@@ -13,6 +13,8 @@ FROM python:3.12-slim-bookworm AS builder
 ARG NODE_MAJOR=22
 ARG APT_MIRROR
 ARG UV_INDEX_URL
+ARG UV_HTTP_TIMEOUT=120
+ARG UV_NO_BINARY_PACKAGE=numpy
 # Optional extras to install (e.g. "postgres" for PostgreSQL support)
 # Usage: docker build --build-arg UV_EXTRAS=postgres,discord ...
 ARG UV_EXTRAS
@@ -63,7 +65,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         esac; \
         extras_flags="$extras_flags --extra $extra"; \
     done; \
-    UV_INDEX_URL=${UV_INDEX_URL:-https://pypi.org/simple} uv sync --extra redis $extras_flags'
+    NPY_DISABLE_CPU_FEATURES="X86_V2 X86_V3 X86_V4 AVX512_ICL AVX512_SPR" \
+    UV_INDEX_URL=${UV_INDEX_URL:-https://pypi.org/simple} \
+    UV_HTTP_TIMEOUT=${UV_HTTP_TIMEOUT:-120} \
+    UV_NO_BINARY_PACKAGE=${UV_NO_BINARY_PACKAGE:-numpy} \
+    uv sync --extra redis $extras_flags'
 
 # UTF-8 locale prevents UnicodeEncodeError on Chinese/emoji content in minimal
 # containers where locale configuration may be missing and the default encoding is not UTF-8.

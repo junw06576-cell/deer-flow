@@ -146,6 +146,8 @@ services:
         APT_MIRROR: ${APT_MIRROR:-}
         UV_IMAGE: ${UV_IMAGE:-ghcr.io/astral-sh/uv:0.7.20}
         UV_INDEX_URL: ${UV_INDEX_URL:-https://pypi.org/simple}
+        UV_HTTP_TIMEOUT: ${UV_HTTP_TIMEOUT:-120}
+        UV_NO_BINARY_PACKAGE: ${UV_NO_BINARY_PACKAGE:-numpy}
     container_name: deer-flow-gateway
     # Startup logic lives in docker/dev-entrypoint.sh — UV_EXTRAS validation,
     # `uv sync --all-packages`, .venv self-heal, and uvicorn handoff. Keeps
@@ -180,6 +182,8 @@ services:
       # the Claude/Codex CLI login as a model provider or ACP agent, via the
       # opt-in docker-compose.cli-auth.yaml overlay. Prefer an env token
       # (CLAUDE_CODE_OAUTH_TOKEN, see .env.example / backend/docs/CONFIGURATION.md).
+      - /opt/deer-flow/skills:/mnt/skills
+      - /opt/deer-flow/agents:/app/agents
     working_dir: /app
     environment:
       - CI=true
@@ -201,6 +205,8 @@ services:
       # Only NO_PROXY is declared here so internal service hostnames are always exempt from the proxy.
       - NO_PROXY=${NO_PROXY:-}${NO_PROXY:+,}localhost,127.0.0.1,::1,gateway,frontend,nginx,provisioner,host.docker.internal
       - no_proxy=${no_proxy:-}${no_proxy:+,}localhost,127.0.0.1,::1,gateway,frontend,nginx,provisioner,host.docker.internal
+      - UV_HTTP_TIMEOUT=${UV_HTTP_TIMEOUT:-120}
+      - UV_NO_BINARY_PACKAGE=${UV_NO_BINARY_PACKAGE:-numpy}
     env_file:
       - ../.env
     extra_hosts:
