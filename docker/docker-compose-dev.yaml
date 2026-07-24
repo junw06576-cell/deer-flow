@@ -183,7 +183,7 @@ services:
       # opt-in docker-compose.cli-auth.yaml overlay. Prefer an env token
       # (CLAUDE_CODE_OAUTH_TOKEN, see .env.example / backend/docs/CONFIGURATION.md).
       - /opt/deer-flow/skills:/mnt/skills
-      - /opt/deer-flow/agents:/app/agents
+      - /opt/deer-flow/agents:/app/backend/.deer-flow/agents
     working_dir: /app
     environment:
       - CI=true
@@ -212,6 +212,26 @@ services:
     extra_hosts:
       # For Linux: map host.docker.internal to host gateway
       - "host.docker.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - deer-flow-dev
+    restart: unless-stopped
+
+  # ── DeerFlow Service (需求分析微服务) ───────────────────────────────────
+  deerflow-service:
+    build:
+      context: ../deerflow-service
+      dockerfile: Dockerfile
+    container_name: deer-flow-service
+    ports:
+      - "8003:8003"
+    environment:
+      - DEERFLOW_BASE_URL=http://gateway:8001
+      - API_KEY=tfs-buddy-secret-key
+      - DEER_FLOW_INTERNAL_AUTH_TOKEN=${DEER_FLOW_INTERNAL_AUTH_TOKEN}
+      - REDIS_URL=redis://redis:6379/0
     depends_on:
       redis:
         condition: service_healthy

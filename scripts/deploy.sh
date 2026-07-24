@@ -200,6 +200,16 @@ if  [ "$CMD" != "down" ] && [ -z "$DEER_FLOW_INTERNAL_AUTH_TOKEN" ]; then
     fi
 fi
 
+# ── 将 DEER_FLOW_INTERNAL_AUTH_TOKEN 注入 .env ──────────────────────────
+# docker compose --env-file .env 只认 .env 文件中的变量，不继承 shell export。
+# 自动写入 .env 文件，这样所有 service 都能通过 ${DEER_FLOW_INTERNAL_AUTH_TOKEN} 引用。
+if [ "$CMD" != "down" ] && [ -n "$DEER_FLOW_INTERNAL_AUTH_TOKEN" ]; then
+    if [ -f "$ENV_FILE" ]; then
+        sed -i '/^DEER_FLOW_INTERNAL_AUTH_TOKEN=/d' "$ENV_FILE" 2>/dev/null || true
+    fi
+    echo "DEER_FLOW_INTERNAL_AUTH_TOKEN=$DEER_FLOW_INTERNAL_AUTH_TOKEN" >> "$ENV_FILE"
+fi
+
 # ── UV_EXTRAS auto-detection ─────────────────────────────────────────────────
 # The production Dockerfile accepts UV_EXTRAS as a single build-arg token and
 # adds the --extra prefix itself. Convert the detector's uv flag string
@@ -324,7 +334,7 @@ echo -e "${BLUE}Sandbox mode: $sandbox_mode${NC}"
 
 echo -e "${BLUE}Runtime: Gateway embedded agent runtime${NC}"
 
-services="redis frontend gateway nginx"
+services="redis frontend gateway nginx deerflow-service"
 
 if [ "$sandbox_mode" = "provisioner" ]; then
     services="$services provisioner"

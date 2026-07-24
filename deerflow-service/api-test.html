@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DeerFlow Service 接口测试</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; padding: 24px; color: #333; }
+  .container { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 22px; margin-bottom: 20px; color: #1a1a2e; }
+  .card { background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,.1); margin-bottom: 16px; overflow: hidden; }
+  .card-header { padding: 14px 20px; font-weight: 600; font-size: 15px; border-bottom: 1px solid #eee; display: flex; align-items: center; gap: 8px; }
+  .card-body { padding: 16px 20px; }
+  .badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 10px; font-weight: 500; }
+  .badge-get { background: #e3f2fd; color: #1565c0; }
+  .badge-post { background: #e8f5e9; color: #2e7d32; }
+  .badge-delete { background: #fce4ec; color: #c62828; }
+  label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 4px; color: #555; }
+  input, textarea { width: 100%; padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 13px; font-family: inherit; margin-bottom: 10px; }
+  input:focus, textarea:focus { outline: none; border-color: #4a6cf7; box-shadow: 0 0 0 2px rgba(74,108,247,.15); }
+  textarea { font-family: 'SFMono-Regular', Consolas, monospace; font-size: 12px; resize: vertical; min-height: 60px; }
+  .row { display: flex; gap: 12px; }
+  .row > * { flex: 1; }
+  .btn { padding: 8px 20px; border: none; border-radius: 6px; font-size: 13px; font-weight: 500; cursor: pointer; transition: all .15s; }
+  .btn-primary { background: #4a6cf7; color: #fff; }
+  .btn-primary:hover { background: #3b5de7; }
+  .btn-primary:disabled { background: #a0b4f7; cursor: not-allowed; }
+  .btn-success { background: #2e7d32; color: #fff; }
+  .btn-success:hover { background: #1b5e20; }
+  .btn-danger { background: #c62828; color: #fff; }
+  .btn-danger:hover { background: #b71c1c; }
+  .response { background: #1e1e2e; color: #cdd6f4; border-radius: 6px; padding: 12px 16px; font-family: 'SFMono-Regular', Consolas, monospace; font-size: 12px; min-height: 40px; white-space: pre-wrap; word-break: break-all; margin-top: 10px; display: none; }
+  .response.show { display: block; }
+  .response .status { float: right; font-size: 11px; padding: 2px 8px; border-radius: 8px; }
+  .response .status-2xx { background: #1b5e20; color: #a5d6a7; }
+  .response .status-4xx { background: #e65100; color: #ffcc80; }
+  .response .status-5xx { background: #b71c1c; color: #ef9a9a; }
+  .response .status-other { background: #37474f; color: #b0bec5; }
+  .mt-8 { margin-top: 8px; }
+  .mb-8 { margin-bottom: 8px; }
+  .text-right { text-align: right; }
+  .flex { display: flex; align-items: center; gap: 8px; }
+  .flex-between { display: flex; justify-content: space-between; align-items: center; }
+  .endpoint-url { font-size: 12px; color: #888; font-family: monospace; }
+  hr { border: none; border-top: 1px solid #eee; margin: 12px 0; }
+  .summary { padding: 0 20px 16px; font-size: 13px; }
+  .summary-item { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+  .dot-pass { background: #2e7d32; }
+  .dot-fail { background: #c62828; }
+  .dot-skip { background: #ffa000; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🧪 DeerFlow Service 接口测试</h1>
+
+  <!-- 基础配置 -->
+  <div class="card">
+    <div class="card-header">⚙️ 基础配置</div>
+    <div class="card-body">
+      <div class="row">
+        <div>
+          <label>服务地址</label>
+          <input id="baseUrl" value="http://172.16.0.192:2026/deerflow-service" />
+        </div>
+        <div>
+          <label>API Key</label>
+          <input id="apiKey" value="tfs-buddy-secret-key" />
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 场景 1：健康检查 -->
+  <div class="card">
+    <div class="card-header"><span class="badge badge-get">GET</span> 场景 1：健康检查</div>
+    <div class="card-body">
+      <p style="font-size:13px;color:#666;margin-bottom:10px;">验证服务是否正常响应，所有端点是否可达。</p>
+      <div class="text-right"><button class="btn btn-primary" onclick="testHealth()">运行测试</button></div>
+      <pre class="response" id="res-health"></pre>
+    </div>
+  </div>
+
+  <!-- 场景 2：提交任务 + 轮询 -->
+  <div class="card">
+    <div class="card-header"><span class="badge badge-post">POST</span> <span class="badge badge-get">GET</span> 场景 2：提交任务 → 轮询结果</div>
+    <div class="card-body">
+      <p style="font-size:13px;color:#666;margin-bottom:10px;">提交一个完整的需求分析任务，随后轮询直到完成或失败。</p>
+      <div class="row">
+        <div>
+          <label>collection_name</label>
+          <input id="s2-collection" value="WN_Data_Platform" />
+        </div>
+        <div>
+          <label>work_item_id</label>
+          <input id="s2-workitem" value="258288" />
+        </div>
+        <div>
+          <label>tfs_project</label>
+          <input id="s2-project" value="NETHIS5.5" />
+        </div>
+      </div>
+      <label>tfs_pat</label>
+      <input id="s2-pat" value="test-pat" />
+      <div class="flex-between">
+        <span class="endpoint-url">POST /api/v1/analysis → GET /api/v1/analysis/{task_id}</span>
+        <button class="btn btn-primary" onclick="testSubmitAndPoll()">运行测试</button>
+      </div>
+      <pre class="response" id="res-submit"></pre>
+    </div>
+  </div>
+
+  <!-- 场景 3：参数校验 -->
+  <div class="card">
+    <div class="card-header"><span class="badge badge-post">POST</span> 场景 3：缺少必填参数 → 400</div>
+    <div class="card-body">
+      <p style="font-size:13px;color:#666;margin-bottom:10px;">只传 collection_name，验证接口返回 400 及字段级错误提示。</p>
+      <div class="text-right"><button class="btn btn-primary" onclick="testMissingParams()">运行测试</button></div>
+      <pre class="response" id="res-missing"></pre>
+    </div>
+  </div>
+
+  <!-- 场景 4：认证拦截 -->
+  <div class="card">
+    <div class="card-header"><span class="badge badge-post">POST</span> 场景 4：错误 API Key → 401</div>
+    <div class="card-body">
+      <p style="font-size:13px;color:#666;margin-bottom:10px;">使用错误的 X-API-Key 提交任务，验证返回 401。</p>
+      <div class="text-right"><button class="btn btn-primary" onclick="testWrongKey()">运行测试</button></div>
+      <pre class="response" id="res-wrongkey"></pre>
+    </div>
+  </div>
+
+  <!-- 场景 5：404 -->
+  <div class="card">
+    <div class="card-header"><span class="badge badge-get">GET</span> 场景 5：不存在的任务 → 404</div>
+    <div class="card-body">
+      <p style="font-size:13px;color:#666;margin-bottom:10px;">查询一个不存在的 task_id，验证返回 404。</p>
+      <div class="text-right"><button class="btn btn-primary" onclick="testNotFound()">运行测试</button></div>
+      <pre class="response" id="res-notfound"></pre>
+    </div>
+  </div>
+
+  <!-- 场景 6：不带 API Key -->
+  <div class="card">
+    <div class="card-header"><span class="badge badge-post">POST</span> 场景 6：不传 API Key → 401</div>
+    <div class="card-body">
+      <p style="font-size:13px;color:#666;margin-bottom:10px;">完全不传 X-API-Key 头，验证返回 401。</p>
+      <div class="text-right"><button class="btn btn-primary" onclick="testNoKey()">运行测试</button></div>
+      <pre class="response" id="res-nokey"></pre>
+    </div>
+  </div>
+
+  <!-- 批量运行 -->
+  <div class="card">
+    <div class="card-header">🚀 全部运行</div>
+    <div class="card-body" style="border-bottom:1px solid #eee;">
+      <div class="text-right"><button class="btn btn-success" onclick="runAll()">运行全部测试</button></div>
+    </div>
+    <div class="summary" id="summary-area">
+      <div style="color:#999;font-size:13px;padding:8px 0;">点击上方按钮开始测试……</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const BASE = document.getElementById('baseUrl');
+const API_KEY = document.getElementById('apiKey');
+
+function $(id) { return document.getElementById(id); }
+function show(sel) {
+  const el = typeof sel === 'string' ? document.querySelector(sel) : sel;
+  el.classList.add('show');
+  return el;
+}
+
+async function api(method, path, body, headers) {
+  const url = BASE.value.replace(/\/+$/, '') + path;
+  const hdrs = { ...headers };
+  if (body) hdrs['Content-Type'] = 'application/json';
+  const opts = { method, headers: hdrs };
+  if (body) opts.body = JSON.stringify(body);
+
+  let resp;
+  const start = Date.now();
+  try {
+    resp = await fetch(url, opts);
+  } catch (e) {
+    return { error: `❌ 网络错误：${e.message}`, time: Date.now() - start };
+  }
+  const ms = Date.now() - start;
+  let data;
+  try { data = await resp.json(); } catch { data = resp.statusText; }
+  return { status: resp.status, data, time: ms };
+}
+
+function renderResponse(el, result, label) {
+  el.textContent = '';
+  show(el);
+
+  if (result.error) {
+    el.innerHTML = `<span class="status status-other">ERR</span> ${result.error}`;
+    return;
+  }
+
+  const cls = result.status < 300 ? 'status-2xx' : result.status < 500 ? 'status-4xx' : result.status < 600 ? 'status-5xx' : 'status-other';
+  const icon = result.status < 300 ? '✅' : '❌';
+  const statusText = `${icon} ${result.status} (${result.time}ms)`;
+  const payload = typeof result.data === 'object' ? JSON.stringify(result.data, null, 2) : result.data;
+  el.innerHTML = `<span class="status ${cls}">${statusText}</span>\n${payload}`;
+}
+
+function updateSummary(pass, fail) {
+  const area = $('summary-area');
+  area.innerHTML = '';
+  const total = pass + fail;
+  if (total === 0) { area.innerHTML = '<div style="color:#999">暂无结果</div>'; return; }
+  area.innerHTML = `
+    <div class="summary-item"><span class="dot dot-pass"></span> 通过：${pass}</div>
+    <div class="summary-item"><span class="dot dot-fail"></span> 失败：${fail}</div>
+    <div style="margin-top:6px;font-weight:500;">共 ${total} 项，${pass === total ? '🎉 全部通过' : `⚠️ ${fail} 项失败`}</div>
+  `;
+}
+
+// ── 测试场景 ──
+
+async function testHealth() {
+  const r = await api('GET', '/api/v1/health');
+  renderResponse($('res-health'), r);
+}
+
+async function testSubmitAndPoll() {
+  const el = $('res-submit');
+  const body = {
+    collection_name: $('s2-collection').value,
+    work_item_id: parseInt($('s2-workitem').value),
+    tfs_project: $('s2-project').value,
+    tfs_pat: $('s2-pat').value,
+  };
+  show(el);
+  el.innerHTML = '⏳ 提交任务中...';
+
+  // submit
+  const r1 = await api('POST', '/api/v1/analysis', body, { 'X-API-Key': API_KEY.value });
+  if (r1.error || r1.status >= 400) {
+    renderResponse(el, r1);
+    return;
+  }
+  el.innerHTML += `\n✅ 提交成功: task_id = ${r1.data.task_id}\n⏳ 等待 3 秒后轮询...\n`;
+
+  await new Promise(r => setTimeout(r, 3000));
+
+  // poll
+  const r2 = await api('GET', `/api/v1/analysis/${r1.data.task_id}`, null, { 'X-API-Key': API_KEY.value });
+  const text = typeof r2.data === 'object' ? JSON.stringify(r2.data, null, 2) : r2.data;
+  const cls = r2.status < 300 ? 'status-2xx' : r2.status < 500 ? 'status-4xx' : 'status-5xx';
+  const icon = r2.status < 300 ? '✅' : '❌';
+  el.innerHTML += `<span class="status ${cls}" style="float:none;display:inline-block;margin:4px 0;">${icon} 轮询结果 (${r2.status}, ${r2.time}ms)</span>\n${text}`;
+}
+
+async function testMissingParams() {
+  const r = await api('POST', '/api/v1/analysis', { collection_name: 'test' }, { 'X-API-Key': API_KEY.value });
+  renderResponse($('res-missing'), r);
+}
+
+async function testWrongKey() {
+  const r = await api('POST', '/api/v1/analysis', {
+    collection_name: 'test', work_item_id: 1, tfs_project: 'p', tfs_pat: 'pat'
+  }, { 'X-API-Key': 'wrong-key' });
+  renderResponse($('res-wrongkey'), r);
+}
+
+async function testNotFound() {
+  const r = await api('GET', '/api/v1/analysis/nonexistent-task-id', null, { 'X-API-Key': API_KEY.value });
+  renderResponse($('res-notfound'), r);
+}
+
+async function testNoKey() {
+  const r = await api('POST', '/api/v1/analysis', {
+    collection_name: 'test', work_item_id: 1, tfs_project: 'p', tfs_pat: 'pat'
+  }, {});
+  renderResponse($('res-nokey'), r);
+}
+
+async function runAll() {
+  const tests = [
+    { name: '健康检查', fn: testHealth, el: 'res-health' },
+    { name: '缺少参数 → 400', fn: testMissingParams, el: 'res-missing' },
+    { name: '错误 API Key → 401', fn: testWrongKey, el: 'res-wrongkey' },
+    { name: '不存在的任务 → 404', fn: testNotFound, el: 'res-notfound' },
+    { name: '不传 API Key → 401', fn: testNoKey, el: 'res-nokey' },
+  ];
+
+  // 提交任务单独跑（需要等 3 秒）
+  const submitTest = { name: '提交任务', fn: testSubmitAndPoll, el: 'res-submit' };
+
+  let pass = 0, fail = 0;
+
+  for (const t of tests) {
+    try {
+      await t.fn();
+      const el = $(t.el);
+      const isPass = !el.textContent.includes('❌') && !el.textContent.includes('ERR');
+      if (isPass) pass++; else fail++;
+    } catch { fail++; }
+  }
+
+  // 单独提交任务测试
+  try {
+    await testSubmitAndPoll();
+    const el = $('res-submit');
+    const isPass = !el.textContent.includes('❌') && !el.textContent.includes('ERR');
+    if (isPass) pass++; else fail++;
+  } catch { fail++; }
+
+  updateSummary(pass, fail);
+}
+</script>
+</body>
+</html>

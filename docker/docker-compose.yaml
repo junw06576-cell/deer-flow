@@ -80,14 +80,14 @@ services:
 
   # ── Gateway API ────────────────────────────────────────────────────────────
   gateway:
-   # build:
-   #   context: ../
-   #   dockerfile: backend/Dockerfile
-    #  args:
-     #   APT_MIRROR: ${APT_MIRROR:-}
-      #  UV_IMAGE: ${UV_IMAGE:-ghcr.io/astral-sh/uv:0.7.20}
-      #  UV_INDEX_URL: ${UV_INDEX_URL:-https://pypi.org/simple}
-      #  UV_EXTRAS: ${UV_EXTRAS:-}
+    build:
+      context: ../
+      dockerfile: backend/Dockerfile
+      args:
+        APT_MIRROR: ${APT_MIRROR:-}
+        UV_IMAGE: ${UV_IMAGE:-ghcr.io/astral-sh/uv:0.7.20}
+        UV_INDEX_URL: ${UV_INDEX_URL:-https://pypi.org/simple}
+        UV_EXTRAS: ${UV_EXTRAS:-}
     image: deer-flow-gateway:core2
     container_name: deer-flow-gateway
     # Gateway hosts the agent runtime with in-process RunManager + StreamBridge
@@ -100,8 +100,10 @@ services:
     volumes:
       - ${DEER_FLOW_CONFIG_PATH}:/app/backend/config.yaml:ro
       - ${DEER_FLOW_EXTENSIONS_CONFIG_PATH}:/app/backend/extensions_config.json:ro
-      - ../skills:/app/skills:ro
+      - /opt/deer-flow/skills:/app/skills:ro
+      - /opt/deer-flow/skills:/mnt/skills:ro
       - ${DEER_FLOW_HOME}:/app/backend/.deer-flow
+      - /opt/deer-flow/agents:/app/backend/.deer-flow/agents
       # DooD: the host Docker socket is NOT mounted by default. It is added only
       # for aio (pure-DooD) sandbox mode via the opt-in docker-compose.dood.yaml
       # overlay (appended by scripts/deploy.sh). See backend/docs/CONFIGURATION.md
@@ -126,7 +128,7 @@ services:
       - DEER_FLOW_INTERNAL_AUTH_TOKEN=${DEER_FLOW_INTERNAL_AUTH_TOKEN}
       # DooD path/network translation
       - DEER_FLOW_HOST_BASE_DIR=${DEER_FLOW_HOME}
-      - DEER_FLOW_HOST_SKILLS_PATH=${DEER_FLOW_REPO_ROOT}/skills
+      - DEER_FLOW_HOST_SKILLS_PATH=/opt/deer-flow/skills
       - DEER_FLOW_SANDBOX_HOST=host.docker.internal
       # Proxy values (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY) are inherited from ../.env via env_file.
       # Only NO_PROXY is declared here so internal service hostnames are always exempt from the proxy.
@@ -157,7 +159,7 @@ services:
     environment:
       - K8S_NAMESPACE=deer-flow
       - SANDBOX_IMAGE=enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:latest
-      - SKILLS_HOST_PATH=${DEER_FLOW_REPO_ROOT}/skills
+      - SKILLS_HOST_PATH=/opt/deer-flow/skills
       - THREADS_HOST_PATH=${DEER_FLOW_HOME}/threads
       - DEER_FLOW_HOST_BASE_DIR=${DEER_FLOW_HOME}
       - KUBECONFIG_PATH=/root/.kube/config
@@ -175,9 +177,33 @@ services:
       interval: 10s
       timeout: 5s
       retries: 6
+
+  # ── DeerFlow Service (需求分析微服务) ───────────────────────────────────────
+  deerflow-service:
+    build:
+      context: ../deerflow-service
+      dockerfile: Dockerfile
+    container_name: deer-flow-service
+    ports:
+      - "8003:8003"
+    environment:
+      - DEERFLOW_BASE_URL=http://gateway:8001
+      - API_KEY=tfs-buddy-secret-key
+      - DEER_FLOW_INTERNAL_AUTH_TOKEN=${DEER_FLOW_INTERNAL_AUTH_TOKEN}
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - deer-flow
+    restart: unless-stopped
+
 volumes:
   redis-data:
 
 networks:
   deer-flow:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.201.0/24
