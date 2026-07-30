@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "sources": [
+    {
+      "product_id": "cloudhis-v56",
+      "product_name": "云HIS 5.6",
+      "tfs_area_values": ["NETHIS5.5"],
+      "source": "../../../menu_business_mapping.json"
+    }
+  ]
+}

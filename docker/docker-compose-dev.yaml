@@ -19,6 +19,8 @@ services:
     image: redis:7-alpine
     container_name: deer-flow-redis
     command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "26380:6379"
     volumes:
       - redis-data:/data
     healthcheck:
@@ -167,6 +169,8 @@ services:
       # replacements visible inside Docker Desktop/WSL containers.
       - ../:/app/project
       - ../skills:/app/skills
+      # Wiki knowledge base mount for product-kb-qa skill
+      - /opt/regional_wiki_kb:/mnt/knowledge:ro
       - ../logs:/app/logs
       # Use a Docker-managed uv cache volume instead of a host bind mount.
       # On macOS/Docker Desktop, uv may fail to create symlinks inside shared
@@ -231,7 +235,7 @@ services:
       - DEERFLOW_BASE_URL=http://gateway:8001
       - API_KEY=tfs-buddy-secret-key
       - DEER_FLOW_INTERNAL_AUTH_TOKEN=${DEER_FLOW_INTERNAL_AUTH_TOKEN}
-      - REDIS_URL=redis://redis:6379/0
+      - REDIS_URL=redis://redis://host.docker.internal:26380/0
     depends_on:
       redis:
         condition: service_healthy

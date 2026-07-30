@@ -1,50 +1,104 @@
-"""Redis 质控结果读取客户端
+"""Redis QC result reader.
 
-从 Redis 读取 auto-req-analysis Skill 写入的质控结果（checklist）。
+Reads checklist data written by requirement-analysis skills.
 """
+
 import json
-from typing import Optional, Dict, Any
+from typing import Any, Optional, Dict
+
 from config import REDIS_QC_KEY_PREFIX
 
 
 def build_qc_plan_key(collection_name: str, work_item_id: int) -> str:
-    """构造 Redis key：auto-req:qc:plan:{collection}:{work_item_id}"""
+    """Build Redis key: auto-req:qc:plan:{collection}:{work_item_id}."""
     return f"{REDIS_QC_KEY_PREFIX}:{collection_name}:{work_item_id}"
 
 
 class RedisQcClient:
-    """从 Redis 读取质控结果"""
+    """Read QC checklist results from Redis.
+
+    Supported storage contracts:
+      - string value: JSON object with top-level ``checklist``
+      - hash value: field ``checklist`` containing checklist JSON
+    """
 
     def __init__(self, redis_client):
         self._redis = redis_client
 
     def get_checklist(self, collection_name: str, work_item_id: int) -> Optional[Dict[str, Any]]:
-        """从 Redis 读取指定工作项的 checklist
-
-        返回：
-          - checklist dict（存在且包含 checklist 节点时）
-          - None（key 不存在或数据不完整时）
-
-        调用方需根据 None 判断是 not_found 还是 invalid_data。
-        """
         key = build_qc_plan_key(collection_name, work_item_id)
-        raw = self._redis.get(key)
-        if not raw:
-            return None
+        return self.get_checklist_by_key(key)
 
+    def get_checklist_by_key(self, key: str) -> Optional[Dict[str, Any]]:
+        result = self.get_result_by_key(key)
+        if not result:
+            return None
+        checklist = result.get("checklist")
+        return checklist if isinstance(checklist, dict) else None
+
+    def get_result_by_key(self, key: str) -> Optional[Dict[str, Any]]:
         try:
-            decoded = raw.decode("utf-8") if isinstance(raw, bytes) else raw
-            payload = json.loads(decoded)
-        except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+            key_type = self._redis.type(key)
+        except Exception:
             return None
 
-        checklist = payload.get("checklist")
-        if not checklist:
-            return None
+        if isinstance(key_type, bytes):
+            key_type = key_type.decode("utf-8", errors="replace")
 
-        return checklist
+        if key_type == "string":
+            value = self._redis.get(key)
+            decoded = _decode_json(value)
+            if isinstance(decoded, dict):
+                return decoded
+            text = _decode_text(value)
+            return {"value": text} if text is not None else None
+
+        if key_type == "hash":
+            raw_hash = self._redis.hgetall(key)
+            result: Dict[str, Any] = {}
+            for raw_key, raw_value in raw_hash.items():
+                field = _decode_text(raw_key)
+                if field is None:
+                    continue
+                value = _decode_text(raw_value)
+                if field == "checklist":
+                    parsed = _decode_json(raw_value)
+                    result[field] = parsed if parsed is not None else value
+                else:
+                    result[field] = value
+            return result
+
+        return None
 
     def exists(self, collection_name: str, work_item_id: int) -> bool:
-        """检查 Redis key 是否存在"""
         key = build_qc_plan_key(collection_name, work_item_id)
         return bool(self._redis.exists(key))
+
+
+def _decode_text(raw) -> Optional[str]:
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    return raw if isinstance(raw, str) else None
+
+
+def _decode_json(raw):
+    decoded = _decode_text(raw)
+    if decoded is None:
+        return None
+    try:
+        return json.loads(decoded)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _decode_json_checklist(raw) -> Optional[Dict[str, Any]]:
+    payload = _decode_json(raw)
+    if not isinstance(payload, dict):
+        return None
+    checklist = payload.get("checklist")
+    return checklist if isinstance(checklist, dict) else None

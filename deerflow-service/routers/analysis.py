@@ -1,28 +1,21 @@
-"""需求质控路由
-
-符合合并后的接口设计：
-  POST /api/v1/analysis            → 提交任务，返回 task_id
-  GET  /api/v1/analysis/{task_id}  → 轮询任务状态；completed 时自动从 Redis 读取 checklist 并嵌入
-"""
-from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
-from models import AnalysisRequest, TaskSubmitResponse, TaskStatusResponse
-from services.deerflow_client import DeerFlowClient
-from services.task_manager import create_task_manager, TaskStatus
-from services.redis_qc_client import RedisQcClient, build_qc_plan_key
-from middleware.auth import verify_api_key
-from config import AGENT_NAME, SKILL_NAME, get_redis_client
 import json
 
-router = APIRouter(prefix="/api/v1/analysis", tags=["需求质控"])
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 
-# singletons
+from config import AGENT_NAME, get_redis_client
+from middleware.auth import verify_api_key
+from models import AnalysisRequest, TaskStatusResponse, TaskSubmitResponse
+from services.deerflow_client import DeerFlowClient
+from services.redis_qc_client import RedisQcClient, build_qc_plan_key
+from services.task_manager import TaskStatus, create_task_manager
+
+router = APIRouter(prefix="/api/v1/analysis", tags=["analysis"])
+
 task_manager = create_task_manager()
 deerflow_client = DeerFlowClient()
 redis_client = get_redis_client()
 redis_qc_client = RedisQcClient(redis_client) if redis_client else None
 
-
-# ── 提交任务 ──
 
 @router.post("", response_model=TaskSubmitResponse)
 def submit_analysis(
@@ -30,115 +23,110 @@ def submit_analysis(
     background_tasks: BackgroundTasks,
     _: None = Depends(verify_api_key),
 ):
-    """提交需求质控任务（异步）
-
-    触发 DeerFlow req-analysis Agent 下的 auto-req-analysis Skill，
-    Skill 将质控结果写入 Redis。
-    调用方通过 GET /api/v1/analysis/{task_id} 轮询结果。
-    """
+    """Submit an asynchronous requirement analysis task."""
     task_id = task_manager.create_task("analysis", req.model_dump())
     background_tasks.add_task(_run_analysis_task, task_id, req)
     return TaskSubmitResponse(task_id=task_id, status="pending")
 
 
-# ── 查询任务状态（含 checklist 嵌入） ──
-
 @router.get("/{task_id}", response_model=TaskStatusResponse)
 def get_analysis_result(task_id: str, _: None = Depends(verify_api_key)):
-    """查询任务状态
-
-    - pending/processing → 仅返回状态
-    - completed → 从 Redis 读取 checklist 并嵌入响应
-    - failed → 返回错误信息
-    """
+    """Poll an analysis task and include the full Redis result when available."""
     task = task_manager.get_task(task_id)
     if not task:
-        raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在")
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
 
-    # 基础响应
     response = TaskStatusResponse(
         task_id=task["task_id"],
         status=task["status"],
         error=task.get("error"),
     )
 
-    # completed 时从 Redis 读取 checklist
     if task["status"] == TaskStatus.COMPLETED:
         redis_key = task.get("result", {}).get("redis_key") if task.get("result") else None
-        if redis_key:
-            checklist = _read_checklist_from_redis(redis_key)
-            if checklist is not None:
-                response.checklist = checklist
-            else:
-                # Redis 数据异常：key 不存在/过期/缺少 checklist
-                response.status = TaskStatus.FAILED
-                response.error = f"质控结果数据异常（Redis key: {redis_key}）"
-        else:
+        if not redis_key:
             response.status = TaskStatus.FAILED
-            response.error = "任务结果中缺少 redis_key"
+            response.error = "Task result is missing redis_key"
+            return response
+
+        response.redis_key = redis_key
+        redis_result = _read_result_from_redis(redis_key)
+        if redis_result is None:
+            response.status = TaskStatus.FAILED
+            response.error = f"Analysis result data is unavailable (Redis key: {redis_key})"
+            return response
+
+        response.redis_result = redis_result
 
     return response
 
 
-# ── 后台任务 ──
-
 def _run_analysis_task(task_id: str, req: AnalysisRequest):
-    """后台执行：调用 DeerFlow Agent 执行质控"""
+    """Run DeerFlow agent in the background."""
     task_manager.update_task(task_id, TaskStatus.PROCESSING)
 
     try:
         redis_key = build_qc_plan_key(req.collection_name, req.work_item_id)
-
-        message = json.dumps({
+        request_payload = {
             "action": "auto_req_analysis",
             "collection_name": req.collection_name,
             "work_item_id": req.work_item_id,
             "tfs_project": req.tfs_project,
             "tfs_pat": req.tfs_pat,
             "redis_key": redis_key,
-        }, ensure_ascii=False)
+        }
+
+        if req.human_feedback:
+            request_payload["human_feedback"] = req.human_feedback
+            message = (
+                "This is a re-submission after human review. "
+                "The previous analysis and questions are in the conversation history above. "
+                "Human feedback on those questions is provided in the 'human_feedback' field below. "
+                "Based on the feedback, update the QC result, revise the Redis plan if needed, "
+                "and proceed to the next step. Do NOT re-run the full analysis from scratch.\n\n"
+                "Task input JSON:\n"
+                f"{json.dumps(request_payload, ensure_ascii=False)}"
+            )
+        else:
+            message = (
+                "System automation task. Execute the requirement analysis/QC workflow "
+                "using the agent's configured requirement-analysis skill. Do not ask "
+                "for clarification and do not stop after summarizing this input. "
+                "Read the configured skill instructions, run the required workflow, "
+                "and write the authoritative result to Redis using the provided "
+                "redis_key. Return only a short JSON status summary when the workflow "
+                "is finished.\n\n"
+                "Task input JSON:\n"
+                f"{json.dumps(request_payload, ensure_ascii=False)}"
+            )
 
         response_text = deerflow_client.run_agent(
             collection_name=req.collection_name,
             work_item_id=req.work_item_id,
             message=message,
             agent_name=AGENT_NAME,
+            redis_url=req.redis_url,
         )
 
-        # 尝试从响应中解析 Skill 返回的 JSON 摘要
         try:
             skill_response = json.loads(response_text)
         except (json.JSONDecodeError, TypeError):
             skill_response = {}
 
-        task_manager.update_task(task_id, TaskStatus.COMPLETED, result={
-            "redis_key": redis_key,
-            "skill_status": skill_response.get("status", "unknown"),
-        })
+        task_manager.update_task(
+            task_id,
+            TaskStatus.COMPLETED,
+            result={
+                "redis_key": redis_key,
+                "skill_status": skill_response.get("status", "unknown"),
+            },
+        )
 
-    except Exception as e:
-        task_manager.update_task(task_id, TaskStatus.FAILED, error=str(e))
+    except Exception as exc:
+        task_manager.update_task(task_id, TaskStatus.FAILED, error=str(exc))
 
 
-# ── 内部工具 ──
-
-def _read_checklist_from_redis(redis_key: str):
-    """从 Redis 读取指定 key 的 checklist 节点
-
-    优先使用 redis_qc_client（如果有 Redis 连接），
-    否则返回 None（由调用方处理为 failed）。
-    """
+def _read_result_from_redis(redis_key: str):
     if redis_qc_client is None:
         return None
-
-    raw = redis_qc_client._redis.get(redis_key)
-    if not raw:
-        return None
-
-    try:
-        decoded = raw.decode("utf-8") if isinstance(raw, bytes) else raw
-        payload = json.loads(decoded)
-    except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
-        return None
-
-    return payload.get("checklist")
+    return redis_qc_client.get_result_by_key(redis_key)

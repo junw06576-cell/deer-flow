@@ -1,6 +1,12 @@
 import httpx
 import secrets
-from config import DEERFLOW_LANGGRAPH_URL, DEER_FLOW_INTERNAL_AUTH_TOKEN
+from urllib.parse import quote
+from config import (
+    DEERFLOW_LANGGRAPH_URL,
+    DEER_FLOW_INTERNAL_AUTH_TOKEN,
+    DEER_FLOW_OWNER_USER_ID,
+    REDIS_URL,
+)
 
 
 class DeerFlowClient:
@@ -16,6 +22,8 @@ class DeerFlowClient:
         headers = {"Content-Type": "application/json"}
         if DEER_FLOW_INTERNAL_AUTH_TOKEN:
             headers["X-DeerFlow-Internal-Token"] = DEER_FLOW_INTERNAL_AUTH_TOKEN
+        if DEER_FLOW_OWNER_USER_ID:
+            headers["X-DeerFlow-Owner-User-Id"] = DEER_FLOW_OWNER_USER_ID
         # 生成 CSRF double-submit cookie 对（server-to-server 调用绕过 CSRF 校验）
         self._csrf_token = secrets.token_urlsafe(64)
         self._client = httpx.Client(
@@ -35,6 +43,7 @@ class DeerFlowClient:
         work_item_id: int,
         message: str,
         agent_name: str,
+        redis_url: str | None = None,
     ) -> str:
         """
         在指定 Thread 中运行 Agent，阻塞等待并返回完整响应。
@@ -51,19 +60,52 @@ class DeerFlowClient:
             Agent 的完整文本响应
         """
         tid = self.thread_id(collection_name, work_item_id)
+        context = {
+            "agent_name": agent_name,
+            "thread_id": tid,
+            "non_interactive": True,
+        }
+        effective_redis_url = redis_url or REDIS_URL
+        if effective_redis_url:
+            context["secrets"] = {
+                "REDIS_URL": effective_redis_url,
+            }
+
+        thread_payload = {
+            "thread_id": tid,
+            "assistant_id": "lead_agent",
+            "metadata": {
+                "source": "deerflow-service",
+                "collection_name": collection_name,
+                "work_item_id": work_item_id,
+            },
+        }
+        thread_resp = self._client.post(
+            f"{self.base_url}/threads",
+            json=thread_payload,
+            headers={"X-CSRF-Token": self._csrf_token},
+            timeout=60.0,
+        )
+        thread_resp.raise_for_status()
 
         payload = {
-            "message": message,
+            "input": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": message,
+                    }
+                ]
+            },
+            "context": context,
             "config": {
-                "configurable": {
-                    "agent_name": agent_name,
-                    "thread_id": tid,
-                }
+                "context": context,
+                "recursion_limit": 500,
             }
         }
 
         resp = self._client.post(
-            f"{self.base_url}/runs/wait",
+            f"{self.base_url}/threads/{quote(tid, safe='')}/runs/wait",
             json=payload,
             headers={"X-CSRF-Token": self._csrf_token},
             timeout=600.0,

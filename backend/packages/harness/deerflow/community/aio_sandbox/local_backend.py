@@ -545,6 +545,10 @@ class LocalContainerBackend(SandboxBackend):
         if self._runtime == "docker":
             cmd.extend(["--security-opt", "seccomp=unconfined"])
 
+        # Map host.docker.internal for sandbox containers on Linux
+        if self._runtime == "docker":
+            cmd.extend(["--add-host", "host.docker.internal:host-gateway"])
+
         if self._runtime == "docker":
             port_mapping = f"{_resolve_docker_bind_host()}:{port}:8080"
         else:
