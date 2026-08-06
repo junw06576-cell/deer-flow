@@ -12,6 +12,15 @@
 
 > **📝 使用说明**：本手册中的所有命令均已登录服务器后的直接可执行命令，无需加 `ssh` 前缀。直接在终端粘贴执行即可。
 
+> **🔐 API 认证说明**：当前部署启用了 BETTER_AUTH 登录认证，`/api/*` 接口（除 `/health`、`/docs` 等）都需要认证，**裸 curl 会返回 `401 Unauthorized`**。本手册所有 curl 命令统一通过内部 token 认证，执行前先取 token：
+>
+> ```bash
+> # 从 .env 读取内部 token（每次新开终端会话都需要重新执行）
+> TOKEN=$(grep '^DEER_FLOW_INTERNAL_AUTH_TOKEN=' /opt/deer-flow/.env | sed 's/.*=//')
+> ```
+>
+> 之后手册中的 curl 命令均带 `-H "X-DeerFlow-Internal-Token: $TOKEN"` 使用。
+
 ---
 
 ## 场景一：更换 API Token
@@ -44,12 +53,13 @@ sed -i 's|^OPENAI_API_KEY=.*|OPENAI_API_KEY=你的新key|' .env
 #### 2. 只重建 gateway 容器（不 rebuild 镜像，秒级）
 
 ```bash
-docker compose --env-file .env -p deer-flow -f docker/docker-compose.yaml up -d --force-recreate gateway
+docker compose --env-file .env -p deer-flow -f docker/docker-compose.yaml -f docker/docker-compose.dood.yaml up -d --force-recreate gateway
 ```
 
 > **⚠️ 注意**：`--env-file .env -p deer-flow` 这两个参数缺一不可。  
 > `--env-file .env`：将 `.env` 注入 compose 变量解析，否则 `$DEER_FLOW_CONFIG_PATH` 等变量为空导致报错。  
-> `-p deer-flow`：指定项目名与 `make up` 一致，否则网络名冲突。
+> `-p deer-flow`：指定项目名与 `make up` 一致，否则网络名冲突。  
+> **`-f docker/docker-compose.dood.yaml` 必须保留**：该覆盖文件挂载 Docker socket（DooD），**缺失会导致沙箱容器无法创建**（报 `dial unix /var/run/docker.sock: no such file or directory`），需求分析 run 会秒级失败。本手册所有 gateway 重启命令均已带此参数。
 
 #### 3. 验证
 
@@ -133,17 +143,17 @@ EOF
 
 ```bash
 # 方式A：重启 gateway 容器（秒级）
-docker compose --env-file .env -p deer-flow -f docker/docker-compose.yaml up -d --force-recreate gateway
+docker compose --env-file .env -p deer-flow -f docker/docker-compose.yaml -f docker/docker-compose.dood.yaml up -d --force-recreate gateway
 
 # 方式B：热重载（不重启容器）
-curl -X POST http://192.16.0.192:2026/api/skills/reload
+curl -s -H "X-DeerFlow-Internal-Token: $TOKEN" -X POST http://192.16.0.192:2026/api/skills/reload
 ```
 
 #### 验证
 
 ```bash
 # 从 API 确认技能是否可见
-curl -s http://192.16.0.192:2026/api/skills | python3 -m json.tool | grep '"name"'
+curl -s -H "X-DeerFlow-Internal-Token: $TOKEN" http://192.16.0.192:2026/api/skills | python3 -m json.tool | grep '"name"'
 ```
 
 ---
@@ -279,7 +289,7 @@ EOF
 #### 3. 重启 gateway 生效
 
 ```bash
-docker compose --env-file .env -p deer-flow -f docker/docker-compose.yaml up -d --force-recreate gateway
+docker compose --env-file .env -p deer-flow -f docker/docker-compose.yaml -f docker/docker-compose.dood.yaml up -d --force-recreate gateway
 ```
 
 #### 4. 验证
@@ -404,17 +414,17 @@ docker logs deer-flow-gateway 2>&1 | grep -i "sandbox" | grep -i "error\|failed"
 rm -rf /opt/deer-flow/skills/public/要删除的skill名
 
 # 2. 方式A：重启 gateway（秒级）
-docker compose --env-file .env -p deer-flow -f docker/docker-compose.yaml up -d --force-recreate gateway
+docker compose --env-file .env -p deer-flow -f docker/docker-compose.yaml -f docker/docker-compose.dood.yaml up -d --force-recreate gateway
 
 # 或方式B：热重载（不重启）
-curl -s -X POST http://127.0.0.1:2026/api/skills/reload
+curl -s -H "X-DeerFlow-Internal-Token: $TOKEN" -X POST http://127.0.0.1:2026/api/skills/reload
 ```
 
 #### 验证
 
 ```bash
 # 确认列表中已无该 skill
-curl -s http://127.0.0.1:2026/api/skills | python3 -m json.tool | grep '"name"'
+curl -s -H "X-DeerFlow-Internal-Token: $TOKEN" http://127.0.0.1:2026/api/skills | python3 -m json.tool | grep '"name"'
 ```
 
 ---
@@ -442,7 +452,7 @@ docker exec deer-flow-gateway rm -rf /app/backend/.deer-flow/users/你的user_id
 刷新前端 skill 列表页面，该 skill 应变为"内置"分类。如仍不更新，可热重载：
 
 ```bash
-curl -s -X POST http://127.0.0.1:2026/api/skills/reload
+curl -s -H "X-DeerFlow-Internal-Token: $TOKEN" -X POST http://127.0.0.1:2026/api/skills/reload
 ```
 
 ---
@@ -475,12 +485,19 @@ docker exec deer-flow-redis redis-cli HGETALL "task:你的task_id"
 docker logs deer-flow-service --tail 30
 ```
 
-### 3. 查看 Agent 执行日志（按线程 ID）
+### 3. 查看 AI 需求分析日志（按需求 ID）
+
+以需求 `WN_PH-Platform-261636` 为例：
 
 ```bash
-# 线程 ID 格式为 {collection_name}-{work_item_id}，如 WN_Data_Platform-234883
-docker logs deer-flow-gateway 2>&1 | grep "线程ID" | head -40
+# 查看最近 40 条该需求的日志
+docker logs deer-flow-gateway 2>&1 | grep "WN_PH-Platform-261636" | head -40
+
+# 动态跟踪该需求的实时日志（Ctrl+C 退出）
+docker logs -f deer-flow-gateway 2>&1 | grep --line-buffered "WN_PH-Platform-261636"
 ```
+
+> **说明**：将 `WN_PH-Platform-261636` 替换为实际的需求工作项 ID 即可查看对应需求的 Agent 执行日志。`--line-buffered` 确保 grep 实时输出匹配行，不会因缓冲区延迟。
 
 ### 4. 查看每一步执行耗时
 

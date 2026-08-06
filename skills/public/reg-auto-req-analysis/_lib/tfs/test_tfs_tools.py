@@ -472,7 +472,8 @@ class TfsClientTests(unittest.TestCase):
 
 
 class PipelinePlanTests(unittest.TestCase):
-    def write_analysis_plan(self, directory, categories, run_id='run_12345678', analysis_rule='fallback-v1'):
+    def write_analysis_plan(self, directory, categories, run_id='run_12345678',
+                            analysis_rule='fallback-v1', analysis_profile=None):
         artifact_name = f'变更方案_1_{run_id}.md'
         plan_path = os.path.join(directory, 'plan.json')
         lines = [
@@ -511,8 +512,14 @@ class PipelinePlanTests(unittest.TestCase):
         ])
         for category in categories:
             lines.append(f'### {category}（测试类别）')
+            if analysis_profile == 'concise-v1':
+                requirements = pipeline.CONCISE_ANALYSIS_DESCRIPTION_REQUIREMENTS[category]
+            elif analysis_profile == 'concise-v2':
+                requirements = pipeline.CONCISE_V2_ANALYSIS_DESCRIPTION_REQUIREMENTS[category]
+            else:
+                requirements = pipeline.ANALYSIS_DESCRIPTION_REQUIREMENTS[category]
             lines.extend(f'- **{label}**：已明确{label}'
-                         for label in pipeline.ANALYSIS_DESCRIPTION_REQUIREMENTS[category])
+                         for label in requirements)
         with open(os.path.join(directory, artifact_name), 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines) + '\n')
         plan = {
@@ -531,6 +538,8 @@ class PipelinePlanTests(unittest.TestCase):
             },
             'artifacts': [{'kind': 'change-plan', 'path': artifact_name}],
         }
+        if analysis_profile is not None:
+            plan['analysis_profile'] = analysis_profile
         if analysis_rule == 'evidence-loop-v1':
             plan.update({
                 'evidence_refs': {
@@ -563,6 +572,92 @@ class PipelinePlanTests(unittest.TestCase):
             plan, plan_path, _ = self.write_analysis_plan(
                 directory, ['existing-ui-simple'], analysis_rule='evidence-loop-v1')
             self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
+    def test_skip_analysis_is_terminal_and_has_no_tfs_mutation_contract(self):
+        plan = {
+            'version': 1, 'run_id': 'run_skip_1234', 'skill': 'auto-req-analysis',
+            'work_item_id': 1, 'expected_rev': 5, 'expected_state': '已建议',
+            'verdict': 'SKIP-ANALYSIS', 'rules_source': {'qc': 'pre-qc-v1'},
+            'tags': [], 'state_to': None, 'artifacts': [],
+            'skip_reason': '接口已开发完成，本工作项仅安排现场联调，无新增业务分析面。',
+        }
+        result = pipeline.validate_plan(plan, '/tmp/skip-plan.json')
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['expected_tags'], [])
+        self.assertIsNone(result['state_to'])
+        self.assertEqual(pipeline.expected_for(plan), (set(), None, set()))
+
+        plan.pop('skip_reason')
+        result = pipeline.validate_plan(plan, '/tmp/skip-plan.json')
+        self.assertFalse(result['ok'])
+        self.assertIn('SKIP-ANALYSIS 计划必须含非空 skip_reason', result['errors'])
+
+        plan['skip_reason'] = '仅联调'
+        plan['checklist'] = {'items': []}
+        result = pipeline.validate_plan(plan, '/tmp/skip-plan.json')
+        self.assertFalse(result['ok'])
+        self.assertIn('SKIP-ANALYSIS 计划不得声明 checklist', result['errors'])
+
+    def test_apply_skip_analysis_records_result_without_tfs_mutation(self):
+        plan = {
+            'version': 1, 'run_id': 'run_skip_1234', 'skill': 'auto-req-analysis',
+            'work_item_id': 1, 'expected_rev': 5, 'expected_state': '已建议',
+            'verdict': 'SKIP-ANALYSIS', 'rules_source': {'qc': 'pre-qc-v1'},
+            'tags': [], 'state_to': None, 'artifacts': [],
+            'skip_reason': '接口已开发完成，本工作项仅安排现场联调，无新增业务分析面。',
+        }
+        with mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}), \
+                mock.patch.object(tfs, 'precheck', return_value={'ok': True}), \
+                mock.patch.object(pipeline, 'preflight',
+                                  return_value={'ok': True, 'work_item': {'tags': ['PM-AI-AUTO-ANA']}}), \
+                mock.patch.object(redis_client, 'publish_plan', return_value={'ok': True}) as publish, \
+                mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}), \
+                mock.patch.object(tfs, 'remove_tag') as remove_tag, \
+                mock.patch.object(tfs, 'add_tag') as add_tag, \
+                mock.patch.object(tfs, 'upload_attachment') as upload_attachment, \
+                mock.patch.object(tfs, 'replace_detail_analysis_section') as replace_detail, \
+                mock.patch.object(tfs, 'write_field') as write_field, \
+                mock.patch.object(tfs, 'set_state') as set_state, \
+                mock.patch.object(tfs, 'set_assignee') as set_assignee:
+            response = pipeline.apply_plan(plan, '/tmp/skip-plan.json', True, 'config.json')
+        self.assertTrue(response['ok'])
+        self.assertEqual(response['actions'], [])
+        publish.assert_called_once_with(plan, 'execute', 'C', 'config.json')
+        for mutation in (remove_tag, add_tag, upload_attachment, replace_detail,
+                         write_field, set_state, set_assignee):
+            mutation.assert_not_called()
+
+    def test_concise_profile_reduces_simple_analysis_dimensions_and_keeps_legacy_shape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            concise, concise_path, concise_artifact = self.write_analysis_plan(
+                directory, ['existing-ui-simple'], analysis_rule='evidence-loop-v1',
+                analysis_profile='concise-v1')
+            self.assertTrue(pipeline.validate_plan(concise, concise_path)['ok'])
+            with open(concise_artifact, 'r', encoding='utf-8') as f:
+                content = f.read()
+            self.assertIn('- **核心改造点**：', content)
+            self.assertNotIn('- **参数控制**：', content)
+
+        with tempfile.TemporaryDirectory() as directory:
+            invalid, invalid_path, _ = self.write_analysis_plan(
+                directory, ['bug-fix'], analysis_rule='evidence-loop-v1')
+            invalid['analysis_profile'] = 'concise-v1'
+            result = pipeline.validate_plan(invalid, invalid_path)
+            self.assertFalse(result['ok'])
+            self.assertIn(
+                'concise-v1 仅允许单一 existing-ui-simple / print-adjustment / data-management 类别',
+                result['errors'])
+
+        with tempfile.TemporaryDirectory() as directory:
+            concise_v2, concise_v2_path, concise_v2_artifact = self.write_analysis_plan(
+                directory, ['existing-ui-simple'], analysis_rule='evidence-loop-v1',
+                analysis_profile='concise-v2')
+            self.assertTrue(pipeline.validate_plan(concise_v2, concise_v2_path)['ok'])
+            with open(concise_v2_artifact, 'r', encoding='utf-8') as f:
+                content = f.read()
+            self.assertIn('- **核心改造点**：', content)
+            self.assertNotIn('- **生效场景**：', content)
+            self.assertNotIn('- **不涉及范围**：', content)
 
     def test_v2_plan_cannot_bypass_evidence_loop_with_fallback_rule_source(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -603,6 +698,40 @@ class PipelinePlanTests(unittest.TestCase):
             plan.pop('auto_scopes')
             self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
 
+    def test_qc_evidence_resolution_requires_confirmed_kb_or_wiki_findings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_analysis_plan(
+                directory, ['existing-ui-simple'], analysis_rule='evidence-loop-v1')
+            plan['qc_evidence_resolution'] = {
+                'initial_verdict': 'NEED-REVIEW',
+                'post_evidence_verdict': 'PASS',
+                'items': [{
+                    'id': 'expiry-threshold',
+                    'initial_gap': '有效期预警分段与月份计算口径未明确。',
+                    'resolution': '已证实同业务范围的既有规则采用自然月分段且红色优先。',
+                    'evidence_refs': ['kb:0'],
+                }],
+            }
+            self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
+            plan['qc_evidence_resolution']['items'][0]['evidence_refs'] = ['work-item']
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertIn(
+                'qc_evidence_resolution.items[1] 的 work-item 必须指向 kb/wiki.findings 的已证实项',
+                result['errors'])
+
+            plan['wiki'] = {
+                'findings': [{'entity': '药品效期预警标准', 'state': 'wiki-确认', 'source': 'wiki/药房药库.md'}]
+            }
+            plan['qc_evidence_resolution']['items'][0]['evidence_refs'] = ['wiki:0']
+            self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
+            plan['qc_evidence_resolution']['post_evidence_verdict'] = 'NEED-REVIEW'
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertIn('qc_evidence_resolution.post_evidence_verdict 必须为 PASS', result['errors'])
+
     def test_evidence_loop_rejects_missing_or_empty_closure_fields(self):
         with tempfile.TemporaryDirectory() as directory:
             plan, plan_path, artifact_path = self.write_analysis_plan(
@@ -635,7 +764,7 @@ class PipelinePlanTests(unittest.TestCase):
             self.assertIn('迭代分析闭环不得以“按现有逻辑”替代业务结论', result['errors'])
 
             rendered = pipeline.render_analysis_description_html(content)
-            self.assertIn('<strong>需求类别：</strong>existing-ui-simple', rendered)
+            self.assertIn('<div>需求类别：existing-ui-simple</div>', rendered)
             self.assertNotIn('现状基线', rendered)
 
     def test_qc_followup_must_be_inline_and_matching_terminal_shape(self):
@@ -683,6 +812,15 @@ class PipelinePlanTests(unittest.TestCase):
         plan_path = os.path.join(tempfile.gettempdir(), 'plan.json')
         # inline qc-followup：无需磁盘文件即可通过
         self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+        # 问题数量硬上限：超过 3 项必须先合并/收敛
+        plan['checklist']['items'] = [
+            {'id': f'q{index}', 'question': f'问题 {index}?',
+             'options': ['口径 A', '口径 B'], 'allow_other': True}
+            for index in range(1, 5)
+        ]
+        result = pipeline.validate_plan(plan, plan_path)
+        self.assertFalse(result['ok'])
+        self.assertIn('checklist.items 最多 3 项', result['errors'][0])
         # 缺 checklist.items → 不通过
         plan['checklist'] = {'responsible': '产品'}
         self.assertFalse(pipeline.validate_plan(plan, plan_path)['ok'])
@@ -1111,13 +1249,34 @@ class PipelinePlanTests(unittest.TestCase):
             '## 四、业务规则与变更范围',
         ])
         rendered = pipeline.render_analysis_description_html(content)
-        self.assertIn('<strong>既有功能简单界面优化</strong>', rendered)
-        self.assertIn('<strong>路径：</strong>菜单路径：费用管理 &gt; 费用录入；操作路径：费用录入 → 保存', rendered)
+        self.assertIn('<div>既有功能简单界面优化</div>', rendered)
+        self.assertIn('<div>路径：菜单路径：费用管理 &gt; 费用录入；操作路径：费用录入 → 保存</div>', rendered)
+        self.assertIn('<strong>修改方案：</strong>调整提示', rendered)
         self.assertIn('&lt;script&gt;alert(1)&lt;/script&gt;', rendered)
         self.assertNotIn('###', rendered)
         self.assertNotIn('**', rendered)
         self.assertNotIn('`', rendered)
         self.assertNotIn('## 四、', rendered)
+
+    def test_render_analysis_description_html_allows_flat_numbered_change_points(self):
+        content = '\n'.join([
+            '# 变更方案',
+            '## 三、分析者描述',
+            '- **需求类别**：`existing-complex`',
+            '- **路径**：菜单路径：诊断信息；操作路径：编辑诊断 → 保存',
+            '### existing-complex（既有功能复杂调整）',
+            '- **涉及条线与模块**：住院诊断与医保登记提醒。',
+            '- **改造内容**：见以下两项。',
+            '1. **主诊断标识**：在已确认的主诊断旁展示图标。',
+            '2. **保存提醒**：满足已确认触发条件后展示提醒。',
+            '- **改造流程**：保存后按已确认规则处理。',
+            '- **改造范围**：住院诊断。',
+            '- **风险与项目注意事项**：人工复核。',
+            '## 四、业务规则与变更范围',
+        ])
+        rendered = pipeline.render_analysis_description_html(content)
+        self.assertIn('<div>1. 主诊断标识：在已确认的主诊断旁展示图标。</div>', rendered)
+        self.assertIn('<div>2. 保存提醒：满足已确认触发条件后展示提醒。</div>', rendered)
 
     def test_apply_analysis_writes_detail_section_not_requirement_analysis(self):
         # 用 MANUAL-REVIEW 计划：同样写描述区段（ANALYSIS_VERDICTS 都写），但不触发 AUTO-ANA 字段流转，
@@ -1519,12 +1678,41 @@ class RedisClientTests(unittest.TestCase):
         self.assertNotIn('plan_path', fields)
         self.assertIn(('SADD', 'auto-req:qc:ids:CollectionA', '1'), commands)
         # 分析终局清掉遗留的 checklist/work_item/next
+        for stale in ('checklist', 'work_item', 'next', 'skip_reason'):
+            self.assertIn(('HDEL', 'auto-req:qc:plan:CollectionA:1', stale), commands)
+        analysis_hset = [command for command in commands if command[0] == 'HSET'][1]
+        analysis_fields = dict(zip(analysis_hset[2::2], analysis_hset[3::2]))
+        for stale in ('checklist', 'work_item', 'next', 'skip_reason'):
+            self.assertNotIn(stale, analysis_fields)
+
+    def test_publish_skip_analysis_exposes_reason_and_removes_question_fields(self):
+        commands = []
+
+        class Connection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return None
+
+            def execute(self, *args):
+                commands.append(args)
+                return 1
+
+        plan = {
+            'work_item_id': 1, 'run_id': 'run_skip_1234', 'verdict': 'SKIP-ANALYSIS',
+            'tags': [], 'state_to': None, 'generated_at_utc': '2026-07-30T00:00:00Z',
+            'skip_reason': '仅安排既有接口联调，无新增业务分析面。',
+        }
+        with mock.patch.object(redis_client, '_Connection', return_value=Connection()), \
+                mock.patch.object(redis_client, 'load_redis_config', return_value={'ttl_seconds': 0}):
+            response = redis_client.publish_plan(plan, 'execute', 'CollectionA', 'config.json')
+        self.assertTrue(response['ok'])
+        fields = dict(zip(commands[0][2::2], commands[0][3::2]))
+        self.assertEqual(fields['skip_reason'], plan['skip_reason'])
+        self.assertEqual(fields['generated_at_utc'], plan['generated_at_utc'])
         for stale in ('checklist', 'work_item', 'next'):
             self.assertIn(('HDEL', 'auto-req:qc:plan:CollectionA:1', stale), commands)
-        analysis_hset = commands[2]
-        analysis_fields = dict(zip(analysis_hset[2::2], analysis_hset[3::2]))
-        for stale in ('checklist', 'work_item', 'next'):
-            self.assertNotIn(stale, analysis_fields)
 
     def test_publish_plan_projects_lean_checklist(self):
         commands = []

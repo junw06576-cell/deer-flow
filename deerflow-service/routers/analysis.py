@@ -78,12 +78,37 @@ def _run_analysis_task(task_id: str, req: AnalysisRequest):
 
         if req.human_feedback:
             request_payload["human_feedback"] = req.human_feedback
-            message = (
+            parts = [
                 "This is a re-submission after human review. "
                 "The previous analysis and questions are in the conversation history above. "
                 "Human feedback on those questions is provided in the 'human_feedback' field below. "
                 "Based on the feedback, update the QC result, revise the Redis plan if needed, "
-                "and proceed to the next step. Do NOT re-run the full analysis from scratch.\n\n"
+                "and proceed to the next step. Do NOT re-run the full analysis from scratch. "
+                "CRITICAL: When running pipeline.py apply, you MUST include --execute to write "
+                "results (labels/state/description) to TFS. Never omit --execute.",
+            ]
+            if req.additional_info:
+                request_payload["additional_info"] = req.additional_info
+                parts.append(
+                    "Additional context is provided in the 'additional_info' field — "
+                    "factor this into your revision."
+                )
+            parts.append(f"\n\nTask input JSON:\n{json.dumps(request_payload, ensure_ascii=False)}")
+            message = "\n".join(parts)
+        elif req.additional_info:
+            request_payload["additional_info"] = req.additional_info
+            message = (
+                "This is a re-analysis request with additional context. "
+                "The previous analysis is in the conversation history above. "
+                "Review the previous result, incorporate the additional context provided "
+                "in the 'additional_info' field below, and revise the analysis accordingly. "
+                "Do NOT start from scratch — build on the previous work, correct any issues "
+                "identified by the additional context, and update the QC result and Redis plan. "
+                "Do not ask for clarification and do not stop after summarizing this input. "
+                "Write the authoritative result to Redis using the provided redis_key. "
+                "CRITICAL: When running pipeline.py apply, you MUST include --execute to write "
+                "results (labels/state/description) to TFS. Never omit --execute. "
+                "Return only a short JSON status summary when the workflow is finished.\n\n"
                 "Task input JSON:\n"
                 f"{json.dumps(request_payload, ensure_ascii=False)}"
             )
@@ -94,7 +119,9 @@ def _run_analysis_task(task_id: str, req: AnalysisRequest):
                 "for clarification and do not stop after summarizing this input. "
                 "Read the configured skill instructions, run the required workflow, "
                 "and write the authoritative result to Redis using the provided "
-                "redis_key. Return only a short JSON status summary when the workflow "
+                "redis_key. CRITICAL: When running pipeline.py apply, you MUST include "
+                "--execute to write results (labels/state/description) to TFS. Never omit "
+                "--execute. Return only a short JSON status summary when the workflow "
                 "is finished.\n\n"
                 "Task input JSON:\n"
                 f"{json.dumps(request_payload, ensure_ascii=False)}"
@@ -105,7 +132,6 @@ def _run_analysis_task(task_id: str, req: AnalysisRequest):
             work_item_id=req.work_item_id,
             message=message,
             agent_name=AGENT_NAME,
-            redis_url=req.redis_url,
         )
 
         try:

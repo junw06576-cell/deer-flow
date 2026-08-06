@@ -93,30 +93,46 @@ def fail(msg, code='ERROR', exit_code=1):
 
 # ---------------- config ----------------
 def load_config(path, pat_override=None, collection_override=None):
-    """加载配置。PAT 优先级：pat_override(--pat) > 环境变量 TFS_PAT > 配置 tfs.pat(字面)。
-    collection 优先级：collection_override(--collection) > 环境变量 TFS_COLLECTION > 配置 tfs.collection。
+    """加载配置。优先级：命令行参数 > 环境变量 > 配置文件（兜底）。
 
-    动态 PAT / collection 仅本次调用临时使用，不写回配置；配置里的值是兜底默认。
+    环境变量映射：
+      TFS_PAT        → tfs.pat
+      TFS_COLLECTION → tfs.collection
+      TFS_PORT       → tfs.port
+      TFS_PROJECT    → tfs.project
+      TFS_SERVER     → tfs.server
+
+    命令行 --pat / --collection 不写回配置，仅本次调用有效。
     """
     if not os.path.exists(path):
         fail(f"配置文件不存在: {path}（从 tfs-config.template.json 复制一份）", 'CONFIG_NOT_FOUND')
     with open(path, 'r', encoding='utf-8') as f:
         c = json.load(f)
     t = c.get('tfs', {})
-    for k in ('server', 'port', 'collection', 'project'):
-        if not t.get(k):
-            fail(f"配置缺字段 tfs.{k}", 'CONFIG_INCOMPLETE')
+    # 环境变量优先于配置文件
+    server = os.environ.get('TFS_SERVER') or t.get('server', '')
+    port = int(os.environ.get('TFS_PORT') or t.get('port', 0))
+    collection = collection_override or os.environ.get('TFS_COLLECTION') or t.get('collection', '')
+    project = os.environ.get('TFS_PROJECT') or t.get('project', '')
     pat = pat_override or os.environ.get('TFS_PAT') or t.get('pat')
+    # 校验必填字段
+    if not server:
+        fail('未提供 TFS server：请在配置 tfs.server 填入，或用环境变量 TFS_SERVER 传入', 'CONFIG_INCOMPLETE')
+    if not port:
+        fail('未提供 TFS port：请在配置 tfs.port 填入，或用环境变量 TFS_PORT 传入', 'CONFIG_INCOMPLETE')
+    if not collection:
+        fail('未提供 TFS collection：请在配置 tfs.collection 填入，或用 --collection / 环境变量 TFS_COLLECTION 传入', 'CONFIG_INCOMPLETE')
+    if not project:
+        fail('未提供 TFS project：请在配置 tfs.project 填入，或用环境变量 TFS_PROJECT 传入', 'CONFIG_INCOMPLETE')
     if not pat:
         fail('未提供 PAT：请在配置 tfs.pat 填入，或用 --pat / 环境变量 TFS_PAT 临时传入', 'PAT_MISSING')
-    collection = collection_override or os.environ.get('TFS_COLLECTION') or t['collection']
     external_attachments = c.get('external_attachments', {})
     if external_attachments and not isinstance(external_attachments, dict):
         fail('external_attachments 必须是对象', 'CONFIG_INCOMPLETE')
     return {
-        'server': t['server'], 'port': t['port'],
-        'collection': collection, 'project': t['project'],
-        'base_url': f"http://{t['server']}:{t['port']}/tfs/{urllib.parse.quote(collection)}/{urllib.parse.quote(t['project'])}",
+        'server': server, 'port': port,
+        'collection': collection, 'project': project,
+        'base_url': f"http://{server}:{port}/tfs/{urllib.parse.quote(collection)}/{urllib.parse.quote(project)}",
         'pat': pat,
         'external_attachments': external_attachments,
     }

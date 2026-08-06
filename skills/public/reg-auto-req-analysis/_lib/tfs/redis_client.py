@@ -203,6 +203,8 @@ def publish_plan(plan, run_mode, collection, config_path=None, timeout=DEFAULT_T
         key = plan_key(collection, wid)
         checklist = plan.get('checklist') or {}
         generated_at = checklist.get('generated_at_utc', '') if isinstance(checklist, dict) else ''
+        if not generated_at:
+            generated_at = plan.get('generated_at_utc', '')
         mapping = {
             'run_id': plan.get('run_id', ''),
             'verdict': plan.get('verdict', ''),
@@ -219,12 +221,14 @@ def publish_plan(plan, run_mode, collection, config_path=None, timeout=DEFAULT_T
             mapping['next'] = checklist.get('next', '')
             redis_checklist = {k: v for k, v in checklist.items() if k in ('responsible', 'items')}
             mapping['checklist'] = json.dumps(redis_checklist, ensure_ascii=False)
+        elif plan.get('verdict') == 'SKIP-ANALYSIS':
+            mapping['skip_reason'] = plan.get('skip_reason', '')
         flat = []
         for k, v in mapping.items():
             flat.extend([k, v])
         with _Connection(cfg, timeout) as c:
             c.execute('HSET', key, *flat)
-            for stale in ('checklist', 'work_item', 'next'):
+            for stale in ('checklist', 'work_item', 'next', 'skip_reason'):
                 if stale not in mapping:
                     c.execute('HDEL', key, stale)
             c.execute('SADD', ids_key(collection), wid)

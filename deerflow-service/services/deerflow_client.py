@@ -5,7 +5,6 @@ from config import (
     DEERFLOW_LANGGRAPH_URL,
     DEER_FLOW_INTERNAL_AUTH_TOKEN,
     DEER_FLOW_OWNER_USER_ID,
-    REDIS_URL,
 )
 
 
@@ -43,7 +42,6 @@ class DeerFlowClient:
         work_item_id: int,
         message: str,
         agent_name: str,
-        redis_url: str | None = None,
     ) -> str:
         """
         在指定 Thread 中运行 Agent，阻塞等待并返回完整响应。
@@ -65,11 +63,6 @@ class DeerFlowClient:
             "thread_id": tid,
             "non_interactive": True,
         }
-        effective_redis_url = redis_url or REDIS_URL
-        if effective_redis_url:
-            context["secrets"] = {
-                "REDIS_URL": effective_redis_url,
-            }
 
         thread_payload = {
             "thread_id": tid,

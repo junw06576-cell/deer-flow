@@ -10,14 +10,14 @@ class AnalysisRequest(BaseModel):
     work_item_id: int = Field(..., description="TFS work item ID")
     tfs_pat: str = Field(..., description="TFS Personal Access Token")
     tfs_project: str = Field(..., description="TFS project name")
-    redis_url: Optional[str] = Field(
-        None,
-        description="Optional Redis URL passed to the DeerFlow skill as REDIS_URL; falls back to service REDIS_URL.",
-    )
     human_feedback: Optional[list[dict]] = Field(
         None,
         description=("人工确认结果。格式：[{\"question_id\": \"q1\", \"answer\": \"...\"}, ...]。"
-                     "传入后 Agent 据此进行第二轮工作流"),
+                     "传入后 Agent 据此进行第二轮工作流（基于上次结果修正，不重跑全流程）。"),
+    )
+    additional_info: Optional[str] = Field(
+        None,
+        description="重新分析时的补充说明。可与 human_feedback 同时传入。",
     )
 
 

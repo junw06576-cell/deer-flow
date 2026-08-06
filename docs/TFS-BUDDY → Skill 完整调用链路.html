@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TFS-BUDDY → Skill 完整调用链路</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; background: #f5f5f0; color: #2c2c2a; line-height: 1.6; }
+  
+  .page { max-width: 1100px; margin: 0 auto; padding: 32px 24px; }
+  
+  h1 { font-size: 22px; font-weight: 600; color: #2c2c2a; margin-bottom: 6px; }
+  .subtitle { font-size: 14px; color: #888; margin-bottom: 32px; }
+  
+  /* ── 主链路图 ── */
+  .chain { display: flex; flex-direction: column; gap: 0; position: relative; }
+  
+  .step { display: flex; align-items: stretch; gap: 20px; }
+  
+  /* 左侧：序号 + 连线 */
+  .step-rail { width: 44px; flex-shrink: 0; display: flex; flex-direction: column; align-items: center; }
+  .step-num { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 15px; font-weight: 600; color: #fff; flex-shrink: 0; }
+  .step-line { flex: 1; width: 2px; background: #d4d4c7; }
+  
+  /* 颜色方案 */
+  .c-blue .step-num { background: #378ADD; }
+  .c-green .step-num { background: #1D9E75; }
+  .c-orange .step-num { background: #D85A30; }
+  .c-purple .step-num { background: #534AB7; }
+  .c-teal .step-num { background: #0F6E56; }
+  
+  /* 右侧：卡片 */
+  .step-card { flex: 1; background: #fff; border: 1px solid #e0e0d8; border-radius: 10px; padding: 20px 24px; margin-bottom: 16px; transition: box-shadow 0.2s, border-color 0.2s; }
+  .step-card:hover { box-shadow: 0 4px 16px rgba(0,0,0,0.08); border-color: #c8c8c0; }
+  
+  .card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; flex-wrap: wrap; gap: 8px; }
+  .card-title { font-size: 16px; font-weight: 600; }
+  .card-tags { display: flex; gap: 6px; flex-wrap: wrap; }
+  .tag { display: inline-block; padding: 2px 10px; border-radius: 4px; font-size: 12px; font-weight: 500; }
+  .tag-method { background: #E6F1FB; color: #185FA5; }
+  .tag-auth { background: #FAEEDA; color: #854F0B; }
+  .tag-sync { background: #F1EFE8; color: #5F5E5A; }
+  .tag-internal { background: #EAF3DE; color: #3B6D11; }
+  
+  .card-section { margin-bottom: 12px; }
+  .card-section:last-child { margin-bottom: 0; }
+  .section-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: #999; margin-bottom: 4px; }
+  
+  .param-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .param-table th { text-align: left; font-weight: 500; color: #888; font-size: 11px; padding: 4px 8px; border-bottom: 1px solid #eee; }
+  .param-table td { padding: 5px 8px; border-bottom: 1px solid #f4f4f0; vertical-align: top; }
+  .param-table tr:last-child td { border-bottom: none; }
+  .param-name { font-family: "SF Mono", "Fira Code", monospace; font-size: 12px; color: #534AB7; font-weight: 500; }
+  .param-type { font-family: "SF Mono", monospace; font-size: 11px; color: #888; }
+  .param-required { color: #D85A30; font-size: 11px; font-weight: 500; }
+  .param-optional { color: #aaa; font-size: 11px; }
+  .param-desc { color: #555; font-size: 12px; }
+  
+  .endpoint { font-family: "SF Mono", monospace; font-size: 13px; background: #f8f8f5; padding: 6px 12px; border-radius: 6px; border: 1px solid #eee; margin-bottom: 10px; display: flex; align-items: center; gap: 8px; overflow-x: auto; }
+  .ep-method { font-weight: 700; color: #378ADD; white-space: nowrap; }
+  .ep-path { color: #2c2c2a; word-break: break-all; }
+  
+  .note-box { background: #FAEEDA; border: 1px solid #FAC775; border-radius: 6px; padding: 10px 14px; font-size: 12px; color: #633806; margin-top: 10px; }
+  .note-box strong { color: #854F0B; }
+  
+  .key-insight { background: #EAF3DE; border: 1px solid #97C459; border-radius: 6px; padding: 10px 14px; font-size: 13px; color: #27500A; margin-top: 10px; }
+  
+  .json-preview { background: #1e1e2e; color: #cdd6f4; border-radius: 8px; padding: 14px 18px; font-family: "SF Mono", "Fira Code", monospace; font-size: 12px; line-height: 1.7; overflow-x: auto; }
+  .json-key { color: #89b4fa; }
+  .json-str { color: #a6e3a1; }
+  .json-num { color: #fab387; }
+  .json-bool { color: #f38ba8; }
+  .json-null { color: #6c7086; }
+  .json-comment { color: #6c7086; font-style: italic; }
+  
+  /* 分隔线 */
+  .divider { height: 1px; background: #e0e0d8; margin: 28px 0; }
+  
+  /* 底部原则区 */
+  .principles { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 28px; }
+  .principle { background: #fff; border: 1px solid #e0e0d8; border-radius: 8px; padding: 16px 18px; }
+  .principle-title { font-size: 13px; font-weight: 600; margin-bottom: 6px; display: flex; align-items: center; gap: 6px; }
+  .principle-desc { font-size: 12px; color: #666; line-height: 1.7; }
+  
+  .icon { display: inline-flex; width: 18px; height: 18px; border-radius: 4px; align-items: center; justify-content: center; font-size: 11px; flex-shrink: 0; }
+  .icon-lock { background: #FAEEDA; color: #854F0B; }
+  .icon-arrow { background: #E6F1FB; color: #185FA5; }
+  .icon-check { background: #EAF3DE; color: #3B6D11; }
+  .icon-shield { background: #EEEDFE; color: #534AB7; }
+  
+  /* 折叠 */
+  .collapsible-header { cursor: pointer; user-select: none; display: flex; align-items: center; gap: 6px; }
+  .collapsible-header::before { content: "▶"; font-size: 10px; color: #aaa; transition: transform 0.2s; display: inline-block; }
+  .collapsible-header.open::before { transform: rotate(90deg); }
+  .collapsible-body { display: none; margin-top: 8px; }
+  .collapsible-body.open { display: block; }
+  
+  /* 流程概览条 */
+  .overview-bar { display: flex; align-items: center; gap: 0; background: #fff; border: 1px solid #e0e0d8; border-radius: 10px; padding: 16px 20px; margin-bottom: 28px; overflow-x: auto; }
+  .ob-node { display: flex; align-items: center; gap: 8px; padding: 8px 14px; border-radius: 6px; font-size: 12px; font-weight: 500; white-space: nowrap; flex-shrink: 0; }
+  .ob-arrow { color: #ccc; font-size: 16px; margin: 0 4px; flex-shrink: 0; }
+  .ob-blue { background: #E6F1FB; color: #185FA5; }
+  .ob-green { background: #EAF3DE; color: #3B6D11; }
+  .ob-orange { background: #FAECE7; color: #993C1D; }
+  .ob-purple { background: #EEEDFE; color: #3C3489; }
+  
+  /* 响应式 */
+  @media (max-width: 700px) {
+    .principles { grid-template-columns: 1fr; }
+    .step { gap: 12px; }
+    .step-card { padding: 16px; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+<h1>TFS-BUDDY → Skill 完整调用链路</h1>
+<p class="subtitle">从工作流平台到 Skill 内部的 TFS 回写，逐层拆解接口、输入与输出</p>
+
+<!-- 流程概览条 -->
+<div class="overview-bar">
+  <div class="ob-node ob-purple">TFS-BUDDY</div>
+  <span class="ob-arrow">→</span>
+  <div class="ob-node ob-blue">FastAPI (透传)</div>
+  <span class="ob-arrow">→</span>
+  <div class="ob-node ob-blue">DeerFlow LangGraph</div>
+  <span class="ob-arrow">→</span>
+  <div class="ob-node ob-green">req-evaluation Skill</div>
+  <span class="ob-arrow">→</span>
+  <div class="ob-node ob-green">req-generation Skill</div>
+  <span class="ob-arrow">→</span>
+  <div class="ob-node ob-orange">TFS 服务 (回写)</div>
+</div>
+
+<div class="chain">
+
+<!-- ═══════ ① TFS-BUDDY 发起 ═══════ -->
+<div class="step c-blue">
+  <div class="step-rail">
+    <div class="step-num">1</div>
+    <div class="step-line"></div>
+  </div>
+  <div class="step-card">
+    <div class="card-header">
+      <span class="card-title">TFS-BUDDY 发起请求</span>
+      <div class="card-tags">
+        <span class="tag tag-method">REST</span>
+        <span class="tag tag-auth">X-API-Key</span>
+      </div>
+    </div>
+    
+    <div class="card-section">
+      <div class="section-label">调用方式</div>
+      <p style="font-size:13px;color:#555;">TFS-BUDDY 工作流平台作为调用方，向 FastAPI 服务发送 HTTP 请求。所有请求通过 <code>X-API-Key</code> 头认证。</p>
+    </div>
+    
+    <div class="card-section">
+      <div class="section-label">可用接口</div>
+      <div class="endpoint"><span class="ep-method">POST</span><span class="ep-path">/api/v1/evaluation/start</span></div>
+      <div class="endpoint"><span class="ep-method">POST</span><span class="ep-path">/api/v1/evaluation/continue</span></div>
+      <div class="endpoint"><span class="ep-method">POST</span><span class="ep-path">/api/v1/generation/start</span> <span style="font-size:11px;color:#aaa;">（仅重试）</span></div>
+    </div>
+
+    <div class="card-section">
+      <div class="section-label">入参（所有接口统一）</div>
+      <table class="param-table">
+        <thead><tr><th>参数</th><th>类型</th><th>必填</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td class="param-name">collection_name</td><td class="param-type">string</td><td class="param-required">是</td><td class="param-desc">TFS 集合名称，如 WN_Data_Platform</td></tr>
+          <tr><td class="param-name">work_item_id</td><td class="param-type">int</td><td class="param-required">是</td><td class="param-desc">TFS 工作项 ID</td></tr>
+          <tr><td class="param-name">tfs_pat</td><td class="param-type">string</td><td class="param-required">是</td><td class="param-desc">TFS Personal Access Token</td></tr>
+          <tr><td class="param-name">tfs_project</td><td class="param-type">string</td><td class="param-required">是</td><td class="param-desc">TFS 项目名称</td></tr>
+          <tr><td class="param-name">answers</td><td class="param-type">array</td><td class="param-optional">仅 continue</td><td class="param-desc">用户答案列表 [{question_id, answer}]</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="key-insight">
+      <strong>关键：</strong>collection_name + work_item_id 用于构造 thread_id（"{collection_name}-{work_item_id}"），TFS-BUDDY 无需存储 Thread ID，每次直接算出。
+    </div>
+  </div>
+</div>
+
+<!-- ═══════ ② FastAPI 服务封装 ═══════ -->
+<div class="step c-blue">
+  <div class="step-rail">
+    <div class="step-num">2</div>
+    <div class="step-line"></div>
+  </div>
+  <div class="step-card">
+    <div class="card-header">
+      <span class="card-title">FastAPI 服务封装层</span>
+      <div class="card-tags">
+        <span class="tag tag-sync">纯透传</span>
+        <span class="tag tag-internal">不做业务逻辑</span>
+      </div>
+    </div>
+    
+    <div class="card-section">
+      <div class="section-label">职责</div>
+      <p style="font-size:13px;color:#555;">FastAPI <strong>不做</strong> TFS 回写、<strong>不做</strong> 文档解析等业务逻辑。只做三件事：</p>
+      <ul style="font-size:13px;color:#555;margin-top:4px;padding-left:20px;">
+        <li>构造 thread_id，透传请求至 DeerFlow</li>
+        <li>调用 DeerFlow LangGraph API（同步阻塞，600s 超时）</li>
+        <li>解析 Skill 输出中的标记（<code>&lt;tfs_result&gt;</code> / JSON），透传至响应</li>
+      </ul>
+    </div>
+
+    <div class="card-section">
+      <div class="section-label">核心组件</div>
+      <table class="param-table">
+        <thead><tr><th>组件</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td class="param-name">DeerFlowClient</td><td class="param-desc">httpx POST → DeerFlow LangGraph API</td></tr>
+          <tr><td class="param-name">SessionManager</td><td class="param-desc">评估状态缓存（开发用内存 / 生产用 Redis）</td></tr>
+          <tr><td style="color:#ccc;text-decoration:line-through;">~~tfs_client.py~~</td><td class="param-desc" style="color:#ccc;">已移除 — TFS 调用归 Skill 内部</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card-section" style="margin-top:12px;">
+      <div class="section-label">evaluation/continue 内部流程</div>
+      <div class="json-preview">
+<span class="json-comment"># confirmed 时，自动触发 Skill 内部生成 + TFS 回写</span>
+<span class="json-key">if</span> eva_status == <span class="json-str">"confirmed"</span>:
+    gen_message = {
+        <span class="json-str">"action"</span>: <span class="json-str">"generate_and_write_back"</span>,
+        <span class="json-str">"work_item_id"</span>: req.work_item_id,
+        <span class="json-str">"tfs_pat"</span>: req.tfs_pat,         <span class="json-comment"># 透传给 Skill</span>
+        <span class="json-str">"tfs_project"</span>: req.tfs_project,   <span class="json-comment"># 透传给 Skill</span>
+    }
+    gen_response = deerflow.run_agent(message=gen_message)
+    tfs_result = parse_tfs_result(gen_response)  <span class="json-comment"># 解析 &lt;tfs_result&gt; 标记</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════ ③ DeerFlow LangGraph ═══════ -->
+<div class="step c-blue">
+  <div class="step-rail">
+    <div class="step-num">3</div>
+    <div class="step-line"></div>
+  </div>
+  <div class="step-card">
+    <div class="card-header">
+      <span class="card-title">DeerFlow 2.0 — LangGraph API</span>
+      <div class="card-tags">
+        <span class="tag tag-method">POST</span>
+        <span class="tag tag-sync">sync 600s</span>
+      </div>
+    </div>
+
+    <div class="card-section">
+      <div class="section-label">接口</div>
+      <div class="endpoint">
+        <span class="ep-method">POST</span>
+        <span class="ep-path">{DEERFLOW_BASE}/api/langgraph/threads/{thread_id}/runs</span>
+      </div>
+    </div>
+
+    <div class="card-section">
+      <div class="section-label">入参</div>
+      <table class="param-table">
+        <thead><tr><th>参数</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td class="param-name">message</td><td class="param-desc">评估提示 / 答案JSON / 生成指令JSON</td></tr>
+          <tr><td class="param-name">config.configurable.agent_name</td><td class="param-desc">固定 "req-analysis"</td></tr>
+          <tr><td class="param-name">config.configurable.thread_id</td><td class="param-desc">"{collection_name}-{work_item_id}"</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card-section">
+      <div class="section-label">出参</div>
+      <p style="font-size:13px;color:#555;">Agent 的完整文本响应。DeerFlow 根据 message 内容自动路由到对应 Skill。</p>
+    </div>
+
+    <div class="note-box">
+      <strong>Thread 持久化：</strong>DeerFlow 将对话历史持久化到 SQLite（生产可切 PostgreSQL），同一 thread_id 跨天可续。
+    </div>
+  </div>
+</div>
+
+<!-- ═══════ ④ Skill: 评估 ═══════ -->
+<div class="step c-green">
+  <div class="step-rail">
+    <div class="step-num">4</div>
+    <div class="step-line"></div>
+  </div>
+  <div class="step-card">
+    <div class="card-header">
+      <span class="card-title">req-evaluation Skill</span>
+      <div class="card-tags">
+        <span class="tag tag-internal">Agent 内部路由</span>
+        <span class="tag tag-method">纯 JSON 输出</span>
+      </div>
+    </div>
+
+    <div class="card-section">
+      <div class="section-label">输入</div>
+      <table class="param-table">
+        <thead><tr><th>场景</th><th>输入内容</th></tr></thead>
+        <tbody>
+          <tr><td class="param-desc">首次评估</td><td class="param-desc"><code>work_item_id</code>、<code>collection_name</code>、<code>tfs_pat</code>、<code>tfs_project</code>（Skill 内部从 TFS 获取工作项详情）</td></tr>
+          <tr><td class="param-desc">继续评估</td><td class="param-desc">同上四项 + <code>previous_evaluation</code>（上轮 JSON）+ <code>answers</code>（用户答案列表）</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card-section">
+      <div class="section-label">输出（结构化 JSON）</div>
+      <div class="json-preview">
+{
+  <span class="json-key">"evaluation_status"</span>: <span class="json-str">"pending"</span> | <span class="json-str">"confirmed"</span>,
+  <span class="json-key">"requirement_summary"</span>: <span class="json-str">"需求一句话摘要"</span>,
+  <span class="json-key">"evaluation_report"</span>: <span class="json-str">"Markdown 格式评估报告"</span>,
+  <span class="json-key">"pending_questions"</span>: [
+    {
+      <span class="json-key">"id"</span>: <span class="json-str">"Q1"</span>,
+      <span class="json-key">"dimension"</span>: <span class="json-str">"评估维度"</span>,
+      <span class="json-key">"question"</span>: <span class="json-str">"待确认的具体问题"</span>,
+      <span class="json-key">"context"</span>: <span class="json-str">"问题的上下文说明"</span>,
+      <span class="json-key">"impact"</span>: <span class="json-str">"HIGH"</span> | <span class="json-str">"MEDIUM"</span> | <span class="json-str">"LOW"</span>,
+      <span class="json-key">"example_answer"</span>: <span class="json-str">"建议的回答示例"</span>
+    }
+  ],
+  <span class="json-key">"confirmed_requirements"</span>: <span class="json-str">"已确认需求的完整文本（confirmed 时必填）"</span>,
+  <span class="json-key">"statistics"</span>: {
+    <span class="json-key">"total_questions"</span>: <span class="json-num">3</span>,
+    <span class="json-key">"by_impact"</span>: {<span class="json-str">"HIGH"</span>: <span class="json-num">1</span>, <span class="json-str">"MEDIUM"</span>: <span class="json-num">1</span>, <span class="json-str">"LOW"</span>: <span class="json-num">1</span>}
+  }
+}
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════ ⑤ Skill: 生成 + TFS 回写 ═══════ -->
+<div class="step c-orange">
+  <div class="step-rail">
+    <div class="step-num">5</div>
+    <div class="step-line"></div>
+  </div>
+  <div class="step-card" style="border-color: #F5C4B3;">
+    <div class="card-header">
+      <span class="card-title">req-generation Skill（含 TFS 回写）</span>
+      <div class="card-tags">
+        <span class="tag tag-internal">Agent 内部路由</span>
+        <span class="tag" style="background:#FAECE7;color:#993C1D;">TFS 回写在 Skill 内部</span>
+      </div>
+    </div>
+
+    <div class="key-insight" style="background:#FAECE7;border-color:#F0997B;color:#712B13;">
+      <strong>核心设计：</strong>TFS 回写是 Skill 内部行为，不对外暴露。FastAPI 只是透传 Skill 返回的 <code>&lt;tfs_result&gt;</code>。
+    </div>
+
+    <div class="card-section" style="margin-top:14px;">
+      <div class="section-label">输入（从 message 获取）</div>
+      <table class="param-table">
+        <thead><tr><th>参数</th><th>来源</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td class="param-desc">已确认需求</td><td class="param-desc">同一 Thread 的评估历史</td><td class="param-desc">Agent 从对话历史中自动提取</td></tr>
+          <tr><td class="param-name">TFS_BASE_URL</td><td class="param-desc">Skill 配置 / 环境变量</td><td class="param-desc">部署时固定</td></tr>
+          <tr><td class="param-name">tfs_pat</td><td class="param-desc">message 传入</td><td class="param-desc">TFS-BUDDY → FastAPI → Skill</td></tr>
+          <tr><td class="param-name">tfs_project</td><td class="param-desc">message 传入</td><td class="param-desc">TFS-BUDDY → FastAPI → Skill</td></tr>
+          <tr><td class="param-name">work_item_id</td><td class="param-desc">message 传入</td><td class="param-desc">回写目标工作项</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card-section">
+      <div class="section-label">Skill 内部执行流程</div>
+      <div class="json-preview">
+<span class="json-comment">## 1. 生成文档</span>
+从 Thread 历史中提取 confirmed_requirements
+→ 生成 Markdown 格式功能需求文档
+
+<span class="json-comment">## 2. 调用 TFS API 回写（Skill 内部）</span>
+PATCH {TFS_BASE_URL}/{tfs_project}/_apis/wit/workitems/{work_item_id}
+  Header: Authorization: Basic base64(:{tfs_pat})
+  Body: [{"op":"add", "path":"/fields/System.Description", "value":"..."}]
+
+<span class="json-comment">## 3. 输出回写结果</span>
+      </div>
+    </div>
+
+    <div class="card-section">
+      <div class="section-label">输出（&lt;tfs_result&gt; 标记）</div>
+      <div class="json-preview">
+&lt;tfs_result&gt;
+{
+  <span class="json-key">"tfs_status"</span>: <span class="json-str">"success"</span>,
+  <span class="json-key">"tfs_message"</span>: <span class="json-str">"文档已回写至 TFS 工作项 #233564"</span>,
+  <span class="json-key">"document_content"</span>: <span class="json-str">"## 功能需求文档\n\n### 1. 功能概述\n..."</span>,
+  <span class="json-key">"tfs_result"</span>: { <span class="json-comment">/* TFS API 原始响应 */</span> }
+}
+&lt;/tfs_result&gt;
+      </div>
+    </div>
+
+    <div class="card-section">
+      <div class="section-label">TFS API 详情（Skill 内部调用）</div>
+      <table class="param-table">
+        <thead><tr><th>项</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td class="param-desc">方式</td><td class="param-desc">HTTP PATCH，Skill 通过 bash Tool 或内置 HTTP 调用</td></tr>
+          <tr><td class="param-desc">接口</td><td><code style="font-size:12px;">{TFS_BASE_URL}/{project}/_apis/wit/workitems/{id}?api-version=6.0</code></td></tr>
+          <tr><td class="param-desc">认证</td><td class="param-desc">HTTP Basic Auth（<code>:{tfs_pat}</code> → Base64）</td></tr>
+          <tr><td class="param-desc">操作</td><td class="param-desc">将 Markdown 文档写入工作项的 <code>System.Description</code> 字段</td></tr>
+          <tr><td class="param-desc">失败降级</td><td class="param-desc">回写失败时，Skill 输出 <code>&lt;doc_result&gt;</code>（仅文档内容），FastAPI 返回 <code>tfs_write_failed</code> + document_content</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════ ⑥ 响应返回 ═══════ -->
+<div class="step c-purple">
+  <div class="step-rail">
+    <div class="step-num">6</div>
+    <div class="step-line" style="background:transparent;"></div>
+  </div>
+  <div class="step-card">
+    <div class="card-header">
+      <span class="card-title">FastAPI 透传 → TFS-BUDDY 接收</span>
+      <div class="card-tags">
+        <span class="tag tag-method">JSON 响应</span>
+      </div>
+    </div>
+
+    <div class="card-section">
+      <div class="section-label">evaluation/continue 响应</div>
+      <table class="param-table">
+        <thead><tr><th>字段</th><th>类型</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td class="param-name">thread_id</td><td class="param-type">string</td><td class="param-desc">如 WN_Data_Platform-233564</td></tr>
+          <tr><td class="param-name">evaluation_status</td><td class="param-type">string</td><td class="param-desc">"pending" / "confirmed"</td></tr>
+          <tr><td class="param-name">evaluation_report</td><td class="param-type">string</td><td class="param-desc">Markdown 评估报告</td></tr>
+          <tr><td class="param-name">pending_questions</td><td class="param-type">array</td><td class="param-desc">待确认问题列表（pending 时）</td></tr>
+          <tr><td class="param-name">document_content</td><td class="param-type">string</td><td class="param-desc">文档内容（confirmed 时由 Skill 返回）</td></tr>
+          <tr><td class="param-name">generation_status</td><td class="param-type">string</td><td class="param-desc">"success" / "tfs_write_failed" / "generation_empty"</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note-box">
+      <strong>TFS-BUDDY 只需一个循环：</strong>发需求 → 收问题 → 答问题 → 最后一次返回 confirmed 时直接拿到文档内容和回写状态。
+    </div>
+  </div>
+</div>
+
+</div><!-- .chain -->
+
+<div class="divider"></div>
+
+<!-- 设计原则 -->
+<div class="principles">
+  <div class="principle">
+    <div class="principle-title"><span class="icon icon-lock">🔒</span> TFS 回写不外露</div>
+    <div class="principle-desc">TFS API 调用完全封装在 req-generation Skill 内部。FastAPI 不持有任何 TFS 连接逻辑，只做透传。Skill 可独立移植。</div>
+  </div>
+  <div class="principle">
+    <div class="principle-title"><span class="icon icon-arrow">→</span> 透传链：PAT 不落地</div>
+    <div class="principle-desc">tfs_pat 和 tfs_project 从 TFS-BUDDY → FastAPI message → DeerFlow → Skill → TFS API，全程内存传递，不持久化、不落盘。</div>
+  </div>
+  <div class="principle">
+    <div class="principle-title"><span class="icon icon-check">✓</span> 一条 Thread 走到底</div>
+    <div class="principle-desc">评估和生成共享 thread_id = {collection_name}-{work_item_id}。生成阶段直接从 Thread 历史提取已确认需求，不需要 API 传大段文本。</div>
+  </div>
+  <div class="principle">
+    <div class="principle-title"><span class="icon icon-shield">🛡</span> 失败降级</div>
+    <div class="principle-desc">Skill 回写 TFS 失败时，输出降级为 &lt;doc_result&gt;（仅文档内容）。FastAPI 返回 tfs_write_failed + document_content，TFS-BUDDY 可自行处理。</div>
+  </div>
+</div>
+
+</div><!-- .page -->
+</body>
+</html>

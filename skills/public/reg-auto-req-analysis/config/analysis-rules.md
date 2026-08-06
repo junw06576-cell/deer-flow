@@ -27,6 +27,8 @@
 > **迭代分析闭环前置**：先按 `iteration-analysis-closure.md` 形成现状、问题、差异、方案取舍、成功衡量和非目标。方向、根因、业务范围、取数口径或权限口径不清 → 回退 QC `NEED-REVIEW`；现有实现、相似能力或方案取舍未证实 → `MANUAL-REVIEW` 并按规则记录仅审计的 `evidence_gaps`。不得用候选实现、未确认根因或“按现有逻辑”替代业务结论。
 > **AUTO-ANA 额外硬前置**：`kb.ready=true` 且 `kb.dedup_ran=true`（相似实现查重必须实际执行，落审计字段 `kb.dedup_ran`）；优化类类别（`existing-*`、`bug-fix`、`print-adjustment`、`data-management`、`permission-config`、`performance`、`mobile-adaptation`）还须在 `kb.findings` 至少一条 `state=已证实` 锚定被改现有模块/入口（见 §下文「现有实现基线」）。KB 未就绪 / 查重未跑 / 无已证实锚点 → 改判 `MANUAL-REVIEW`（不加 `STOP-AUTO`，属信息缺口而非高风险）。此条由 `pipeline.py` 强制校验。
 > **治标警惕（根因/方向存疑→不分析、回退质控）**：需求描述含性能/异常抱怨（卡顿/慢/等待/超时/延迟/崩溃/数据错乱等）但变更方案为**使用层规避**（上限/提醒/分批/限制/阈值等）而非根因优化时，**不得判 AUTO-ANA**，也**不得选 `performance` 类别把规避方案写成"优化方案"兜底、或用 `existing-ui-simple` 等类别绕过根因**——按 `SKILL.md` 回退通路回质控 `NEED-REVIEW`（产品 + 研发负责人），审计 `qc_recheck=analysis-rootcause-mismatch`。详见 `references/qc-checklist.md` §一 #10。
+> **BUG 语义优先于标题/类型**：既有功能出现错误、字段条件分支有值/为空不一致或结果偏离既有预期时，即使工作项类型为功能性、标题写“优化/调整”，也优先选 `bug-fix`；不得包装成新功能、打印调整或界面优化。字段/打印异常须枚举全部取值分支；未闭环来源进入 `evidence_gaps` 并判 MANUAL。
+> **现有设计规则也是证据**：界面颜色、标签、图标、列位或交互方式不能只按实施方案默认。须核实当前页或同类页面的既有规则；只定位到组件、不清楚设计规则时记 `evidence_gaps`，不得 AUTO-ANA。
 > **AUTO-ANA 指派**：判 AUTO-ANA 后另按 `references/assignee-rules.md`（产品×版本×模块→开发组长）匹配唯一指派人，写入计划字段 `assignee_to`（display name）；范围外产品/混合版本且模块不清/命中多人时省略该字段、在分析者描述与审计写候选，**不阻断 AUTO-ANA**（指派与终局置信度解耦）。版本号取工作项 `version` 字段（`Winning.Prod.Version`），**不从迭代路径**判断。
 
 ## 2. 高风险清单（→ `MANUAL-REVIEW` + `PM-AI-STOP-AUTO`）

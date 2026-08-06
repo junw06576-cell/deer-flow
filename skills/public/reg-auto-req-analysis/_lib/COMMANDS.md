@@ -3,15 +3,17 @@
 > 本文件是本 skill 全部可复用命令的**唯一权威索引**：5 个脚本、全部子命令、知识库工具与各自适用场景。
 > 别处在散文里提到的命令都是叙述，以本文件为准。
 
-## 写脚本前必读（纪律）
+## 运行前必读（硬纪律）
 
-写任何临时脚本（Python / shell / jq / grep 拼接）之前，按序：
+处理任何工作项前完整读取本文件，并遵守：
 
-1. **先查本文件**找候选命令；
-2. 对候选脚本跑 `python3 <script>.py --help`（tfs_client / pipeline 的子命令可 `python3 <script>.py <子命令> --help`）确认签名；
-3. **能复用既有命令就绝不新写**。
+1. **只使用本文件列出的脚本、子命令和 MCP 工具**；拿不准签名时先跑 `--help`。
+2. **不得临时实现 TFS/Redis/知识库客户端**，不得使用 `python3 -c`、Python heredoc、临时 Python/shell/jq 脚本、`redis-cli` 或直接 `curl` 操作 TFS/Redis。
+3. **不得在运行时安装依赖**，包括 `pip`、`pip3`、`uv pip`、`npm`、`brew`；缺依赖时按工具返回的 `unsupported`/降级结果继续或停止。
+4. **工作项流程的 TFS 写入只走 `pipeline.py apply`**；Redis 写入只由 pipeline 内部发布。不得直接调用 `tfs_client.py` 写子命令或 Redis 写命令绕过计划校验。
+5. 本文件没有所需能力时，记录 `ERROR`/`evidence_gap` 后停止，禁止自行补脚本、装包或寻找旁路。
 
-**纯解读既有命令的 JSON 输出**——不要为此手写脚本，直接在上下文里读 JSON 完成。典型：
+**纯解读既有命令的 JSON 输出**——直接在上下文里完成，不得为此手写脚本。典型：
 - `list-iterations` 返回的 `matched`/`earliest` → 按 `config/qc-rules.md §2`、`_lib/tfs/field-flow.md §4 条硬约束` 在上下文里做 timing 判定与 earliest/matched 取舍；
 - 附件转换器返回的 `converted`/`needs_read`/`error`/`unsupported` → 按 `_lib/attachment-evidence.md §2` 映射 `parsed`/`unparsed`/`skipped`（图片 `needs_read` 还要视觉读取，**不可脚本化**）；
 - `fetch` 返回的 `workItem` → 直接读字段；
@@ -35,7 +37,7 @@
 
 ## tfs_client.py（读 / 写标签 / 转状态 / 写字段 / 传附件 / 审计）
 
-`python3 skills/reg-auto-req-analysis/_lib/tfs/tfs_client.py <子命令> ...` —— 标准库 `urllib`，无第三方依赖；所有写操作支持 `--dry-run`。
+`python3 skills/reg-auto-req-analysis/_lib/tfs/tfs_client.py <子命令> ...` —— 标准库 `urllib`，无第三方依赖。下表写子命令供执行器维护和受控诊断使用；**本 skill 的正常工作项流程不得直接调用它们写 TFS，必须使用 `pipeline.py apply`**。
 
 | 子命令 | 签名 | 何时用 |
 |---|---|---|
@@ -71,11 +73,13 @@ python3 skills/reg-auto-req-analysis/_lib/tfs/attachment_converter.py \
   --input-dir 过程文件/<id>/<run_id>/附件 --output-dir 过程文件/<id>/<run_id>/附件解析 [--max-bytes N]
 ```
 
-核心纯标准库；`.pdf` 在本机装 PyMuPDF(`fitz`) 时提取，未装降级 `unsupported`。返回 `converted`/`needs_read`/`error`/`unsupported`/`skipped` —— **三态映射（parsed/unparsed/skipped）在上下文按 `_lib/attachment-evidence.md §2` 做**（图片 `needs_read` 要视觉读取）。
+核心纯标准库；`.pdf` 在本机已有 PyMuPDF(`fitz`) 时提取，未安装则降级 `unsupported`，**不得在运行中安装**。返回 `converted`/`needs_read`/`error`/`unsupported`/`skipped` —— **三态映射（parsed/unparsed/skipped）在上下文按 `_lib/attachment-evidence.md §2` 做**（图片 `needs_read` 要视觉读取）。
 
 ## redis_client.py（结果存储查询）
 
 `python3 skills/reg-auto-req-analysis/_lib/tfs/redis_client.py <子命令> [--config <path>]`
+
+本脚本只公开探活和查询。Redis 写入由 `pipeline.py apply` 内部完成；没有独立写入命令时必须停止，不得用 `redis-cli`、`python3 -c` 或临时脚本补写。
 
 | 子命令 | 签名 | 何时用 |
 |---|---|---|

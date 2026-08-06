@@ -35,6 +35,7 @@ OPTIMIZATION_CATEGORIES = {
     'permission-config', 'performance', 'mobile-adaptation',
 }
 QC_VERDICTS = {'NEED-INFO', 'NEED-REVIEW'}
+ROUTING_VERDICTS = {'SKIP-ANALYSIS'}
 ANALYSIS_VERDICTS = {'AUTO-ANA', 'MANUAL-REVIEW', 'MANUAL-REVIEW-STOP'}
 ANALYSIS_DESCRIPTION_REQUIREMENTS = {
     'report': ('合规性', '查询条件', '列定义', '统计口径', '特殊统计逻辑'),
@@ -55,6 +56,21 @@ ANALYSIS_DESCRIPTION_REQUIREMENTS = {
     'performance': ('性能问题', '影响范围', '优化方案', '预期效果', '现有行为/数据影响'),
     'mobile-adaptation': ('业务场景', '涉及功能', '数据同步逻辑', '与 Web 差异', '现有行为/数据影响'),
 }
+CONCISE_ANALYSIS_DESCRIPTION_REQUIREMENTS = {
+    'existing-ui-simple': ('核心改造点', '生效场景', '不涉及范围'),
+    'print-adjustment': ('核心改造点', '打印场景', '不涉及范围'),
+    'data-management': ('核心改造点', '操作场景', '不涉及范围'),
+}
+CONCISE_V2_ANALYSIS_DESCRIPTION_REQUIREMENTS = {
+    'existing-ui-simple': ('核心改造点',),
+    'print-adjustment': ('核心改造点',),
+    'data-management': ('核心改造点',),
+}
+ANALYSIS_DESCRIPTION_PROFILES = {'concise-v1', 'concise-v2'}
+ANALYSIS_EMPHASIS_LABELS = {
+    '核心改造点', '修改方案', '改造内容', '功能方案', '修复方案', '优化方案',
+    '修改内容', '现有接口变更', '操作规则', '协作事项',
+}
 ANALYSIS_PATH_VALUE_RE = re.compile(r'^菜单路径：\s*(\S(?:.*?\S)?)\s*；\s*操作路径：\s*(\S(?:.*\S)?)$')
 ANALYSIS_BANNED_PHRASES = (
     '请开发处理', '已和项目沟通，关闭', '没问题，关闭',
@@ -71,7 +87,9 @@ ITERATION_ANALYSIS_CLOSURE_BANNED_PHRASES = ('候选实现', '未确认根因', 
 ANALYSIS_GAP_FIELDS = ('id', 'topic', 'missing', 'impact', 'question', 'options', 'allow_other')
 EVIDENCE_GAP_FIELDS = ('id', 'topic', 'missing', 'impact', 'owner', 'next_action')
 EVIDENCE_GAP_OWNERS = {'研发', '知识库治理'}
+QC_EVIDENCE_RESOLUTION_FIELDS = ('id', 'initial_gap', 'resolution', 'evidence_refs')
 CHECKLIST_ITEM_FIELDS = ('id', 'question', 'options', 'allow_other')
+MAX_QC_ITEMS = 3
 
 # 字段流转：指派人账号解析（身份字段必须 WINNING\account 格式；bare display name TFS 报「未知标识」HTTP400）
 ASSIGNEE_FULL_RE = re.compile(r'<([^>]+)>')                      # Dev.Leader 全格式里的 <WINNING\account>
@@ -109,13 +127,20 @@ def render_analysis_description_html(content):
             continue
         category = re.fullmatch(r'###\s+([a-z-]+)（(.+)）', line)
         if category:
-            rendered.append(f'<div><strong>{_plain_analysis_text(category.group(2))}</strong></div>')
+            rendered.append(f'<div>{_plain_analysis_text(category.group(2))}</div>')
             continue
         field = re.fullmatch(r'-\s+\*\*(.+?)\*\*：\s*(\S.*?)\s*', line)
         if field:
             label = _plain_analysis_text(field.group(1))
             value = _plain_analysis_text(field.group(2))
-            rendered.append(f'<div><strong>{label}：</strong>{value}</div>')
+            if label in ANALYSIS_EMPHASIS_LABELS:
+                rendered.append(f'<div><strong>{label}：</strong>{value}</div>')
+            else:
+                rendered.append(f'<div>{label}：{value}</div>')
+            continue
+        numbered = re.fullmatch(r'([1-9][0-9]*)\.\s+(\S.*?)\s*', line)
+        if numbered:
+            rendered.append(f'<div>{numbered.group(1)}. {_plain_analysis_text(numbered.group(2))}</div>')
             continue
         raise ValueError(f'分析者描述含不支持的 Markdown 行：{line}')
     if not rendered:
@@ -244,6 +269,8 @@ def validate_checklist(plan, errors):
     if not isinstance(items, list) or not items:
         errors.append('checklist.items 必须为非空数组')
         return
+    if len(items) > MAX_QC_ITEMS:
+        errors.append(f'checklist.items 最多 {MAX_QC_ITEMS} 项；请合并同类问题并保留会改变实现或验收的最高优先项')
     ids = set()
     for index, item in enumerate(items, start=1):
         if not isinstance(item, dict):
@@ -272,7 +299,7 @@ def validate_checklist(plan, errors):
 def expected_for(plan):
     """终局契约按 verdict 分派（不再按 skill 名）。
 
-    合并后新 run 用 skill='auto-req'；旧 skill 名 'auto-req-qc'/'auto-req-analysis'
+    合并后新 run 用 skill='auto-req-analysis'；旧 skill 名 'auto-req-qc'
     仅作审计标签与向后兼容，终局契约一律由 verdict 决定。PASS 保留仅用于兼容旧 PASS 计划，
     新 SKILL.md 不再产出 PASS 计划（PASS 为内部阶段闸）。
     """
@@ -280,6 +307,8 @@ def expected_for(plan):
     if verdict in QC_VERDICTS:
         tag = 'PM-AI-QC-NEED-INFO' if verdict == 'NEED-INFO' else 'PM-AI-QC-NEED-REVIEW'
         return ({tag}, None, {'qc-followup'})
+    if verdict in ROUTING_VERDICTS:
+        return (set(), None, set())
     if verdict == 'PASS':
         return (set(), None, set())
     if verdict in ANALYSIS_VERDICTS:
@@ -368,6 +397,74 @@ def validate_evidence_gaps(plan, errors):
     return gaps
 
 
+def is_confirmed_evidence_ref(plan, value):
+    """确认 KB/wiki 索引引用的 finding 已被证实；work-item 不属于补证来源。"""
+    if not isinstance(value, str) or not EVIDENCE_REF_RE.fullmatch(value):
+        return False
+    if value.startswith('kb:'):
+        source, index = 'kb', int(value[3:])
+    elif value.startswith('wiki:'):
+        source, index = 'wiki', int(value[5:])
+    else:
+        return False
+    findings = plan.get(source, {}).get('findings') if isinstance(plan.get(source), dict) else None
+    if not isinstance(findings, list) or index >= len(findings) or not isinstance(findings[index], dict):
+        return False
+    expected_states = {'已证实'} if source == 'kb' else {'已证实', 'wiki-确认'}
+    return findings[index].get('state') in expected_states
+
+
+def validate_qc_evidence_resolution(plan, errors):
+    """校验初判 NEED-REVIEW 被 KB/wiki 已证实证据逐项消除的审计记录。"""
+    resolution = plan.get('qc_evidence_resolution')
+    if resolution is None:
+        return
+    if plan['version'] != PLAN_VERSION or plan['verdict'] not in ANALYSIS_VERDICTS:
+        errors.append('qc_evidence_resolution 仅允许出现在 v2 分析计划')
+        return
+    if not isinstance(resolution, dict):
+        errors.append('qc_evidence_resolution 必须为对象')
+        return
+    if resolution.get('initial_verdict') != 'NEED-REVIEW':
+        errors.append('qc_evidence_resolution.initial_verdict 必须为 NEED-REVIEW')
+    if resolution.get('post_evidence_verdict') != 'PASS':
+        errors.append('qc_evidence_resolution.post_evidence_verdict 必须为 PASS')
+    items = resolution.get('items')
+    if not isinstance(items, list) or not items:
+        errors.append('qc_evidence_resolution.items 必须为非空数组')
+        return
+    ids = set()
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            errors.append(f'qc_evidence_resolution.items[{index}] 必须为对象')
+            continue
+        missing = [field for field in QC_EVIDENCE_RESOLUTION_FIELDS if field not in item]
+        if missing:
+            errors.append(f'qc_evidence_resolution.items[{index}] 缺少字段：{missing}')
+            continue
+        item_id = item['id']
+        if not isinstance(item_id, str) or not ANALYSIS_GAP_ID_RE.fullmatch(item_id):
+            errors.append(f'qc_evidence_resolution.items[{index}].id 必须为稳定的字母开头标识')
+        elif item_id in ids:
+            errors.append('qc_evidence_resolution.items.id 不可重复')
+        else:
+            ids.add(item_id)
+        for field in ('initial_gap', 'resolution'):
+            if not isinstance(item[field], str) or not item[field].strip():
+                errors.append(f'qc_evidence_resolution.items[{index}].{field} 必须为非空字符串')
+        refs = item['evidence_refs']
+        if (not isinstance(refs, list) or not refs
+                or not all(isinstance(value, str) for value in refs)):
+            errors.append(f'qc_evidence_resolution.items[{index}].evidence_refs 必须为非空数组')
+            continue
+        if len(refs) != len(set(refs)):
+            errors.append(f'qc_evidence_resolution.items[{index}].evidence_refs 不可重复')
+        for value in refs:
+            if not is_confirmed_evidence_ref(plan, value):
+                errors.append(
+                    f'qc_evidence_resolution.items[{index}] 的 {value} 必须指向 kb/wiki.findings 的已证实项')
+
+
 def validate_evidence_refs(plan, errors):
     """校验 v2 闭环结论到工作项、KB 或 wiki 已证实 finding 的内部追溯。"""
     if plan['version'] != PLAN_VERSION or plan['verdict'] not in ANALYSIS_VERDICTS:
@@ -378,11 +475,6 @@ def validate_evidence_refs(plan, errors):
         errors.append(f'evidence_refs 必须精确覆盖闭环章节：{sorted(expected)}')
         return
 
-    def confirmed(source, index):
-        findings = plan.get(source, {}).get('findings') if isinstance(plan.get(source), dict) else None
-        return (isinstance(findings, list) and index < len(findings)
-                and isinstance(findings[index], dict) and findings[index].get('state') == '已证实')
-
     for heading, values in refs.items():
         if (not isinstance(values, list) or not values
                 or not all(isinstance(value, str) and EVIDENCE_REF_RE.fullmatch(value) for value in values)):
@@ -391,9 +483,9 @@ def validate_evidence_refs(plan, errors):
         if len(values) != len(set(values)):
             errors.append(f'evidence_refs.{heading} 不可重复')
         for value in values:
-            if value.startswith('kb:') and not confirmed('kb', int(value[3:])):
+            if value.startswith('kb:') and not is_confirmed_evidence_ref(plan, value):
                 errors.append(f'evidence_refs.{heading} 引用的 {value} 必须指向 kb.findings 的已证实项')
-            if value.startswith('wiki:') and not confirmed('wiki', int(value[5:])):
+            if value.startswith('wiki:') and not is_confirmed_evidence_ref(plan, value):
                 errors.append(f'evidence_refs.{heading} 引用的 {value} 必须指向 wiki.findings 的已证实项')
 
     if plan['verdict'] == 'AUTO-ANA':
@@ -418,6 +510,13 @@ def validate_analysis_description(plan, plan_path, check_files, errors):
     invalid = sorted(set(categories) - set(ANALYSIS_DESCRIPTION_REQUIREMENTS))
     if invalid:
         errors.append(f'analysis_description.categories 含不支持类别：{invalid}')
+    profile = plan.get('analysis_profile')
+    if profile is not None:
+        if profile not in ANALYSIS_DESCRIPTION_PROFILES:
+            errors.append(f'analysis_profile 仅允许：{sorted(ANALYSIS_DESCRIPTION_PROFILES)}')
+        elif (len(categories) != 1
+              or categories[0] not in CONCISE_ANALYSIS_DESCRIPTION_REQUIREMENTS):
+            errors.append(f'{profile} 仅允许单一 existing-ui-simple / print-adjustment / data-management 类别')
     if not check_files or invalid:
         return
 
@@ -464,7 +563,13 @@ def validate_analysis_description(plan, plan_path, check_files, errors):
         errors.append('变更方案三级标题类别必须与 analysis_description.categories 完全一致')
     for category in categories:
         section = sections.get(category, '')
-        for label in ANALYSIS_DESCRIPTION_REQUIREMENTS[category]:
+        if profile == 'concise-v1' and category in CONCISE_ANALYSIS_DESCRIPTION_REQUIREMENTS:
+            requirements = CONCISE_ANALYSIS_DESCRIPTION_REQUIREMENTS[category]
+        elif profile == 'concise-v2' and category in CONCISE_V2_ANALYSIS_DESCRIPTION_REQUIREMENTS:
+            requirements = CONCISE_V2_ANALYSIS_DESCRIPTION_REQUIREMENTS[category]
+        else:
+            requirements = ANALYSIS_DESCRIPTION_REQUIREMENTS[category]
+        for label in requirements:
             field = re.compile(rf'^[ \t]*-[ \t]*\*\*{re.escape(label)}\*\*：[ \t]*\S+', re.MULTILINE)
             if not field.search(section):
                 errors.append(f'分析类别 {category} 缺少非空维度“{label}”')
@@ -598,6 +703,14 @@ def validate_plan(plan, plan_path, check_files=True):
     elif auto_scopes not in (None, []):
         errors.append('仅 AUTO-ANA 计划可以声明 auto_scopes')
 
+    if plan['verdict'] in ROUTING_VERDICTS:
+        if not isinstance(plan.get('skip_reason'), str) or not plan['skip_reason'].strip():
+            errors.append('SKIP-ANALYSIS 计划必须含非空 skip_reason')
+        for field in ('checklist', 'analysis_description', 'analysis_profile', 'analysis_gaps',
+                      'evidence_refs', 'evidence_gaps', 'auto_scopes', 'assignee_to'):
+            if field in plan and plan[field] not in (None, [], {}):
+                errors.append(f'SKIP-ANALYSIS 计划不得声明 {field}')
+
     # assignee_to：AUTO-ANA 自动指派（System.AssignedTo）。仅 AUTO-ANA 允许非空；
     # 匹配不出唯一人时省略该字段（指派留空、在描述/审计说明候选，不阻断流转）。
     # 写入格式必须可解析为 WINNING\账号（运行时优先取 Winning.Dev.Leader，本字段为回退；
@@ -638,6 +751,7 @@ def validate_plan(plan, plan_path, check_files=True):
         analysis_gaps = validate_analysis_gaps(plan, errors)
         validate_evidence_gaps(plan, errors)
         validate_evidence_refs(plan, errors)
+        validate_qc_evidence_resolution(plan, errors)
     elif plan['verdict'] in QC_VERDICTS:
         validate_checklist(plan, errors)
 
@@ -736,6 +850,7 @@ def record_failure(plan, error, run_mode, state_from='', state_to='', actions=No
         'analysis_gaps': plan.get('analysis_gaps'),
         'evidence_refs': plan.get('evidence_refs'),
         'evidence_gaps': plan.get('evidence_gaps'),
+        'qc_evidence_resolution': plan.get('qc_evidence_resolution'),
         'qc_recheck': plan.get('qc_recheck'),
         'wiki': plan.get('wiki'),
     }
@@ -876,7 +991,13 @@ def apply_plan(plan, plan_path, execute, config_path, pat_override=None, collect
 
     dry_run = not execute
     expected_tags = set(validation['expected_tags'])
-    owned_tags = ANALYSIS_TAGS if plan['verdict'] in ANALYSIS_VERDICTS else QC_TAGS
+    if plan['verdict'] in ANALYSIS_VERDICTS:
+        owned_tags = ANALYSIS_TAGS
+    elif plan['verdict'] in QC_VERDICTS:
+        owned_tags = QC_TAGS
+    else:
+        # 路由跳过终局只记审计/Redis，不清理或新增任何 TFS 标签。
+        owned_tags = set()
     actions = []
     try:
         for tag in sorted((set(gate['work_item']['tags']) & owned_tags) - expected_tags):
@@ -916,11 +1037,14 @@ def apply_plan(plan, plan_path, execute, config_path, pat_override=None, collect
                         'auto_scopes': plan.get('auto_scopes', []), 'kb': plan.get('kb'), 'wiki': plan.get('wiki'),
                         'iteration': plan.get('iteration'), 'attachments': plan.get('attachments'),
                         'analysis_description': plan.get('analysis_description'),
+                        'analysis_profile': plan.get('analysis_profile'),
                         'analysis_gaps': plan.get('analysis_gaps'),
                         'evidence_refs': plan.get('evidence_refs'),
                         'evidence_gaps': plan.get('evidence_gaps'),
+                        'qc_evidence_resolution': plan.get('qc_evidence_resolution'),
                         'assignee_to': plan.get('assignee_to'),
                         'qc_recheck': plan.get('qc_recheck'),
+                        'skip_reason': plan.get('skip_reason'),
                         'plan': os.path.abspath(plan_path),
                         'redis': redis_result,
                         'actions': actions}, plan['run_id'])
