@@ -6,7 +6,6 @@
 （质控结论、变更方案）由 skill 生成，本脚本只负责校验计划和可恢复地执行写入。
 """
 import argparse
-import datetime
 import html
 import json
 import os
@@ -23,7 +22,7 @@ PLAN_VERSION = 2
 SUPPORTED_PLAN_VERSIONS = {1, PLAN_VERSION}
 RUN_ID_RE = re.compile(r'^[A-Za-z0-9_-]{8,80}$')
 ANALYSIS_GAP_ID_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_-]{0,63}$')
-EVIDENCE_REF_RE = re.compile(r'^(?:work-item|kb:[0-9]+|wiki:[0-9]+)$')
+EVIDENCE_REF_RE = re.compile(r'^(?:work-item|kb:[0-9]+|wiki:[0-9]+|req:[0-9]+)$')
 QC_TAGS = {'PM-AI-QC-NEED-INFO', 'PM-AI-QC-NEED-REVIEW'}
 ANALYSIS_TAGS = {'PM-AI-AUTO-ANA', 'PM-AI-MANUAL-REVIEW', 'PM-AI-STOP-AUTO'}
 DOWNSTREAM_TERMINAL_TAGS = {'PM-AI-MANUAL-PASSED'}
@@ -66,10 +65,36 @@ CONCISE_V2_ANALYSIS_DESCRIPTION_REQUIREMENTS = {
     'print-adjustment': ('核心改造点',),
     'data-management': ('核心改造点',),
 }
-ANALYSIS_DESCRIPTION_PROFILES = {'concise-v1', 'concise-v2'}
+CONCISE_V3_ANALYSIS_DESCRIPTION_REQUIREMENTS = {
+    'report': ('报表分析',),
+    'third-party-debug': ('联调说明',),
+    'third-party-adjustment': ('接口调整方案',),
+    'third-party-new': ('业务节点与触发时机', '字段与返回数据处理', '业务改造与控制'),
+    'existing-ui-simple': ('界面优化方案',),
+    'existing-query-simple': ('查询调整方案',),
+    'existing-query-adjustment': ('查询规则与展示', '影响范围与控制'),
+    'existing-complex': ('改造条线与内容', '改造流程与范围', '风险与项目注意事项'),
+    'new-feature': ('功能与交互方案', '控制与数据安全', '数据及第三方影响'),
+    'print-adjustment': ('打印调整方案',),
+    'bug-fix': ('问题与条件', '修复方案与影响'),
+    'data-management': ('数据管理方案',),
+    'permission-config': ('权限参数方案',),
+    'performance': ('性能优化方案',),
+    'mobile-adaptation': ('多端适配方案',),
+}
+ANALYSIS_DESCRIPTION_PROFILES = {'concise-v1', 'concise-v2', 'concise-v3'}
+ANALYSIS_DECISION_SUMMARY_REQUIREMENTS = (
+    '决策结论', '生效路径与条件', '决策边界', '验收要点',
+)
 ANALYSIS_EMPHASIS_LABELS = {
     '核心改造点', '修改方案', '改造内容', '功能方案', '修复方案', '优化方案',
     '修改内容', '现有接口变更', '操作规则', '协作事项',
+    '报表分析', '联调说明', '接口调整方案', '业务节点与触发时机',
+    '字段与返回数据处理', '业务改造与控制', '界面优化方案', '查询调整方案',
+    '查询规则与展示', '影响范围与控制', '改造条线与内容', '改造流程与范围',
+    '风险与项目注意事项', '功能与交互方案', '控制与数据安全', '数据及第三方影响',
+    '打印调整方案', '问题与条件', '修复方案与影响', '数据管理方案',
+    '权限参数方案', '性能优化方案', '多端适配方案',
 }
 ANALYSIS_PATH_VALUE_RE = re.compile(r'^菜单路径：\s*(\S(?:.*?\S)?)\s*；\s*操作路径：\s*(\S(?:.*\S)?)$')
 ANALYSIS_BANNED_PHRASES = (
@@ -84,10 +109,38 @@ ITERATION_ANALYSIS_CLOSURE_REQUIREMENTS = {
     '成功衡量与非目标': ('成功衡量', '非目标'),
 }
 ITERATION_ANALYSIS_CLOSURE_BANNED_PHRASES = ('候选实现', '未确认根因', '按现有逻辑')
+TRACEABILITY_HEADING = '四、范围—方案—验收追踪'
+TRACEABILITY_HEADERS = ('ID', '范围/改动点', '方案/目标行为', '验收场景与结果', '结论状态', '依据或缺口')
+TRACEABILITY_STATUSES = {'已证实', '合理假设', '待业务确认'}
 ANALYSIS_GAP_FIELDS = ('id', 'topic', 'missing', 'impact', 'question', 'options', 'allow_other')
 EVIDENCE_GAP_FIELDS = ('id', 'topic', 'missing', 'impact', 'owner', 'next_action')
-EVIDENCE_GAP_OWNERS = {'研发', '知识库治理'}
+EVIDENCE_GAP_OWNERS = {'研发', '知识库治理', '产品'}
+EVIDENCE_GAP_KINDS = {'technical', 'background'}
+EVIDENCE_GAP_TYPES = {
+    'WIKI_TOPIC_MISSING', 'WIKI_BROKEN_LINK', 'TFS_SNAPSHOT_LAG', 'TFS_SEARCH_TRUNCATED',
+    'GITNEXUS_REPO_MISSING', 'GITNEXUS_EMBEDDINGS_DISABLED', 'DB_SCHEMA_PARTIAL',
+    'DB_RELATION_PARTIAL', 'EXISTING_IMPL_LOCATION', 'SIMILAR_IMPL_DEDUP',
+}
 QC_EVIDENCE_RESOLUTION_FIELDS = ('id', 'initial_gap', 'resolution', 'evidence_refs')
+TFS_REQUIREMENTS_FINDING_FIELDS = ('work_item_id', 'fact', 'state', 'source_tool')
+TFS_REQUIREMENTS_FINDING_STATES = {'已证实', '候选', '未确认'}
+TFS_REQUIREMENTS_TOOLS = {
+    'get_requirements_summary', 'get_related_work_items', 'search_requirements', 'get_work_item',
+}
+TFS_REQUIREMENTS_CONFIRMED_TOOLS = {'get_related_work_items', 'get_work_item'}
+TFS_MATURITY_STATES = {'设想', '分析确认', '已落地'}
+# evidence-loop-v2 采集状态契约（四源同构）：区分「已命中 / 完整查询后无命中 / 覆盖不完整 / 来源不可用」。
+# 只有 coverage_status=COMPLETE ∧ stop_reason=exhausted ∧ 未截断 的 NO_HIT 才能支撑「无相似/无现有实现」负面结论。
+EVIDENCE_ACQUISITION_SOURCES = ('tfs_requirements', 'wiki', 'gitnexus', 'db_knowledge')
+EVIDENCE_AVAILABILITY = {'READY', 'UNAVAILABLE'}
+EVIDENCE_COVERAGE_STATUS = {'COMPLETE', 'PARTIAL', 'OUT_OF_SCOPE', 'UNKNOWN'}
+EVIDENCE_QUERY_STATUS = {'HIT', 'NO_HIT', 'SKIPPED', 'ERROR'}
+EVIDENCE_STOP_REASONS = {'exhausted', 'verified_hit', 'hard_limit', 'source_gap', 'not_applicable'}
+ATTACHMENT_CONVERTERS = {
+    'markitdown', 'builtin-fallback', 'libreoffice+markitdown',
+    'libreoffice+builtin-fallback', '人工视觉读取',
+}
+ATTACHMENT_RUNTIME_MODES = {'fixed-image', 'managed-host', 'builtin-only'}
 CHECKLIST_ITEM_FIELDS = ('id', 'question', 'options', 'allow_other')
 MAX_QC_ITEMS = 3
 
@@ -96,7 +149,7 @@ ASSIGNEE_FULL_RE = re.compile(r'<([^>]+)>')                      # Dev.Leader �
 ASSIGNEE_WINNING_RE = re.compile(r'^WINNING\\[A-Za-z][A-Za-z0-9_]*$')
 ASSIGNEE_PAREN_RE = re.compile(r'\(([A-Za-z][A-Za-z0-9_]*)\)')   # 回退 display(account) 取账号
 QC_RULE_SOURCE = 'pre-qc-v1'
-ANALYSIS_RULE_SOURCES = {'fallback-v1', 'evidence-loop-v1'}
+ANALYSIS_RULE_SOURCES = {'fallback-v1', 'evidence-loop-v1', 'evidence-loop-v2'}
 LEGACY_RULE_SOURCES = {'pre-qc-v1', 'fallback'}
 
 
@@ -117,7 +170,7 @@ def _plain_analysis_text(value):
     return html.escape(plain, quote=True)
 
 
-def render_analysis_description_html(content):
+def render_analysis_description_html(content, analysis_profile=None):
     """将受控分析者描述 Markdown 转成 TFS 编辑器可读的基础 HTML。"""
     section = re.sub(r'<!--.*?-->', '', extract_analysis_description_markdown(content), flags=re.DOTALL)
     rendered = []
@@ -127,12 +180,17 @@ def render_analysis_description_html(content):
             continue
         category = re.fullmatch(r'###\s+([a-z-]+)（(.+)）', line)
         if category:
-            rendered.append(f'<div>{_plain_analysis_text(category.group(2))}</div>')
+            if analysis_profile != 'concise-v3':
+                rendered.append(f'<div>{_plain_analysis_text(category.group(2))}</div>')
             continue
         field = re.fullmatch(r'-\s+\*\*(.+?)\*\*：\s*(\S.*?)\s*', line)
         if field:
             label = _plain_analysis_text(field.group(1))
             value = _plain_analysis_text(field.group(2))
+            if analysis_profile == 'concise-v3' and (
+                    label in {'需求类别', '路径'}
+                    or label in ANALYSIS_DECISION_SUMMARY_REQUIREMENTS):
+                raise ValueError(f'concise-v3 分析者描述不得包含“{label}”')
             if label in ANALYSIS_EMPHASIS_LABELS:
                 rendered.append(f'<div><strong>{label}：</strong>{value}</div>')
             else:
@@ -246,7 +304,8 @@ def validate_rules_source(plan, errors):
     if source.get('qc') != QC_RULE_SOURCE:
         errors.append(f'rules_source.qc 必须为 {QC_RULE_SOURCE!r}')
     if 'analysis' in expected:
-        allowed = {'evidence-loop-v1'} if plan['version'] == PLAN_VERSION else ANALYSIS_RULE_SOURCES
+        allowed = ({'evidence-loop-v1', 'evidence-loop-v2'}
+                   if plan['version'] == PLAN_VERSION else ANALYSIS_RULE_SOURCES)
         if source.get('analysis') not in allowed:
             errors.append(f'rules_source.analysis 必须为 {sorted(allowed)}')
 
@@ -394,24 +453,354 @@ def validate_evidence_gaps(plan, errors):
                 errors.append(f'evidence_gaps[{index}].{field} 必须为非空字符串')
         if gap['owner'] not in EVIDENCE_GAP_OWNERS:
             errors.append(f'evidence_gaps[{index}].owner 必须为 {sorted(EVIDENCE_GAP_OWNERS)} 之一')
+        # type/kind 为可选字段（缺口分类与来源区分）；存在时校验取值。
+        if 'type' in gap and gap['type'] not in EVIDENCE_GAP_TYPES:
+            errors.append(f'evidence_gaps[{index}].type 必须为 {sorted(EVIDENCE_GAP_TYPES)} 之一')
+        if 'kind' in gap and gap['kind'] not in EVIDENCE_GAP_KINDS:
+            errors.append(f'evidence_gaps[{index}].kind 必须为 {sorted(EVIDENCE_GAP_KINDS)} 之一')
     return gaps
 
 
+def validate_tfs_requirements(plan, errors):
+    """校验可选的 TFS 需求历史证据对象。"""
+    evidence = plan.get('tfs_requirements')
+    if evidence is None:
+        return
+    if not isinstance(evidence, dict):
+        errors.append('tfs_requirements 必须为对象')
+        return
+    required = ('ready', 'coverage', 'tools_used', 'findings', 'note')
+    missing = [field for field in required if field not in evidence]
+    if missing:
+        errors.append(f'tfs_requirements 缺少字段：{missing}')
+        return
+    if not isinstance(evidence['ready'], bool):
+        errors.append('tfs_requirements.ready 必须为布尔值')
+    if not isinstance(evidence['coverage'], dict):
+        errors.append('tfs_requirements.coverage 必须为对象')
+    elif evidence['ready'] and not evidence['coverage']:
+        errors.append('tfs_requirements.ready=true 时 coverage 不得为空')
+    tools_used = evidence['tools_used']
+    if (not isinstance(tools_used, list)
+            or not all(isinstance(tool, str) and tool in TFS_REQUIREMENTS_TOOLS for tool in tools_used)
+            or len(tools_used) != len(set(tools_used))):
+        errors.append(f'tfs_requirements.tools_used 必须为不重复的工具白名单子集：{sorted(TFS_REQUIREMENTS_TOOLS)}')
+        tools_used = []
+    elif evidence['ready'] and 'get_requirements_summary' not in tools_used:
+        errors.append('tfs_requirements.ready=true 时 tools_used 必须包含 get_requirements_summary')
+    if not isinstance(evidence['note'], str) or not evidence['note'].strip():
+        errors.append('tfs_requirements.note 必须为非空字符串')
+    findings = evidence['findings']
+    if not isinstance(findings, list):
+        errors.append('tfs_requirements.findings 必须为数组')
+        return
+    for index, finding in enumerate(findings):
+        if not isinstance(finding, dict):
+            errors.append(f'tfs_requirements.findings[{index}] 必须为对象')
+            continue
+        missing = [field for field in TFS_REQUIREMENTS_FINDING_FIELDS if field not in finding]
+        if missing:
+            errors.append(f'tfs_requirements.findings[{index}] 缺少字段：{missing}')
+            continue
+        if not isinstance(finding['work_item_id'], int) or finding['work_item_id'] <= 0:
+            errors.append(f'tfs_requirements.findings[{index}].work_item_id 必须为正整数')
+        if not isinstance(finding['fact'], str) or not finding['fact'].strip():
+            errors.append(f'tfs_requirements.findings[{index}].fact 必须为非空字符串')
+        if not isinstance(finding['state'], str) or finding['state'] not in TFS_REQUIREMENTS_FINDING_STATES:
+            errors.append(
+                f'tfs_requirements.findings[{index}].state 必须为 '
+                f'{sorted(TFS_REQUIREMENTS_FINDING_STATES)} 之一')
+        source_tool = finding['source_tool']
+        if not isinstance(source_tool, str) or source_tool not in TFS_REQUIREMENTS_TOOLS:
+            errors.append(
+                f'tfs_requirements.findings[{index}].source_tool 必须为 '
+                f'{sorted(TFS_REQUIREMENTS_TOOLS)} 之一')
+        elif source_tool not in tools_used:
+            errors.append(f'tfs_requirements.findings[{index}].source_tool 必须出现在 tools_used')
+        if (finding['state'] == '已证实'
+                and (not isinstance(source_tool, str)
+                     or source_tool not in TFS_REQUIREMENTS_CONFIRMED_TOOLS)):
+            errors.append(
+                f'tfs_requirements.findings[{index}] 只有 get_work_item 或 '
+                'get_related_work_items 的结果可标为已证实')
+        # maturity 为可选字段；存在时校验取值，且「已落地」不得基于未证实/设想级证据。
+        maturity = finding.get('maturity')
+        if maturity is not None:
+            if maturity not in TFS_MATURITY_STATES:
+                errors.append(
+                    f'tfs_requirements.findings[{index}].maturity 必须为 '
+                    f'{sorted(TFS_MATURITY_STATES)} 之一')
+            elif maturity == '已落地' and finding['state'] != '已证实':
+                errors.append(
+                    f'tfs_requirements.findings[{index}].maturity=已落地 要求 state=已证实'
+                    '（设想级证据不得支撑「已落地」结论）')
+
+
+def validate_existing_feature(plan, errors):
+    """校验「功能已存在」声明（一套公版假设下，既有能力已满足本次诉求）。
+
+    可选顶层对象 existing_feature：satisfied=true 表示查重命中 maturity=已落地
+    的历史方案且其能力覆盖本次需求诉求，本次无需新增改动。此时终局必须
+    MANUAL-REVIEW（人工确认；非高风险故不加 STOP-AUTO）——本函数硬闸阻止
+    satisfied=true ∧ verdict=AUTO-ANA 的自动放行，与 kb.dedup_ran 等 AUTO
+    硬闸一致（缺一即“改判 MANUAL-REVIEW”）。字段缺省向后兼容。
+    """
+    feature = plan.get('existing_feature')
+    if feature is None:
+        return
+    if not isinstance(feature, dict):
+        errors.append('existing_feature 必须为对象')
+        return
+    satisfied = feature.get('satisfied')
+    if not isinstance(satisfied, bool):
+        errors.append('existing_feature.satisfied 必须为布尔值')
+        satisfied = None  # 无法判定，跳过硬闸继续校验其它子字段
+    if 'requirement_ids' in feature:
+        ids = feature['requirement_ids']
+        if (not isinstance(ids, list)
+                or not all(isinstance(i, int) and i > 0 for i in ids)
+                or len(ids) != len(set(ids))):
+            errors.append('existing_feature.requirement_ids 若存在必须为不重复的正整数数组（已实现该功能的需求号）')
+    if 'note' in feature:
+        note = feature['note']
+        if not isinstance(note, str) or not note.strip():
+            errors.append('existing_feature.note 若存在必须为非空字符串')
+    # 硬闸：功能已存在 → 不得 AUTO-ANA（须人工确认，非高风险故不加 STOP-AUTO）。
+    if satisfied is True and plan['verdict'] == 'AUTO-ANA':
+        errors.append(
+            'existing_feature.satisfied=true 表示本次诉求已被既有能力满足（功能已存在），'
+            '禁止 AUTO-ANA，须改判 MANUAL-REVIEW 并在分析者描述标注“该功能已存在”'
+            '（附需求号）；属信息确认而非高风险，故不加 STOP-AUTO')
+
+
+def validate_evidence_acquisition(plan, errors):
+    """evidence-loop-v2 采集状态契约：如实记录四源采集，禁止覆盖不全却声明无命中/已查重。
+
+    四态区分：已命中 / 完整查询后无命中 / 覆盖不完整 / 来源不可用。只有
+    coverage_status=COMPLETE ∧ stop_reason=exhausted ∧ 未截断 的 query_status=NO_HIT
+    才能支撑「无相似需求 / 无现有实现」等负面结论。v1 计划（evidence-loop-v1）不触发。
+    """
+    if plan.get('rules_source', {}).get('analysis') != 'evidence-loop-v2':
+        return
+    if plan['verdict'] not in ANALYSIS_VERDICTS:
+        return
+    acquisition = plan.get('evidence_acquisition')
+    if not isinstance(acquisition, dict):
+        errors.append(
+            'evidence-loop-v2 分析计划必须含 evidence_acquisition 对象'
+            '（记录 tfs_requirements/wiki/gitnexus/db_knowledge 四源采集状态）')
+        return
+    missing = [s for s in EVIDENCE_ACQUISITION_SOURCES
+               if s not in acquisition or not isinstance(acquisition[s], dict)]
+    if missing:
+        errors.append(
+            f'evidence_acquisition 缺少来源或格式错误：{missing}'
+            '（四源均须出现并为对象；未触发的源用 query_status=SKIPPED）')
+        return
+    enums = (
+        ('availability', EVIDENCE_AVAILABILITY),
+        ('coverage_status', EVIDENCE_COVERAGE_STATUS),
+        ('query_status', EVIDENCE_QUERY_STATUS),
+        ('stop_reason', EVIDENCE_STOP_REASONS),
+    )
+    for source in EVIDENCE_ACQUISITION_SOURCES:
+        entry = acquisition[source]
+        for field, allowed in enums:
+            if entry.get(field) not in allowed:
+                errors.append(
+                    f'evidence_acquisition.{source}.{field} 必须为 {sorted(allowed)} 之一')
+        queries = entry.get('queries')
+        if not isinstance(queries, list):
+            errors.append(f'evidence_acquisition.{source}.queries 必须为数组')
+            queries = []
+        for i, query in enumerate(queries, start=1):
+            if not isinstance(query, dict):
+                errors.append(f'evidence_acquisition.{source}.queries[{i}] 必须为对象')
+                continue
+            terms = query.get('terms')
+            terms_ok = (isinstance(terms, str) and terms.strip()) or (
+                isinstance(terms, list) and terms
+                and all(isinstance(t, str) and t.strip() for t in terms))
+            if not terms_ok:
+                errors.append(
+                    f'evidence_acquisition.{source}.queries[{i}] 缺少非空 terms（查询词/条件）')
+            if 'truncated' in query and not isinstance(query['truncated'], bool):
+                errors.append(f'evidence_acquisition.{source}.queries[{i}].truncated 必须为布尔值')
+        # 查询状态与查询记录的相干性：HIT/NO_HIT 必须留有查询；SKIPPED 查询可空。
+        query_status = entry.get('query_status')
+        if query_status in {'HIT', 'NO_HIT'} and not queries:
+            errors.append(
+                f'evidence_acquisition.{source}.query_status={query_status} 时 queries 不得为空')
+        # 约束 3：COMPLETE 须 availability=READY ∧ stop_reason=exhausted ∧ 无截断。
+        if entry.get('coverage_status') == 'COMPLETE':
+            if entry.get('availability') != 'READY':
+                errors.append(
+                    f'evidence_acquisition.{source}.coverage_status=COMPLETE 要求 availability=READY')
+            if entry.get('stop_reason') != 'exhausted':
+                errors.append(
+                    f'evidence_acquisition.{source}.coverage_status=COMPLETE 要求 stop_reason=exhausted')
+            if any(isinstance(q, dict) and q.get('truncated') is True for q in queries):
+                errors.append(
+                    f'evidence_acquisition.{source}.coverage_status=COMPLETE 但存在 truncated=true 的查询；'
+                    '截断时只能 PARTIAL/UNKNOWN')
+        # 约束 4：覆盖不全不得声明无命中。
+        if query_status == 'NO_HIT' and entry.get('coverage_status') != 'COMPLETE':
+            errors.append(
+                f'evidence_acquisition.{source}.query_status=NO_HIT 要求 coverage_status=COMPLETE'
+                '（覆盖不全不得声明无命中）')
+    # 约束 1：未执行查询不得写 dedup_ran=true。
+    kb = plan.get('kb')
+    if isinstance(kb, dict) and kb.get('dedup_ran') is True:
+        tfs_queries = acquisition['tfs_requirements'].get('queries') or []
+        if not tfs_queries:
+            errors.append(
+                'kb.dedup_ran=true 时 evidence_acquisition.tfs_requirements.queries 不得为空'
+                '（未执行查询不得声明已查重）')
+    # 约束 2：AUTO-ANA 须查重覆盖完整或源在范围外；覆盖不全不得自动放行。
+    if plan['verdict'] == 'AUTO-ANA':
+        coverage = acquisition['tfs_requirements'].get('coverage_status')
+        if coverage not in {'COMPLETE', 'OUT_OF_SCOPE'}:
+            errors.append(
+                'AUTO-ANA 要求 evidence_acquisition.tfs_requirements.coverage_status ∈ '
+                '{COMPLETE, OUT_OF_SCOPE}（查重覆盖不全不得自动放行）；覆盖不全改判 MANUAL-REVIEW')
+
+
+def validate_attachments(plan, errors):
+    """校验附件来源、逐文件终态和新运行时审计；旧计划可省略新增字段。"""
+    attachments = plan.get('attachments')
+    if attachments is None:
+        return
+    if not isinstance(attachments, dict):
+        errors.append('attachments 必须为对象')
+        return
+    if not isinstance(attachments.get('ready'), bool):
+        errors.append('attachments.ready 必须为布尔值')
+    lists = {}
+    for field in ('downloaded', 'parsed', 'skipped', 'errors'):
+        value = attachments.get(field)
+        if not isinstance(value, list):
+            errors.append(f'attachments.{field} 必须为数组')
+            value = []
+        lists[field] = value
+
+    names = {}
+    for field, values in lists.items():
+        current = []
+        for index, item in enumerate(values):
+            if not isinstance(item, dict):
+                errors.append(f'attachments.{field}[{index}] 必须为对象')
+                continue
+            name = item.get('name')
+            if not isinstance(name, str) or not name.strip():
+                errors.append(f'attachments.{field}[{index}].name 必须为非空字符串')
+                continue
+            current.append(name)
+        if len(current) != len(set(current)):
+            errors.append(f'attachments.{field}.name 不可重复')
+        names[field] = current
+
+    downloaded = set(names['downloaded'])
+    outcomes = names['parsed'] + names['skipped'] + names['errors']
+    if len(outcomes) != len(set(outcomes)):
+        errors.append('每个附件只能出现在 parsed/skipped/errors 的一个终态中')
+    if downloaded != set(outcomes):
+        errors.append('attachments 的每个 downloaded 文件必须且只能有一个解析终态')
+    expected_ready = not names['skipped'] and not names['errors'] and downloaded == set(names['parsed'])
+    if isinstance(attachments.get('ready'), bool) and attachments['ready'] != expected_ready:
+        errors.append(f'attachments.ready 必须与逐文件终态一致，期望为 {expected_ready}')
+
+    preflight = attachments.get('preflight')
+    enriched = preflight is not None
+    for index, item in enumerate(lists['parsed']):
+        if not isinstance(item, dict):
+            continue
+        if item.get('status') != 'parsed':
+            errors.append(f'attachments.parsed[{index}].status 必须为 parsed')
+        chain = item.get('converter_chain', item.get('converter'))
+        if chain is not None and chain not in ATTACHMENT_CONVERTERS:
+            errors.append(
+                f'attachments.parsed[{index}] 的转换链必须为 {sorted(ATTACHMENT_CONVERTERS)} 之一')
+        if enriched:
+            if item.get('converter_chain') not in ATTACHMENT_CONVERTERS:
+                errors.append(f'attachments.parsed[{index}].converter_chain 缺失或不合法')
+            if item.get('runtime_mode') not in ATTACHMENT_RUNTIME_MODES:
+                errors.append(f'attachments.parsed[{index}].runtime_mode 缺失或不合法')
+            if not isinstance(item.get('tool_versions'), dict):
+                errors.append(f'attachments.parsed[{index}].tool_versions 必须为对象')
+
+    for field in ('skipped', 'errors'):
+        for index, item in enumerate(lists[field]):
+            if not isinstance(item, dict):
+                continue
+            if not isinstance(item.get('reason'), str) or not item['reason'].strip():
+                errors.append(f'attachments.{field}[{index}].reason 必须为非空字符串')
+            if enriched and not isinstance(item.get('blocking'), bool):
+                errors.append(f'attachments.{field}[{index}].blocking 必须为布尔值')
+
+    if not enriched:
+        return
+    if not isinstance(preflight, dict):
+        errors.append('attachments.preflight 必须为对象')
+        return
+    for field in ('requested_formats', 'blocked_formats', 'install_required', 'warnings'):
+        value = preflight.get(field)
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            errors.append(f'attachments.preflight.{field} 必须为字符串数组')
+    if not isinstance(preflight.get('capabilities'), dict):
+        errors.append('attachments.preflight.capabilities 必须为对象')
+    if preflight.get('runtime_mode') not in ATTACHMENT_RUNTIME_MODES:
+        errors.append('attachments.preflight.runtime_mode 不合法')
+    cache_key = preflight.get('runtime_cache_key')
+    if cache_key is not None and (not isinstance(cache_key, str) or not cache_key.strip()):
+        errors.append('attachments.preflight.runtime_cache_key 必须为非空字符串或 null')
+    runtime_dir = preflight.get('runtime_dir')
+    if runtime_dir is not None and (not isinstance(runtime_dir, str) or not runtime_dir.strip()):
+        errors.append('attachments.preflight.runtime_dir 必须为非空字符串或 null')
+    installations = preflight.get('installations')
+    if not isinstance(installations, list):
+        errors.append('attachments.preflight.installations 必须为数组')
+        return
+    for index, item in enumerate(installations):
+        if not isinstance(item, dict):
+            errors.append(f'attachments.preflight.installations[{index}] 必须为对象')
+            continue
+        for field in ('group', 'manager', 'started_at', 'finished_at', 'status'):
+            if not isinstance(item.get(field), str) or not item[field].strip():
+                errors.append(f'attachments.preflight.installations[{index}].{field} 必须为非空字符串')
+        if item.get('status') not in {'installed', 'failed'}:
+            errors.append(f'attachments.preflight.installations[{index}].status 不合法')
+        if not isinstance(item.get('packages'), list) or not item.get('packages') or not all(
+                isinstance(package, str) and package.strip() for package in item.get('packages', [])):
+            errors.append(f'attachments.preflight.installations[{index}].packages 必须为非空字符串数组')
+        forbidden = set(item) & {'command', 'env', 'environment'}
+        if forbidden:
+            errors.append(
+                f'attachments.preflight.installations[{index}] 不得记录命令或环境：{sorted(forbidden)}')
+        if re.search(r'(?i)\b(?:TFS_PAT|PAT|TOKEN|PASSWORD)=\S+', str(item.get('error', ''))):
+            errors.append(f'attachments.preflight.installations[{index}].error 含未脱敏敏感值')
+
+
 def is_confirmed_evidence_ref(plan, value):
-    """确认 KB/wiki 索引引用的 finding 已被证实；work-item 不属于补证来源。"""
+    """确认 KB/wiki/需求历史索引引用的 finding 已被证实。"""
     if not isinstance(value, str) or not EVIDENCE_REF_RE.fullmatch(value):
         return False
     if value.startswith('kb:'):
         source, index = 'kb', int(value[3:])
     elif value.startswith('wiki:'):
         source, index = 'wiki', int(value[5:])
+    elif value.startswith('req:'):
+        source, index = 'tfs_requirements', int(value[4:])
     else:
         return False
     findings = plan.get(source, {}).get('findings') if isinstance(plan.get(source), dict) else None
     if not isinstance(findings, list) or index >= len(findings) or not isinstance(findings[index], dict):
         return False
-    expected_states = {'已证实'} if source == 'kb' else {'已证实', 'wiki-确认'}
-    return findings[index].get('state') in expected_states
+    if source == 'kb':
+        return findings[index].get('state') == '已证实'
+    if source == 'wiki':
+        return findings[index].get('state') in {'已证实', 'wiki-确认'}
+    return (findings[index].get('state') == '已证实'
+            and findings[index].get('source_tool') in TFS_REQUIREMENTS_CONFIRMED_TOOLS)
 
 
 def validate_qc_evidence_resolution(plan, errors):
@@ -460,13 +849,13 @@ def validate_qc_evidence_resolution(plan, errors):
         if len(refs) != len(set(refs)):
             errors.append(f'qc_evidence_resolution.items[{index}].evidence_refs 不可重复')
         for value in refs:
-            if not is_confirmed_evidence_ref(plan, value):
+            if (isinstance(value, str) and value.startswith('req:')) or not is_confirmed_evidence_ref(plan, value):
                 errors.append(
                     f'qc_evidence_resolution.items[{index}] 的 {value} 必须指向 kb/wiki.findings 的已证实项')
 
 
 def validate_evidence_refs(plan, errors):
-    """校验 v2 闭环结论到工作项、KB 或 wiki 已证实 finding 的内部追溯。"""
+    """校验 v2 闭环结论到工作项、KB、wiki 或需求历史 finding 的内部追溯。"""
     if plan['version'] != PLAN_VERSION or plan['verdict'] not in ANALYSIS_VERDICTS:
         return
     refs = plan.get('evidence_refs')
@@ -487,6 +876,10 @@ def validate_evidence_refs(plan, errors):
                 errors.append(f'evidence_refs.{heading} 引用的 {value} 必须指向 kb.findings 的已证实项')
             if value.startswith('wiki:') and not is_confirmed_evidence_ref(plan, value):
                 errors.append(f'evidence_refs.{heading} 引用的 {value} 必须指向 wiki.findings 的已证实项')
+            if value.startswith('req:') and not is_confirmed_evidence_ref(plan, value):
+                errors.append(
+                    f'evidence_refs.{heading} 引用的 {value} 必须指向 '
+                    'tfs_requirements.findings 的已证实项')
 
     if plan['verdict'] == 'AUTO-ANA':
         for heading in ('现状基线', '差异与范围', '方案取舍'):
@@ -514,8 +907,11 @@ def validate_analysis_description(plan, plan_path, check_files, errors):
     if profile is not None:
         if profile not in ANALYSIS_DESCRIPTION_PROFILES:
             errors.append(f'analysis_profile 仅允许：{sorted(ANALYSIS_DESCRIPTION_PROFILES)}')
-        elif (len(categories) != 1
-              or categories[0] not in CONCISE_ANALYSIS_DESCRIPTION_REQUIREMENTS):
+        elif profile == 'concise-v3' and plan.get('version') != PLAN_VERSION:
+            errors.append(f'concise-v3 仅允许 version={PLAN_VERSION} 的新分析计划')
+        elif (profile in {'concise-v1', 'concise-v2'}
+              and (len(categories) != 1
+                   or categories[0] not in CONCISE_ANALYSIS_DESCRIPTION_REQUIREMENTS)):
             errors.append(f'{profile} 仅允许单一 existing-ui-simple / print-adjustment / data-management 类别')
     if not check_files or invalid:
         return
@@ -542,43 +938,142 @@ def validate_analysis_description(plan, plan_path, check_files, errors):
     except ValueError as exc:
         errors.append(str(exc))
         return
-    declared_match = re.search(r'^- \*\*需求类别\*\*：(?P<value>.+)$', review_content, re.MULTILINE)
-    declared = set(re.findall(r'`([a-z-]+)`', declared_match.group('value'))) if declared_match else set()
-    if declared != set(categories):
-        errors.append('变更方案“需求类别”必须与 analysis_description.categories 完全一致')
+    if plan['version'] == PLAN_VERSION and profile != 'concise-v3':
+        for label in ANALYSIS_DECISION_SUMMARY_REQUIREMENTS:
+            matches = re.findall(
+                rf'^\s*-\s*\*\*{re.escape(label)}\*\*：\s*\S.*$',
+                analysis_section, re.MULTILINE)
+            if len(matches) != 1:
+                errors.append(f'分析者描述必须且只能包含一个非空“{label}”决策摘要')
+    elif profile == 'concise-v3':
+        for label in ANALYSIS_DECISION_SUMMARY_REQUIREMENTS:
+            if re.search(rf'^\s*-\s*\*\*{re.escape(label)}\*\*：', analysis_section, re.MULTILINE):
+                errors.append(f'concise-v3 分析者描述不得包含“{label}”决策摘要')
+
+    declared_match = re.search(r'^- \*\*需求类别\*\*：(?P<value>.+)$', analysis_section, re.MULTILINE)
+    if profile == 'concise-v3':
+        if declared_match:
+            errors.append('concise-v3 分析者描述不得包含“需求类别”正文行')
+    else:
+        declared = set(re.findall(r'`([a-z-]+)`', declared_match.group('value'))) if declared_match else set()
+        if declared != set(categories):
+            errors.append('变更方案“需求类别”必须与 analysis_description.categories 完全一致')
 
     path_values = re.findall(
         r'^\s*-\s*\*\*路径\*\*：\s*(\S.*?)\s*$', analysis_section, re.MULTILINE)
-    if len(path_values) != 1:
+    if profile == 'concise-v3':
+        if path_values:
+            errors.append('concise-v3 分析者描述不得包含固定“路径”行')
+    elif len(path_values) != 1:
         errors.append('分析者描述必须且只能包含一个非空“路径”')
     elif not ANALYSIS_PATH_VALUE_RE.fullmatch(path_values[0]):
         errors.append('分析者描述“路径”必须按“菜单路径：...；操作路径：...”填写')
 
     sections = {}
-    headers = list(re.finditer(r'^### ([a-z-]+)(?:\s|（|$)', review_content, re.MULTILINE))
+    category_content = analysis_section if profile == 'concise-v3' else review_content
+    headers = list(re.finditer(r'^### ([a-z-]+)(?:\s|（|$)', category_content, re.MULTILINE))
+    if profile == 'concise-v3':
+        first_header = re.search(r'^### [a-z-]+(?:\s|（|$)', analysis_section, re.MULTILINE)
+        preamble = analysis_section[:first_header.start()] if first_header else analysis_section
+        if re.search(r'^\s*-\s*\*\*.+?\*\*：', preamble, re.MULTILINE):
+            errors.append('concise-v3 业务维度必须写在对应类别标题下')
     for index, header in enumerate(headers):
-        end = headers[index + 1].start() if index + 1 < len(headers) else len(review_content)
-        sections[header.group(1)] = review_content[header.end():end]
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(category_content)
+        sections[header.group(1)] = category_content[header.end():end]
     if set(sections) != set(categories):
         errors.append('变更方案三级标题类别必须与 analysis_description.categories 完全一致')
     for category in categories:
         section = sections.get(category, '')
-        if profile == 'concise-v1' and category in CONCISE_ANALYSIS_DESCRIPTION_REQUIREMENTS:
+        if profile == 'concise-v3':
+            requirements = CONCISE_V3_ANALYSIS_DESCRIPTION_REQUIREMENTS[category]
+        elif profile == 'concise-v1' and category in CONCISE_ANALYSIS_DESCRIPTION_REQUIREMENTS:
             requirements = CONCISE_ANALYSIS_DESCRIPTION_REQUIREMENTS[category]
         elif profile == 'concise-v2' and category in CONCISE_V2_ANALYSIS_DESCRIPTION_REQUIREMENTS:
             requirements = CONCISE_V2_ANALYSIS_DESCRIPTION_REQUIREMENTS[category]
         else:
             requirements = ANALYSIS_DESCRIPTION_REQUIREMENTS[category]
+        if profile == 'concise-v3':
+            labels = re.findall(r'^[ \t]*-[ \t]*\*\*(.+?)\*\*：', section, re.MULTILINE)
+            extras = sorted(set(labels) - set(requirements))
+            if extras:
+                errors.append(f'分析类别 {category} 含 concise-v3 非法维度：{extras}')
         for label in requirements:
             field = re.compile(rf'^[ \t]*-[ \t]*\*\*{re.escape(label)}\*\*：[ \t]*\S+', re.MULTILINE)
-            if not field.search(section):
+            matches = field.findall(section)
+            if not matches:
                 errors.append(f'分析类别 {category} 缺少非空维度“{label}”')
+            elif profile == 'concise-v3' and len(matches) != 1:
+                errors.append(f'分析类别 {category} 必须且只能包含一个“{label}”维度')
 
     if re.search(r'<[^>\r\n]+>', review_content) or re.search(r'\bTODO\b', review_content, re.IGNORECASE):
         errors.append('变更方案不得包含模板占位符或 TODO')
     for phrase in ANALYSIS_BANNED_PHRASES:
         if phrase in review_content:
             errors.append(f'变更方案包含空泛描述：{phrase}')
+
+
+def validate_analysis_traceability(plan, content, errors):
+    """校验 v2 业务范围、方案、验收和结论状态的一对一追踪。"""
+    source = plan.get('rules_source')
+    if not isinstance(source, dict) or source.get('analysis') != 'evidence-loop-v1':
+        return
+
+    matches = list(re.finditer(rf'^##\s+{re.escape(TRACEABILITY_HEADING)}\s*$', content, re.MULTILINE))
+    if len(matches) != 1:
+        errors.append(f'变更方案必须且只能包含一个“## {TRACEABILITY_HEADING}”区')
+        return
+    start = matches[0].end()
+    following = re.search(r'^##\s+', content[start:], re.MULTILINE)
+    section = content[start:start + following.start()] if following else content[start:]
+    rows = []
+    for line in section.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith('|'):
+            continue
+        cells = [cell.strip() for cell in stripped.strip('|').split('|')]
+        if all(re.fullmatch(r':?-{3,}:?', cell or '') for cell in cells):
+            continue
+        rows.append(cells)
+    if not rows or tuple(rows[0]) != TRACEABILITY_HEADERS:
+        errors.append(f'“{TRACEABILITY_HEADING}”必须使用表头：' + ' | '.join(TRACEABILITY_HEADERS))
+        return
+    data_rows = rows[1:]
+    if not data_rows:
+        errors.append(f'“{TRACEABILITY_HEADING}”至少需要一条追踪项')
+        return
+
+    gap_ids = {gap.get('id') for gap in plan.get('analysis_gaps', []) if isinstance(gap, dict)}
+    pending_gap_ids = []
+    ids = set()
+    for index, row in enumerate(data_rows, start=1):
+        if len(row) != len(TRACEABILITY_HEADERS) or not all(row):
+            errors.append(f'“{TRACEABILITY_HEADING}”第 {index} 行的 6 个单元格均须非空')
+            continue
+        item_id, _, _, _, conclusion_status, basis = row
+        if not ANALYSIS_GAP_ID_RE.fullmatch(item_id):
+            errors.append(f'“{TRACEABILITY_HEADING}”第 {index} 行 ID 必须是稳定的字母开头标识')
+        elif item_id in ids:
+            errors.append(f'“{TRACEABILITY_HEADING}”ID 不可重复：{item_id}')
+        else:
+            ids.add(item_id)
+        if conclusion_status not in TRACEABILITY_STATUSES:
+            errors.append(f'“{TRACEABILITY_HEADING}”第 {index} 行结论状态必须为 {sorted(TRACEABILITY_STATUSES)} 之一')
+            continue
+        if conclusion_status == '合理假设' and not basis.startswith('呈现类默认：'):
+            errors.append(f'“{TRACEABILITY_HEADING}”第 {index} 行合理假设的依据必须以“呈现类默认：”说明边界')
+        if conclusion_status == '待业务确认':
+            match = re.fullmatch(r'analysis-gap:([A-Za-z][A-Za-z0-9_-]{0,63})', basis)
+            if not match or match.group(1) not in gap_ids:
+                errors.append(f'“{TRACEABILITY_HEADING}”第 {index} 行待业务确认必须关联既有 analysis-gap:<id>')
+            else:
+                pending_gap_ids.append(match.group(1))
+        elif basis.startswith('analysis-gap:'):
+            errors.append(f'“{TRACEABILITY_HEADING}”第 {index} 行只有待业务确认可关联 analysis-gap')
+
+    if len(pending_gap_ids) != len(set(pending_gap_ids)):
+        errors.append(f'“{TRACEABILITY_HEADING}”中的 analysis-gap 引用不可重复')
+    if set(pending_gap_ids) != gap_ids:
+        errors.append(f'“{TRACEABILITY_HEADING}”必须与 analysis_gaps 一对一关联')
 
 
 def validate_iteration_analysis_closure(plan, content, errors):
@@ -707,7 +1202,8 @@ def validate_plan(plan, plan_path, check_files=True):
         if not isinstance(plan.get('skip_reason'), str) or not plan['skip_reason'].strip():
             errors.append('SKIP-ANALYSIS 计划必须含非空 skip_reason')
         for field in ('checklist', 'analysis_description', 'analysis_profile', 'analysis_gaps',
-                      'evidence_refs', 'evidence_gaps', 'auto_scopes', 'assignee_to'):
+                      'evidence_refs', 'evidence_gaps', 'auto_scopes', 'assignee_to',
+                      'tfs_requirements', 'existing_feature'):
             if field in plan and plan[field] not in (None, [], {}):
                 errors.append(f'SKIP-ANALYSIS 计划不得声明 {field}')
 
@@ -745,6 +1241,10 @@ def validate_plan(plan, plan_path, check_files=True):
                     'state=已证实 的现有实现锚点；缺失时改判 MANUAL-REVIEW '
                     '并在 evidence_gaps 记录“现有实现定位”缺口')
 
+    validate_tfs_requirements(plan, errors)
+    validate_attachments(plan, errors)
+    validate_existing_feature(plan, errors)
+
     analysis_gaps = []
     if plan['verdict'] in ANALYSIS_VERDICTS:
         validate_analysis_description(plan, plan_path, check_files, errors)
@@ -752,6 +1252,15 @@ def validate_plan(plan, plan_path, check_files=True):
         validate_evidence_gaps(plan, errors)
         validate_evidence_refs(plan, errors)
         validate_qc_evidence_resolution(plan, errors)
+        validate_evidence_acquisition(plan, errors)
+        if check_files:
+            change = next((item for item in plan['artifacts']
+                           if isinstance(item, dict) and item.get('kind') == 'change-plan'), None)
+            if isinstance(change, dict) and is_local_artifact_name(change.get('path')):
+                path = artifact_path(plan_path, change)
+                if os.path.isfile(path):
+                    with open(path, 'r', encoding='utf-8') as f:
+                        validate_analysis_traceability(plan, f.read(), errors)
     elif plan['verdict'] in QC_VERDICTS:
         validate_checklist(plan, errors)
 
@@ -853,6 +1362,7 @@ def record_failure(plan, error, run_mode, state_from='', state_to='', actions=No
         'qc_evidence_resolution': plan.get('qc_evidence_resolution'),
         'qc_recheck': plan.get('qc_recheck'),
         'wiki': plan.get('wiki'),
+        'tfs_requirements': plan.get('tfs_requirements'),
     }
     if extra:
         details.update(extra)
@@ -937,10 +1447,10 @@ def apply_field_flow(client, wid, dry_run, fallback_assignee=None, assignee_over
             if isinstance(earliest, dict):
                 iteration_path = earliest.get('path')
                 finish = earliest.get('finish') or ''
-                finish_date = finish[:10] if len(finish) >= 10 else None
+                finish_date = tfs.beijing_date(finish).isoformat() if finish else None
         except Exception:
             pass  # 迭代查询失败 → 降级，继续状态流转
-    today = datetime.date.today().isoformat()
+    today = tfs.beijing_date().isoformat()
     if iteration_path:
         actions.append(checked_call('write-field:IterationPath', tfs.write_field,
                                     client, wid, tfs.F_ITERATION, iteration_path, 'replace', dry_run))
@@ -970,7 +1480,7 @@ def apply_field_flow(client, wid, dry_run, fallback_assignee=None, assignee_over
     return actions
 
 
-def apply_plan(plan, plan_path, execute, config_path, pat_override=None, collection_override=None):
+def apply_plan(plan, plan_path, execute, config_path, pat_override=None, collection_override=None, project_override=None):
     validation = validate_plan(plan, plan_path, check_files=True)
     if not validation['ok']:
         return failure_result(plan, '计划校验失败：' + '; '.join(validation['errors']), 'validate',
@@ -979,7 +1489,7 @@ def apply_plan(plan, plan_path, execute, config_path, pat_override=None, collect
 
     run_mode = 'execute' if execute else 'dry-run'
     try:
-        client = tfs.load_config(config_path, pat_override, collection_override)
+        client = tfs.load_config(config_path, pat_override, collection_override, project_override)
         readiness = tfs.precheck(client)
         if not readiness.get('ok'):
             return failure_result(plan, f"TFS precheck 失败：{readiness.get('error', readiness)}", run_mode)
@@ -999,6 +1509,7 @@ def apply_plan(plan, plan_path, execute, config_path, pat_override=None, collect
         # 路由跳过终局只记审计/Redis，不清理或新增任何 TFS 标签。
         owned_tags = set()
     actions = []
+    analysis_desc_html = ''  # 分析终局下=写入 TFS 的分析者描述 HTML，供 Redis 镜像
     try:
         for tag in sorted((set(gate['work_item']['tags']) & owned_tags) - expected_tags):
             actions.append(checked_call(f'remove-tag:{tag}', tfs.remove_tag, client, plan['work_item_id'], tag, dry_run))
@@ -1006,7 +1517,9 @@ def apply_plan(plan, plan_path, execute, config_path, pat_override=None, collect
         if plan['verdict'] in ANALYSIS_VERDICTS:
             change = next(a for a in plan['artifacts'] if a['kind'] == 'change-plan')
             path = artifact_path(plan_path, change)
-            rendered = render_analysis_description_html(tfs.parse_value('@' + path))
+            rendered = render_analysis_description_html(
+                tfs.parse_value('@' + path), plan.get('analysis_profile'))
+            analysis_desc_html = rendered  # 同一份 HTML 写 TFS + Redis，保证三者同源一致
             actions.append(checked_call('write-detail-analysis', tfs.replace_detail_analysis_section,
                                         client, plan['work_item_id'], rendered, dry_run))
 
@@ -1030,11 +1543,16 @@ def apply_plan(plan, plan_path, execute, config_path, pat_override=None, collect
         return failure_result(plan, exc, run_mode, plan['expected_state'],
                               validation['state_to'] or '', actions)
 
-    redis_result = redis_client.publish_plan(plan, run_mode, client['collection'], config_path)
+    _wi = gate.get('work_item') or {}
+    work_item_label = f"{_wi.get('id', '')} {_wi.get('title', '')}".strip()
+    redis_result = redis_client.publish_plan(plan, run_mode, client['collection'], config_path,
+                                             analysis_description_html=analysis_desc_html,
+                                             work_item=work_item_label)
     audit = tfs.record(plan['skill'], plan['work_item_id'], plan['verdict'], sorted(expected_tags),
                        plan['expected_state'], validation['state_to'] or '', '',
                        {'run_mode': run_mode, 'rules_source': plan['rules_source'],
                         'auto_scopes': plan.get('auto_scopes', []), 'kb': plan.get('kb'), 'wiki': plan.get('wiki'),
+                        'tfs_requirements': plan.get('tfs_requirements'),
                         'iteration': plan.get('iteration'), 'attachments': plan.get('attachments'),
                         'analysis_description': plan.get('analysis_description'),
                         'analysis_profile': plan.get('analysis_profile'),
@@ -1055,7 +1573,7 @@ def apply_plan(plan, plan_path, execute, config_path, pat_override=None, collect
                   next_action=next_action, redis=redis_result)
 
 
-def repair_analysis_placement(plan, plan_path, execute, config_path, pat_override=None, collection_override=None):
+def repair_analysis_placement(plan, plan_path, execute, config_path, pat_override=None, collection_override=None, project_override=None):
     """修复旧执行器将 Markdown 错写到需求分析字段的既有运行。"""
     validation = validate_plan(plan, plan_path, check_files=True)
     if not validation['ok']:
@@ -1067,7 +1585,7 @@ def repair_analysis_placement(plan, plan_path, execute, config_path, pat_overrid
 
     run_mode = 'repair-execute' if execute else 'repair-dry-run'
     try:
-        client = tfs.load_config(config_path, pat_override, collection_override)
+        client = tfs.load_config(config_path, pat_override, collection_override, project_override)
         readiness = tfs.precheck(client)
         if not readiness.get('ok'):
             return failure_result(plan, f"TFS precheck 失败：{readiness.get('error', readiness)}", run_mode)
@@ -1083,7 +1601,7 @@ def repair_analysis_placement(plan, plan_path, execute, config_path, pat_overrid
     dry_run = not execute
     actions = []
     try:
-        rendered = render_analysis_description_html(content)
+        rendered = render_analysis_description_html(content, plan.get('analysis_profile'))
         actions.append(checked_call('replace-detail-analysis', tfs.replace_detail_analysis_section,
                                     client, plan['work_item_id'], rendered, dry_run))
         actions.append(checked_call('remove-legacy-analysis', tfs.remove_legacy_analysis_append,
@@ -1112,7 +1630,7 @@ def _flow_audit(verdict, wid, state_from, state_to, actions, run_id, assignee_ov
 
 
 def flow_item(wid, execute, config_path, expected_rev=None, expected_state=None,
-              assignee_override=None, run_id='', pat_override=None, collection_override=None):
+              assignee_override=None, run_id='', pat_override=None, collection_override=None, project_override=None):
     """对任意工作项单独跑字段流转（与 verdict 回写解耦）。
 
     用于 MANUAL-REVIEW 等人工确认后推流到「已分析」（如 2026-07-28 的 259681）。
@@ -1121,7 +1639,7 @@ def flow_item(wid, execute, config_path, expected_rev=None, expected_state=None,
     """
     run_mode = 'flow-execute' if execute else 'flow-dry-run'
     try:
-        client = tfs.load_config(config_path, pat_override, collection_override)
+        client = tfs.load_config(config_path, pat_override, collection_override, project_override)
         readiness = tfs.precheck(client)
         if not readiness.get('ok'):
             return result(False, error=f"TFS precheck 失败：{readiness.get('error', readiness)}", mode=run_mode)
@@ -1139,7 +1657,7 @@ def flow_item(wid, execute, config_path, expected_rev=None, expected_state=None,
         return result(False, error=str(exc), mode=run_mode)
 
     state_from = current['state']
-    run_id = run_id or f"flow_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    run_id = run_id or f"flow_{tfs.beijing_timestamp('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
     dry_run = not execute
     try:
         actions = apply_field_flow(client, wid, dry_run,
@@ -1165,7 +1683,7 @@ def _run_flow(args):
         if not args.expected_state:
             args.expected_state = plan.get('expected_state')
     return flow_item(wid, args.execute, args.config, args.expected_rev, args.expected_state,
-                     args.assignee, run_id, args.pat, args.collection)
+                     args.assignee, run_id, args.pat, args.collection, args.project)
 
 
 def main():
@@ -1178,12 +1696,14 @@ def main():
     apply.add_argument('--config', default=os.path.join(tfs.SCRIPT_DIR, 'tfs-config.json'))
     apply.add_argument('--pat', default=None, help='临时 PAT；缺省用 TFS_PAT 或配置 tfs.pat')
     apply.add_argument('--collection', default=None, help='临时 collection；缺省用 TFS_COLLECTION 或配置 tfs.collection')
+    apply.add_argument('--project', default=None, help='临时 project；缺省用 TFS_PROJECT 或配置 tfs.project')
     apply.add_argument('--execute', action='store_true', help='显式允许写 TFS；缺省只 dry-run')
     repair = sub.add_parser('repair-analysis-placement')
     repair.add_argument('--plan', required=True)
     repair.add_argument('--config', default=os.path.join(tfs.SCRIPT_DIR, 'tfs-config.json'))
     repair.add_argument('--pat', default=None, help='临时 PAT；缺省用 TFS_PAT 或配置 tfs.pat')
     repair.add_argument('--collection', default=None, help='临时 collection；缺省用 TFS_COLLECTION 或配置 tfs.collection')
+    repair.add_argument('--project', default=None, help='临时 project；缺省用 TFS_PROJECT 或配置 tfs.project')
     repair.add_argument('--execute', action='store_true', help='显式允许写 TFS；缺省只 dry-run')
     flow = sub.add_parser('flow', help='对任意工作项单独跑字段流转（迭代/日期/活动→已分析/指派）')
     fg = flow.add_mutually_exclusive_group(required=True)
@@ -1192,6 +1712,7 @@ def main():
     flow.add_argument('--config', default=os.path.join(tfs.SCRIPT_DIR, 'tfs-config.json'))
     flow.add_argument('--pat', default=None, help='临时 PAT；缺省用 TFS_PAT 或配置 tfs.pat')
     flow.add_argument('--collection', default=None, help='临时 collection；缺省用 TFS_COLLECTION 或配置 tfs.collection')
+    flow.add_argument('--project', default=None, help='临时 project；缺省用 TFS_PROJECT 或配置 tfs.project')
     flow.add_argument('--expected-rev', type=int, default=None, help='可选版本闸；不传则靠每步 revision_guard')
     flow.add_argument('--expected-state', default=None, help='可选状态闸')
     flow.add_argument('--assignee', default=None, help='可选指派 WINNING\\\\account，优先于 Winning.Dev.Leader')

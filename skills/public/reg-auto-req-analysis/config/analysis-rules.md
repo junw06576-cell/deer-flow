@@ -7,7 +7,8 @@
 
 1. **命中 §2 高风险清单（6 类）** → `MANUAL-REVIEW` + `PM-AI-STOP-AUTO`。
    最高优先，**覆盖启发式**：即使改动小、信息完整，也强制人工确认、状态不自动流转、**绝不 `AUTO-ANA`**。
-2. 否则按 §1 / `confidence-heuristic.md`：全满足 → `AUTO-ANA`；任一不满足 → `MANUAL-REVIEW`（**不加** `STOP-AUTO`）。
+2. **功能已存在（一套公版）** → `MANUAL-REVIEW`（**不加** `STOP-AUTO`）。查重命中 `state=已证实` 且 `maturity=已落地` 的历史方案，且其能力覆盖本次诉求时，**不得 `AUTO-ANA`**；分析者描述须标注“该功能已存在”+需求号，计划声明 `existing_feature.satisfied=true`。由 `pipeline.py` 硬闸强制（`satisfied=true ∧ verdict=AUTO-ANA` 报错）。仅相似而本次是新增量改动（既有能力未完整覆盖本次诉求）不触发本档，仍按第 3 档。
+3. 否则按 §1 / `confidence-heuristic.md`：全满足 → `AUTO-ANA`；任一不满足 → `MANUAL-REVIEW`（**不加** `STOP-AUTO`）。
 
 ---
 
@@ -26,6 +27,7 @@
 > 任一改动不属于白名单、同时包含未列出的改动，或无法明确归类 → `MANUAL-REVIEW`。`AUTO-ANA` 计划必须写入非空 `auto_scopes`（仅能使用上表值）并在变更方案中逐项说明依据。
 > **迭代分析闭环前置**：先按 `iteration-analysis-closure.md` 形成现状、问题、差异、方案取舍、成功衡量和非目标。方向、根因、业务范围、取数口径或权限口径不清 → 回退 QC `NEED-REVIEW`；现有实现、相似能力或方案取舍未证实 → `MANUAL-REVIEW` 并按规则记录仅审计的 `evidence_gaps`。不得用候选实现、未确认根因或“按现有逻辑”替代业务结论。
 > **AUTO-ANA 额外硬前置**：`kb.ready=true` 且 `kb.dedup_ran=true`（相似实现查重必须实际执行，落审计字段 `kb.dedup_ran`）；优化类类别（`existing-*`、`bug-fix`、`print-adjustment`、`data-management`、`permission-config`、`performance`、`mobile-adaptation`）还须在 `kb.findings` 至少一条 `state=已证实` 锚定被改现有模块/入口（见 §下文「现有实现基线」）。KB 未就绪 / 查重未跑 / 无已证实锚点 → 改判 `MANUAL-REVIEW`（不加 `STOP-AUTO`，属信息缺口而非高风险）。此条由 `pipeline.py` 强制校验。
+> **功能已存在排除**：`existing_feature.satisfied=true`（一套公版下，既有能力已覆盖本次诉求）时禁止 `AUTO-ANA`（由 `pipeline.py` 强制）；须改判 `MANUAL-REVIEW` 并在分析者描述以“该功能已存在”+需求号领起。与上一条同属 AUTO-ANA 硬前置，缺一即降级。
 > **治标警惕（根因/方向存疑→不分析、回退质控）**：需求描述含性能/异常抱怨（卡顿/慢/等待/超时/延迟/崩溃/数据错乱等）但变更方案为**使用层规避**（上限/提醒/分批/限制/阈值等）而非根因优化时，**不得判 AUTO-ANA**，也**不得选 `performance` 类别把规避方案写成"优化方案"兜底、或用 `existing-ui-simple` 等类别绕过根因**——按 `SKILL.md` 回退通路回质控 `NEED-REVIEW`（产品 + 研发负责人），审计 `qc_recheck=analysis-rootcause-mismatch`。详见 `references/qc-checklist.md` §一 #10。
 > **BUG 语义优先于标题/类型**：既有功能出现错误、字段条件分支有值/为空不一致或结果偏离既有预期时，即使工作项类型为功能性、标题写“优化/调整”，也优先选 `bug-fix`；不得包装成新功能、打印调整或界面优化。字段/打印异常须枚举全部取值分支；未闭环来源进入 `evidence_gaps` 并判 MANUAL。
 > **现有设计规则也是证据**：界面颜色、标签、图标、列位或交互方式不能只按实施方案默认。须核实当前页或同类页面的既有规则；只定位到组件、不清楚设计规则时记 `evidence_gaps`，不得 AUTO-ANA。
@@ -38,11 +40,12 @@
 
 ## 3. 需求分类规则
 
-当前不按产品线额外分流；需求类别决定分析者描述必需维度，闭环结论决定 QC 回退、MANUAL-REVIEW 或 AUTO-ANA。
+当前不按产品线额外分流（**一套公版假设**：同一产品线视为一套公版能力，查重不按项目/客户/版本拆分）；需求类别决定分析者描述必需维度，闭环结论决定 QC 回退、MANUAL-REVIEW 或 AUTO-ANA。命中已落地且能力覆盖本次诉求的既有能力 → “功能已存在” → MANUAL-REVIEW（见 §判定优先级第 2 项）。
 
 ## 4. 知识库接线说明（非规则·图谱为内部佐证）
 
-> **权威来源：`../_lib/knowledge-base.md`**（GitNexus 代码图谱 + 数据库图谱 + 产品 wiki，两阶段共用）。
+> **权威来源：`../_lib/knowledge-base.md`**（TFS 需求历史 + GitNexus 代码图谱 + 数据库图谱 + 产品 wiki，两阶段共用）。
+> **需求历史只作业务追溯佐证**：`tfs-requirements` 用于历史背景、关联工作项、验收条件和变更原因；已核验 finding 可用 `req:<索引>` 补充 `evidence_refs`。它不得覆盖实时 `fetch`、不得证明当前代码实现、不得进入 `qc_evidence_resolution`，也不得满足 AUTO 的 `kb.ready` / `kb.dedup_ran` / `kb:` 现有实现证据。
 > **代码图谱定位是内部佐证，不进 PM 视角变更方案正文**——变更方案是业务视角（见 `references/change-plan-template.md`）。“分析者描述”的 `路径` 仅写菜单路径和操作路径，不写仓库、代码符号、接口、Mapper 或表字段。
 > **产品 wiki 同样作业务内部佐证**（业务规则/流程/数据口径/验收），结果落 `wiki.findings`、**不进正文**；查询见 `../_lib/wiki-kb-recipe.md`，读序在 GitNexus 之前。**代码事实为准、wiki 仅补充——二者冲突时以 GitNexus 为准**（代码库最准）。
 

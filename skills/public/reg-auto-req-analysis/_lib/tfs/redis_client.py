@@ -188,7 +188,50 @@ def ids_key(collection):
     return f'{IDS_KEY_PREFIX}:{collection}'
 
 
-def publish_plan(plan, run_mode, collection, config_path=None, timeout=DEFAULT_TIMEOUT):
+def _knowledge_summary(plan):
+    """精简投影三类知识源（代码图谱/wiki/历史需求）的「定位 + 作用」，供下游快速查阅。
+
+    只保留每条发现的定位字段（entity/fact + source/source_tool/work_item_id）与作用字段
+    （state/maturity），丢弃冗长 note/coverage/dedup_ran。某来源缺失或为空则不出现。
+    """
+    summary = {}
+    kb = plan.get('kb')
+    if isinstance(kb, dict) and kb:
+        summary['code_graph'] = {
+            'ready': kb.get('ready'),
+            'tools': kb.get('tools_used') or [],
+            'findings': [
+                {'entity': f.get('entity', ''), 'state': f.get('state', ''),
+                 'source_tool': f.get('source_tool', '')}
+                for f in (kb.get('findings') or []) if isinstance(f, dict)
+            ],
+        }
+    wiki = plan.get('wiki')
+    if isinstance(wiki, dict) and wiki:
+        summary['wiki'] = {
+            'ready': wiki.get('ready'),
+            'modules': wiki.get('modules_matched') or [],
+            'findings': [
+                {'entity': f.get('entity', ''), 'state': f.get('state', ''),
+                 'source': f.get('source', '')}
+                for f in (wiki.get('findings') or []) if isinstance(f, dict)
+            ],
+        }
+    tfs_req = plan.get('tfs_requirements')
+    if isinstance(tfs_req, dict) and tfs_req:
+        summary['history'] = {
+            'ready': tfs_req.get('ready'),
+            'findings': [
+                {'work_item_id': f.get('work_item_id'), 'fact': f.get('fact', ''),
+                 'state': f.get('state', ''), 'maturity': f.get('maturity', '')}
+                for f in (tfs_req.get('findings') or []) if isinstance(f, dict)
+            ],
+        }
+    return summary
+
+
+def publish_plan(plan, run_mode, collection, config_path=None, timeout=DEFAULT_TIMEOUT,
+                 analysis_description_html='', work_item=''):
     """写入计划结果摘要 + SADD collection 索引 + 可选 EXPIRE。
 
     返回 {ok, key, fields} 或 {ok:false, reason}。**永不抛异常**。
@@ -213,11 +256,21 @@ def publish_plan(plan, run_mode, collection, config_path=None, timeout=DEFAULT_T
             'generated_at_utc': generated_at,
             'run_mode': run_mode,
         }
+        # 分析者描述正文（与写入 TFS System.Description 的内容同源）；仅分析终局由 pipeline 传入。
+        if analysis_description_html:
+            mapping['analysis_description'] = analysis_description_html
+        # 三类知识源的定位+作用精简投影（代码图谱/wiki/历史需求），任一非空才出现。
+        knowledge = _knowledge_summary(plan)
+        if knowledge:
+            mapping['knowledge'] = json.dumps(knowledge, ensure_ascii=False)
+        # 工作项「<id> <标题>」：所有终局统一写入（apply_plan 传 live 抓取值）；直调回退 checklist.work_item。
+        work_item_label = work_item or (checklist.get('work_item', '') if isinstance(checklist, dict) else '')
+        if work_item_label:
+            mapping['work_item'] = work_item_label
         if plan.get('verdict') in ('NEED-INFO', 'NEED-REVIEW') and isinstance(checklist, dict):
             # Redis 里 checklist 只保留下游确认所需：responsible（谁确认）+ items（确认什么）。
-            # work_item/next 提升为顶层 Hash 字段；verdict/tag/generated_at_utc 与外层摘要重复，不进 checklist。
+            # next 提升为顶层 Hash 字段；work_item 已由上方统一写入；verdict/tag/generated_at_utc 与外层摘要重复，不进 checklist。
             # 完整 checklist 仍保留在 plan JSON / TFS 附件 待补充信息 / 执行审计。
-            mapping['work_item'] = checklist.get('work_item', '')
             mapping['next'] = checklist.get('next', '')
             redis_checklist = {k: v for k, v in checklist.items() if k in ('responsible', 'items')}
             mapping['checklist'] = json.dumps(redis_checklist, ensure_ascii=False)
@@ -228,7 +281,8 @@ def publish_plan(plan, run_mode, collection, config_path=None, timeout=DEFAULT_T
             flat.extend([k, v])
         with _Connection(cfg, timeout) as c:
             c.execute('HSET', key, *flat)
-            for stale in ('checklist', 'work_item', 'next', 'skip_reason'):
+            for stale in ('checklist', 'work_item', 'next', 'skip_reason',
+                          'analysis_description', 'knowledge'):
                 if stale not in mapping:
                     c.execute('HDEL', key, stale)
             c.execute('SADD', ids_key(collection), wid)

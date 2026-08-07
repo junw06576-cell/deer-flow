@@ -52,6 +52,7 @@ BUNDLE_ROOT = os.path.normpath(os.path.join(SCRIPT_DIR, '..', '..'))
 PROCESS_DIR = os.path.join(os.path.dirname(os.path.dirname(BUNDLE_ROOT)), '过程文件')
 API = '4.1'
 DEFAULT_ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024
+BEIJING_TZ = datetime.timezone(datetime.timedelta(hours=8), name='Asia/Shanghai')
 
 # 字段引用名（确认自 tfs-auto-complete.js）
 F_REQUIREMENT_ANALYSIS = 'Winning.Demand.Analysis'
@@ -91,48 +92,76 @@ def fail(msg, code='ERROR', exit_code=1):
     sys.exit(exit_code)
 
 
+def parse_tfs_datetime(value):
+    """解析 TFS ISO 时间并转换为北京时间；纯日期按业务日期原样解释。"""
+    if isinstance(value, datetime.datetime):
+        parsed = value
+    elif isinstance(value, datetime.date):
+        return datetime.datetime.combine(value, datetime.time(), tzinfo=BEIJING_TZ)
+    else:
+        raw = str(value or '').strip()
+        if not raw:
+            raise ValueError('时间值为空')
+        if re.fullmatch(r'\d{4}-\d{2}-\d{2}', raw):
+            return datetime.datetime.combine(datetime.date.fromisoformat(raw), datetime.time(),
+                                             tzinfo=BEIJING_TZ)
+        normalized = raw[:-1] + '+00:00' if raw.endswith(('Z', 'z')) else raw
+        try:
+            parsed = datetime.datetime.fromisoformat(normalized)
+        except ValueError as exc:
+            raise ValueError(f'无法解析 TFS 时间: {raw!r}') from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=BEIJING_TZ)
+    return parsed.astimezone(BEIJING_TZ)
+
+
+def beijing_iso(value):
+    """返回北京时间 ISO；输入为纯日期时保留 YYYY-MM-DD 形态。"""
+    raw = str(value or '').strip()
+    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', raw):
+        return raw
+    return parse_tfs_datetime(value).isoformat(timespec='seconds')
+
+
+def beijing_date(value=None):
+    """返回北京时间业务日期；不传值时使用当前北京时间。"""
+    if value is None:
+        return datetime.datetime.now(BEIJING_TZ).date()
+    return parse_tfs_datetime(value).date()
+
+
+def beijing_timestamp(fmt):
+    return datetime.datetime.now(BEIJING_TZ).strftime(fmt)
+
+
 # ---------------- config ----------------
-def load_config(path, pat_override=None, collection_override=None):
-    """加载配置。优先级：命令行参数 > 环境变量 > 配置文件（兜底）。
+def load_config(path, pat_override=None, collection_override=None, project_override=None):
+    """加载配置。PAT 优先级：pat_override(--pat) > 环境变量 TFS_PAT > 配置 tfs.pat(字面)。
+    collection 优先级：collection_override(--collection) > 环境变量 TFS_COLLECTION > 配置 tfs.collection。
+    project 优先级：project_override(--project) > 环境变量 TFS_PROJECT > 配置 tfs.project。
 
-    环境变量映射：
-      TFS_PAT        → tfs.pat
-      TFS_COLLECTION → tfs.collection
-      TFS_PORT       → tfs.port
-      TFS_PROJECT    → tfs.project
-      TFS_SERVER     → tfs.server
-
-    命令行 --pat / --collection 不写回配置，仅本次调用有效。
+    动态 PAT / collection / project 仅本次调用临时使用，不写回配置；配置里的值是兜底默认。
     """
     if not os.path.exists(path):
         fail(f"配置文件不存在: {path}（从 tfs-config.template.json 复制一份）", 'CONFIG_NOT_FOUND')
     with open(path, 'r', encoding='utf-8') as f:
         c = json.load(f)
     t = c.get('tfs', {})
-    # 环境变量优先于配置文件
-    server = os.environ.get('TFS_SERVER') or t.get('server', '')
-    port = int(os.environ.get('TFS_PORT') or t.get('port', 0))
-    collection = collection_override or os.environ.get('TFS_COLLECTION') or t.get('collection', '')
-    project = os.environ.get('TFS_PROJECT') or t.get('project', '')
+    for k in ('server', 'port', 'collection', 'project'):
+        if not t.get(k):
+            fail(f"配置缺字段 tfs.{k}", 'CONFIG_INCOMPLETE')
     pat = pat_override or os.environ.get('TFS_PAT') or t.get('pat')
-    # 校验必填字段
-    if not server:
-        fail('未提供 TFS server：请在配置 tfs.server 填入，或用环境变量 TFS_SERVER 传入', 'CONFIG_INCOMPLETE')
-    if not port:
-        fail('未提供 TFS port：请在配置 tfs.port 填入，或用环境变量 TFS_PORT 传入', 'CONFIG_INCOMPLETE')
-    if not collection:
-        fail('未提供 TFS collection：请在配置 tfs.collection 填入，或用 --collection / 环境变量 TFS_COLLECTION 传入', 'CONFIG_INCOMPLETE')
-    if not project:
-        fail('未提供 TFS project：请在配置 tfs.project 填入，或用环境变量 TFS_PROJECT 传入', 'CONFIG_INCOMPLETE')
     if not pat:
         fail('未提供 PAT：请在配置 tfs.pat 填入，或用 --pat / 环境变量 TFS_PAT 临时传入', 'PAT_MISSING')
+    collection = collection_override or os.environ.get('TFS_COLLECTION') or t['collection']
+    project = project_override or os.environ.get('TFS_PROJECT') or t['project']
     external_attachments = c.get('external_attachments', {})
     if external_attachments and not isinstance(external_attachments, dict):
         fail('external_attachments 必须是对象', 'CONFIG_INCOMPLETE')
     return {
-        'server': server, 'port': port,
+        'server': t['server'], 'port': t['port'],
         'collection': collection, 'project': project,
-        'base_url': f"http://{server}:{port}/tfs/{urllib.parse.quote(collection)}/{urllib.parse.quote(project)}",
+        'base_url': f"http://{t['server']}:{t['port']}/tfs/{urllib.parse.quote(collection)}/{urllib.parse.quote(project)}",
         'pat': pat,
         'external_attachments': external_attachments,
     }
@@ -197,6 +226,14 @@ def map_workitem(raw):
     tags_raw = f.get(F_TAGS, '') or ''
     tags = [t.strip() for t in tags_raw.replace(',', ';').split(';') if t.strip()]
     area_path = f.get(F_AREA_PATH, '') or ''
+    expected_date_raw = f.get(F_EXPECTED_DATE) or f.get('Custom.ExpectedDate') or None
+    expected_date = expected_date_raw
+    if expected_date_raw:
+        try:
+            expected_date = beijing_iso(expected_date_raw)
+        except ValueError:
+            # 保留原值供 list_iterations 失败关闭，同时避免 fetch 丢失现场数据。
+            pass
     # 菜单源按 TFS 区域首级配置；旧工作项无 AreaPath 时才兼容 teamProject。
     area = area_path.split('\\', 1)[0] if area_path else f.get('System.TeamProject', '')
     return {
@@ -216,7 +253,8 @@ def map_workitem(raw):
         'description': f.get(F_DESCRIPTION, ''),
         'analyzerDesc': f.get(F_ANALYZER_DESC, ''),
         'tags': tags,
-        'expectedDate': f.get(F_EXPECTED_DATE) or f.get('Custom.ExpectedDate') or None,
+        'expectedDate': expected_date,
+        'expectedDateRaw': expected_date_raw,
         'productName': f.get(F_PRODUCT, ''),
         'version': f.get(F_VERSION, ''),
         'devLeader': f.get(F_DEV_LEADER, '') or '',
@@ -841,7 +879,8 @@ def list_iterations(client, project, expected_date=None, today=None):
     - earliest：在「提交截止未过」的候选里取 finishDate 最小者——字段流转「排期」取向（field-flow.md）：
       下界 = finishDate − 7 天 ≥ 今天（代码提交截止还没过，排除来不及开发 / 已结束的历史迭代）。
       多个满足条件的迭代时优先把需求排到更早的那个（例：期望 260907，候选 2608.14/2608.28 → 排 2608.14）。
-    today 缺省取当前日期；单测可传固定值。matched 候选不加下界（取 max 不受历史污染）；
+    expected_date 与 today 均按北京时间业务日期解释；today 缺省取当前北京时间，单测可传固定值。
+    matched 候选不加下界（取 max 不受历史污染）；
     earliest 无可排候选时为 None（此时 matched 仍可能存在）。
     """
     tree = fetch_iteration_tree(client, project)
@@ -851,15 +890,32 @@ def list_iterations(client, project, expected_date=None, today=None):
     matched = None
     earliest = None
     if expected_date:
-        exp = expected_date[:10]
-        candidates = [i for i in iters if i.get('finish') and i['finish'][:10] <= exp]
+        try:
+            exp = beijing_date(expected_date)
+        except (TypeError, ValueError) as exc:
+            return {'ok': False, 'project': project, 'count': len(iters), 'iterations': iters,
+                    'matched': None, 'earliest': None, 'error': str(exc)}
+        dated_candidates = []
+        for iteration in iters:
+            finish = iteration.get('finish')
+            if not finish:
+                continue
+            try:
+                finish_date = beijing_date(finish)
+            except (TypeError, ValueError) as exc:
+                return {'ok': False, 'project': project, 'count': len(iters), 'iterations': iters,
+                        'matched': None, 'earliest': None,
+                        'error': f"迭代 {iteration.get('path') or iteration.get('name')!r} 截止时间无效: {exc}"}
+            if finish_date <= exp:
+                dated_candidates.append((iteration, finish_date))
+        candidates = dated_candidates
         if candidates:
-            matched = max(candidates, key=lambda i: i['finish'][:10])
-            today_date = today or datetime.date.today()
-            deadline = (today_date + datetime.timedelta(days=7)).isoformat()
-            schedulable = [i for i in candidates if i['finish'][:10] >= deadline]
+            matched = max(candidates, key=lambda item: item[1])[0]
+            today_date = beijing_date(today) if today is not None else beijing_date()
+            deadline = today_date + datetime.timedelta(days=7)
+            schedulable = [item for item in candidates if item[1] >= deadline]
             if schedulable:
-                earliest = min(schedulable, key=lambda i: i['finish'][:10])
+                earliest = min(schedulable, key=lambda item: item[1])[0]
     return {'ok': True, 'project': project, 'count': len(iters),
             'iterations': iters, 'matched': matched, 'earliest': earliest}
 
@@ -869,7 +925,7 @@ def record(skill, wid, verdict, tags, state_from, state_to, trace, extra, run_id
     wid_seg = str(wid) if wid else '_no_id'
     runs_dir = os.path.join(PROCESS_DIR, wid_seg, 'runs')
     os.makedirs(runs_dir, exist_ok=True)
-    ts = time.strftime('%Y%m%d_%H%M%S')
+    ts = beijing_timestamp('%Y%m%d_%H%M%S')
     run_id = run_id or uuid.uuid4().hex
     if not all(c.isalnum() or c in '-_' for c in run_id):
         fail('run_id 只能包含字母、数字、-、_', 'BAD_RUN_ID')
@@ -907,10 +963,11 @@ def main():
     ap = argparse.ArgumentParser(description='auto-req-qc / auto-req-analysis 共享 TFS 客户端')
     ap.add_argument('--config', default=os.path.join(SCRIPT_DIR, 'tfs-config.json'))
     sub = ap.add_subparsers(dest='cmd', required=True)
-    # --pat / --collection 经 parents 让每个子命令都带，可放在子命令后；临时覆盖、不写回配置。
+    # --pat / --collection / --project 经 parents 让每个子命令都带，可放在子命令后；临时覆盖、不写回配置。
     conn_parent = argparse.ArgumentParser(add_help=False)
     conn_parent.add_argument('--pat', default=None, help='临时 PAT（不写回配置）；缺省用 TFS_PAT 环境变量或配置 tfs.pat')
     conn_parent.add_argument('--collection', default=None, help='临时 collection（不写回配置）；缺省用 TFS_COLLECTION 环境变量或配置 tfs.collection')
+    conn_parent.add_argument('--project', default=None, help='临时 project（不写回配置）；缺省用 TFS_PROJECT 环境变量或配置 tfs.project')
 
     sp = sub.add_parser('fetch', parents=[conn_parent]); sp.add_argument('id')
     sp = sub.add_parser('download-attachments', parents=[conn_parent]); sp.add_argument('id'); sp.add_argument('--output-dir', required=True); sp.add_argument('--include-external', action='store_true', help='受控下载详细信息中命中白名单的外部附件链接'); sp.add_argument('--max-bytes', type=int, default=DEFAULT_ATTACHMENT_MAX_BYTES)
@@ -921,7 +978,7 @@ def main():
     sp = sub.add_parser('write-field', parents=[conn_parent]); sp.add_argument('id'); sp.add_argument('--field', required=True); sp.add_argument('--value', required=True); sp.add_argument('--mode', choices=['replace', 'append'], default='replace'); sp.add_argument('--marker', default=''); sp.add_argument('--dry-run', action='store_true')
     sp = sub.add_parser('upload-attachment', parents=[conn_parent]); sp.add_argument('id'); sp.add_argument('--file', required=True); sp.add_argument('--dry-run', action='store_true')
     sub.add_parser('precheck', parents=[conn_parent])
-    sp = sub.add_parser('list-iterations', parents=[conn_parent]); sp.add_argument('--project', required=True); sp.add_argument('--expected-date', default=None)
+    sp = sub.add_parser('list-iterations', parents=[conn_parent]); sp.add_argument('--expected-date', default=None)
     sp = sub.add_parser('record', parents=[conn_parent]); sp.add_argument('--skill', required=True); sp.add_argument('--id', required=True); sp.add_argument('--verdict', required=True)
     sp.add_argument('--tag', action='append', default=[]); sp.add_argument('--state-from', default=''); sp.add_argument('--state-to', default='')
     sp.add_argument('--trace', default=''); sp.add_argument('--extra', default='{}'); sp.add_argument('--run-id', default='')
@@ -929,11 +986,13 @@ def main():
     args = ap.parse_args()
 
     if args.cmd == 'precheck':
-        client = load_config(args.config, args.pat, args.collection)
+        client = load_config(args.config, args.pat, args.collection, args.project)
         emit(precheck(client)); return
 
     if args.cmd == 'list-iterations':
-        client = load_config(args.config, args.pat, args.collection)
+        if not args.project:
+            ap.error('list-iterations 需要 --project（或 TFS_PROJECT 环境变量）')
+        client = load_config(args.config, args.pat, args.collection, args.project)
         emit(list_iterations(client, args.project, args.expected_date)); return
 
     if args.cmd == 'record':
@@ -944,7 +1003,7 @@ def main():
         emit(record(args.skill, args.id, args.verdict, args.tag, args.state_from, args.state_to, args.trace, extra, args.run_id))
         return
 
-    client = load_config(args.config, args.pat, args.collection)
+    client = load_config(args.config, args.pat, args.collection, args.project)
     wid = int(args.id)
 
     if args.cmd == 'fetch':

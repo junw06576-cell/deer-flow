@@ -12,9 +12,9 @@
 
 | # | 动作 | 字段 / 命令 | 值 |
 |---|---|---|---|
-| 1 | 写迭代路径 | `System.IterationPath` | 目标迭代 = **earliest**（`finishDate ≤ 期望日期` 中 **finishDate 最小者**，排期取向=最早；期望日取自 `Demand.Expected.date`，由 `list_iterations` 算 earliest） |
-| 2 | 写开始日期 | `Microsoft.VSTS.Scheduling.StartDate` | 当前日期（`YYYY-MM-DD`） |
-| 3 | 写完成日期 | `Microsoft.VSTS.Scheduling.FinishDate` | 迭代截止（`matched.finish[:10]`，`YYYY-MM-DD`） |
+| 1 | 写迭代路径 | `System.IterationPath` | 目标迭代 = **earliest**（`finishDate ≤ 北京时间期望日期` 中 **finishDate 最小者**；期望日取自 `Demand.Expected.date`） |
+| 2 | 写开始日期 | `Microsoft.VSTS.Scheduling.StartDate` | 当前北京时间日期（`YYYY-MM-DD`） |
+| 3 | 写完成日期 | `Microsoft.VSTS.Scheduling.FinishDate` | `earliest.finish` 转北京时间后的日期（`YYYY-MM-DD`） |
 | 4 | 转状态 → 活动 | `set-state 活动` | TFS 自动填 `Microsoft.VSTS.Common.ActivatedBy`/`ActivatedDate` |
 | 5 | 转状态 → 已分析 | `set-state 已分析` | TFS 自动填 `Winning.AnalysisBy`/`Winning.AnalysisDate`（终态） |
 | 6 | 指派 | `set-assignee` | `WINNING\账号`（见下方指派优先级） |
@@ -58,9 +58,9 @@
 | dry-run | 每原语返预演不 PATCH；flow 返 actions 预演 |
 | 重跑（已终态+字段已设） | write_field 覆写同值、set_state noop（幂等可接受） |
 
-## 已知 quirk（不改，仅记录）
+## 时间口径
 
-`list_iterations` 用 `expected_date[:10]` 截断日期做比较。`Demand.Expected.date` 存 UTC（如 `2026-09-16T16:00:00Z` = CST 次日午夜），`[:10]` 取 UTC 日，可能比 CST 意图早一天。此为既存行为，259681 实测通过（实际数据下未踩边界）；`apply_field_flow` 只消费 `earliest`（排期最早），`matched` 留给质控时效，均不重复截断逻辑。若发现迭代选错，优先核查此处。
+`fetch` 保留 TFS 原始 `expectedDateRaw`，并把 `expectedDate` 转为 `Asia/Shanghai (+08:00)` ISO 时间。`list_iterations` 对纯日期、UTC ISO、带偏移 ISO 统一先转换为北京时间业务日期，再与迭代截止日比较；例如 `2026-09-16T16:00:00Z` 按 2026-09-17 处理。无法解析的期望时间或迭代截止时间返回 `ok:false`，不得继续猜测排期。`generated_at_utc` 仍保持 UTC 契约。
 
 ## 审计
 

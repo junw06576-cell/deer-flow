@@ -39,7 +39,9 @@ def _invoke_scoped_search(
     _validate_parameters(query, similarity_threshold, vector_similarity_weight)
     arguments = {
         "query": query.strip(),
-        "dataset_ids": [dataset_id],
+        # ragflow_search 的 dataset_ids 签名是 str（逗号分隔），传 list 会触发
+        # pydantic 校验错误 "dataset_ids: Input should be a valid string"
+        "dataset_ids": dataset_id,
         "similarity_threshold": similarity_threshold,
         "vector_similarity_weight": vector_similarity_weight,
     }

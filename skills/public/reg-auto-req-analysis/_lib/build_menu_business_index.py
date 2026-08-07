@@ -10,7 +10,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SOURCES = os.path.join(SCRIPT_DIR, 'menu-sources.json')
 DEFAULT_OUTPUT = os.path.join(SCRIPT_DIR, 'menu-business-index.json')
 REQUIRED_FIELDS = ('mcode', 'pcaption', 'menu_path', 'business_domain', 'match_status')
-OPTIONAL_FIELDS = ('module_url', 'subproject', 'repo', 'apis')
+OPTIONAL_FIELDS = ('module_url', 'subproject', 'repo')
 
 
 def read_json(path):
@@ -58,7 +58,7 @@ def validate_sources(data, manifest_path):
 
 
 def compact_menu(menu, source):
-    item = {'product_id': source['product_id'], 'tfs_area_values': source['tfs_area_values']}
+    item = {'product_id': source['product_id']}
     for field in REQUIRED_FIELDS:
         item[field] = menu.get(field, '')
     for field in OPTIONAL_FIELDS:
@@ -101,7 +101,7 @@ def write_index(index, output_path):
     directory = os.path.dirname(os.path.abspath(output_path))
     os.makedirs(directory, exist_ok=True)
     with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(index, f, ensure_ascii=False, indent=2)
+        json.dump(index, f, ensure_ascii=False, separators=(',', ':'))
         f.write('\n')
 
 

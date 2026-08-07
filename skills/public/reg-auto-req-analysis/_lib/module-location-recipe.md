@@ -6,14 +6,14 @@
 
 ## §0 何时跑
 
-- **质控**：需求触及判定面（高风险 ①②⑤⑥，或含结算/费用/医保/上传/校验/明细等可映射概念）时，跑 §1、§2 和 §5 的佐证子集，只为核对可识别性、查重和高风险；不做完整调用链与源码验证。
+- **质控**：需求触及判定面（高风险 ①②⑤⑥，**或触及 [`business-keyword-dictionary.md`](business-keyword-dictionary.md) 任一业务概念**——不再限于"结算/费用/医保/上传/校验/明细"等枚举）时，跑 §1、§2 和 §5 的佐证子集，只为核对可识别性、查重和高风险；不做完整调用链与源码验证。
 - **分析**：生成变更方案时跑 §1–§5 完整方法，作为内部佐证；结果落 `kb.findings`，不把仓库、代码符号、接口、Mapper 或表字段写入 PM 视角变更方案正文。分析者描述的 `路径` 仅写业务菜单路径和操作路径。
 
 ## §1 固定检索范围与探活
 
 1. 若共享菜单索引存在，先用工作项 `area` 精确选择 `tfs_area_values`；唯一命中的菜单只能提供 repo、页面路径和 API **候选**。未命中、未配置或不唯一时记录范围未确认，继续后续步骤，不猜测产品。
-2. 调用 `gitnexus-team.list_repos` 后明确 `repo`：菜单候选 repo 必须实际存在才可采用；已知项目优先单仓库，跨项目才使用 `cloudhis-unified`。
-3. 记录 `indexedAt`、`lastCommit`、节点数、流程数和 `embeddings`。索引稍旧但可查询时可继续，并标注局限；`LadybugDB unavailable`、`rebuilding` 或超时才是不可查，应按共享规范降级。
+2. 调用 `gitnexus-team.list_repos` 后明确 `repo`：菜单候选 repo 必须实际存在才可采用；**从实时返回的清单中选定，不硬编码仓库名（实测 `cloudhis-unified` 不在清单，旧默认值已废止）**。
+3. 记录 `indexedAt`、`lastCommit`、节点数、流程数和 `embeddings`（**当前全部仓库 `embeddings=0`**，查询词须走精确锚点 + [`business-keyword-dictionary.md`](business-keyword-dictionary.md) 同义词/拼音缩写）。索引稍旧但可查询时可继续，并标注局限；`LadybugDB unavailable`、`rebuilding` 或超时才是不可查，应按共享规范降级。
 4. 不得省略 repo 范围直接搜索，也不得把第一次命中的文件当结论。
 
 > **wiki 桥接（技术锚点来源之一）**：在 GitNexus 检索**之前**按 [`wiki-kb-recipe.md`](wiki-kb-recipe.md) §2 读 wiki，其业务叙述里常带**子系统名/仓库名**（如 `batmed-yfyk-base-frame`、`batwce-v5.6`）——优先用作下文 §2 的"技术锚点"组检索词与 §3 `query`/`context` 的首选锚点。wiki 是业务语义、非代码事实：子系统名只提供**候选**，仍须经 §3 `query → context → route_map → context` 证据链证实，不得据此跳过验证。
@@ -29,7 +29,9 @@
 | 技术锚点 | 找入口和契约 | `/organization`、`orgManage`、Controller、DTO、字典 |
 
 - 先用业务对象和动作找候选，再从页面、API 文件或符号提取 API 路径、Controller、方法、DTO、Mapper 或表名，作为第二轮精确锚点。
-- 中文业务词过宽、`embeddings: 0` 或首轮无命中时，优先使用路径、接口、类/方法名、拼音缩写或英文领域名；必要时收窄到已知子仓库。
+- 中文业务词过宽、`embeddings: 0`（当前全部仓库实测为 0）或首轮无命中时，优先使用路径、接口、类/方法名、[`business-keyword-dictionary.md`](business-keyword-dictionary.md) 的拼音缩写或英文领域名；必要时收窄到已知子仓库。
+- **覆盖度回环（强制）**：至少跑 2 组正交角度（业务对象 / 业务动作 / 技术锚点），每组记 query+命中数+是否截断；首轮窄命中不得直接停手，须第二角度交叉验证。
+- **首轮空回退链（强制）**：首轮 `query` 全空时不得记缺口了事，依次试 ①字典同义词/拼音缩写 ②`cypher` 结构查 ③`impact` 反向找调用方 ④`traverse_graph` ⑤换 repo；仍空才记"代码图谱覆盖缺口"。
 - `processes` 是有价值的增强证据，但不能以其缺失否定业务模块。
 
 ## §3 建立证据链
@@ -67,7 +69,7 @@ query(业务对象/动作)
 
 “图谱事实 / 推断 / 未确认”描述单条证据性质；“已证实 / 候选 / 未确认”描述模块定位结论。名称相似、单个文件命中或未经关系验证的表不得升级为已证实。
 
-**AUTO-ANA 候选的额外要求**：优化类类别（既有功能优化）判 `AUTO-ANA` 时，`kb.findings` 必须至少一条 `state=已证实` 锚定**被改的现有模块/入口**，并在 v2 `evidence_refs` 中被现状、差异或方案结论引用——仅"图谱事实"等证据态不足以放行（由 `pipeline.py` 强制，见 `../config/analysis-rules.md` §1）。目标部署页面的受控观察、可追溯截图或工作项已解析附件可作为“现有 UI 行为/范围”的直接证据：记录来源、采集时间、项目/版本、菜单或 URL、可见状态；它能替代候选源码对**布局与交互事实**的证明，但不能推导未观察到的后端规则。无法证实现有实现或现场 UI 行为 → 不判 `AUTO-ANA`，降 `MANUAL-REVIEW` 并在内部 `evidence_gaps` 记录缺口。
+**AUTO-ANA 候选的额外要求**：优化类类别（既有功能优化）判 `AUTO-ANA` 时，`kb.findings` 必须至少一条 `state=已证实` 锚定**被改的现有模块/入口**，并在 v2 `evidence_refs` 中被现状、差异或方案结论引用——仅"图谱事实"等证据态不足以放行（由 `pipeline.py` 强制，见 `../config/analysis-rules.md` §1）。目标部署页面的受控观察、可追溯截图、工作项已解析附件**或 wiki 界面布局描述（含 Raw 复核，`state=wiki-确认`）**可作为”现有 UI 行为/范围”的直接证据：记录来源、采集时间/页面路径、项目/版本、菜单或 URL、可见状态；它们能替代候选源码对**布局与交互事实**的证明，但不能推导未观察到的后端规则。**界面/布局类需求的现状基线至少须两源交叉证实（见 `../references/iteration-analysis-closure.md` §1），wiki 为首选源之一。**无法证实现有实现或现场 UI 行为 → 不判 `AUTO-ANA`，降 `MANUAL-REVIEW` 并在内部 `evidence_gaps` 记录缺口。
 
 `kb.findings` 至少记录：结论分级、模块/目录范围、入口、已证实关系、关键文件（≤5）、已证实的配置关联、复用/影响、置信度和每项所依据的路径/符号/API。
 
@@ -79,7 +81,7 @@ query(业务对象/动作)
 2. 从页面绑定字段或提交参数取得代码字段候选，再沿 DTO、保存/查询方法、Mapper 或 SQL 验证其业务语义；单个同名变量不能证明数据库映射。
 3. 用代码字段、已证实 Mapper、方法名或 SQL 片段查询 `Column`、`CodeSymbol`、`SQLStatement` 和 `Table`，对候选执行 `traverse_graph`/`get_table_knowledge`，形成“业务词 → 代码字段 → SQL 读写 → 正式表列”闭环。
 4. 排除日期后缀、备份、测试及其他同名近似表；只有在用仓库的 SQL `READS`/`WRITES` 与业务键能锁定的表才记为正式表。最后反查目标查询是否已经选择该列；未选择时记录“目标数据链缺字段”。
-5. 两轮仍无命中或证据链不完整时，记录“数据库图谱覆盖缺口”，将真实表/字段或关联方式列为候选/未确认；不得用相似表补全链路。
+5. 两轮仍无命中或证据链不完整时，记录"数据库图谱覆盖缺口"（`evidence_acquisition.db_knowledge.coverage_status=PARTIAL/UNKNOWN`），将真实表/字段或关联方式列为候选/未确认；不得用相似表补全链路。**负面推断禁令**：`search_knowledge` 无命中只代表"图谱未覆盖/未命中"，**不等同于"库不存在该表/字段"**——数据库图谱覆盖率未知、外键关系稀疏，覆盖不全时严禁下负面结论；只有 `coverage_status=COMPLETE ∧ exhausted ∧ 未截断` 的无命中才允许。
 
 只有存在明确的代码 SQL/契约关系时，才能把数据库结果连入当前业务流程。
 

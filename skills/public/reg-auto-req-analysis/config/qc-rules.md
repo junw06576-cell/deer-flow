@@ -2,7 +2,7 @@
 
 > **状态：已接入事前质控规则。**完整规则、项目关键词字典和更新记录见 `../references/pre-qc-rules.md`；本文件只保留自动化执行时必须遵循的判定顺序与终局映射。
 >
-> 质控**不修改 TFS 状态**。查重仍为预留项，不参与当前判定。
+> 质控**不修改 TFS 状态**。**质控阶段的**查重仍为预留项，不参与**质控 verdict** 判定（分析阶段的“功能已存在”判定另由 `references/confidence-heuristic.md` 第 4 项反向条款与 `pipeline.py` 硬闸约束，不影响质控）。
 
 ## 读取字段
 
@@ -15,6 +15,8 @@
 | 期望日期 | `expectedDate` | 是 |
 | 迭代路径 | `iterationPath` | 否 |
 | 标题 | `title` | 否 |
+
+`expectedDate` 已由 `fetch` 转为北京时间 ISO，`expectedDateRaw` 仅用于审计原始 TFS 值；时效判断不得再对 UTC 原值直接 `[:10]` 截断。
 
 ## 初判优先级（先命中先生效；`SKIP-ANALYSIS` 只记路由原因，其余阻断项先经 `references/qc-checklist.md` §二·收敛规则分流，再按下文 KB/wiki 补证规则复核）
 

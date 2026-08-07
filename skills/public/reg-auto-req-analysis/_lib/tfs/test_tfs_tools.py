@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import gzip
 import json
+import pathlib
 import zipfile
 from unittest import mock
 
@@ -13,6 +14,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import pipeline  # noqa: E402
 import tfs_client as tfs  # noqa: E402
 import attachment_converter as converter  # noqa: E402
+import attachment_runtime as attachment_runtime  # noqa: E402
 import redis_client  # noqa: E402
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import build_menu_business_index as menu_index  # noqa: E402
@@ -31,7 +33,8 @@ class TfsClientTests(unittest.TestCase):
         }})
         self.assertEqual(item['demandType'], '功能性的')
         self.assertEqual(item['pimisPriority'], 'C级(一般)')
-        self.assertEqual(item['expectedDate'], '2026-09-16T16:00:00Z')
+        self.assertEqual(item['expectedDate'], '2026-09-17T00:00:00+08:00')
+        self.assertEqual(item['expectedDateRaw'], '2026-09-16T16:00:00Z')
         self.assertEqual(item['areaPath'], 'NETHIS5.5\\2026年')
         self.assertEqual(item['area'], 'NETHIS5.5')
         self.assertEqual(item['areaSource'], 'System.AreaPath')
@@ -41,6 +44,17 @@ class TfsClientTests(unittest.TestCase):
         item = tfs.map_workitem({'fields': {'System.TeamProject': 'NETHIS5.5'}})
         self.assertEqual(item['area'], 'NETHIS5.5')
         self.assertEqual(item['areaSource'], 'System.TeamProject')
+
+    def test_tfs_dates_use_beijing_timezone_without_host_timezone_dependency(self):
+        self.assertEqual(tfs.beijing_iso('2026-09-16T16:00:00Z'),
+                         '2026-09-17T00:00:00+08:00')
+        self.assertEqual(tfs.beijing_iso('2026-09-17T00:00:00+08:00'),
+                         '2026-09-17T00:00:00+08:00')
+        self.assertEqual(tfs.beijing_iso('2026-09-17'), '2026-09-17')
+        self.assertEqual(tfs.beijing_iso('2026-09-17T00:00:00'),
+                         '2026-09-17T00:00:00+08:00')
+        with self.assertRaises(ValueError):
+            tfs.beijing_iso('not-a-date')
 
     def test_write_field_skips_existing_run_marker(self):
         raw = {'id': 1, 'rev': 4, 'fields': {'Winning.Demand.Analysis': 'old\n<!-- auto-req-run:run_12345678 -->'}}
@@ -350,6 +364,18 @@ class TfsClientTests(unittest.TestCase):
         self.assertIsNone(res_empty['matched'])
         self.assertIsNone(res_empty['earliest'])
 
+        # TFS UTC 前一日 16:00 是北京时间次日 00:00，必须允许截止日在北京时间期望日当天。
+        with mock.patch.object(tfs, 'wit_retry', return_value=(200, tree)):
+            res_beijing = tfs.list_iterations(
+                client, 'Proj', '2026-08-13T16:00:00Z', today=datetime.date(2026, 8, 1))
+        self.assertEqual(res_beijing['matched']['name'], 'V6.0.2608.14')
+        self.assertEqual(res_beijing['earliest']['name'], 'V6.0.2608.14')
+
+        with mock.patch.object(tfs, 'wit_retry', return_value=(200, tree)):
+            res_invalid = tfs.list_iterations(client, 'Proj', 'bad-date', today=datetime.date(2026, 8, 1))
+        self.assertFalse(res_invalid['ok'])
+        self.assertIn('无法解析 TFS 时间', res_invalid['error'])
+
     def test_builtin_attachment_converter_extracts_docx_and_xlsx_without_external_tools(self):
         document_xml = '''<?xml version="1.0" encoding="UTF-8"?>
         <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>
@@ -381,10 +407,248 @@ class TfsClientTests(unittest.TestCase):
                 archive.writestr('xl/worksheets/sheet1.xml', sheet_xml)
             result = converter.convert_directory(source, output)
             self.assertEqual(result['converted'], 2)
+            self.assertEqual({item['converter'] for item in result['files']}, {'builtin-fallback'})
             with open(os.path.join(output, '接口.docx.md'), encoding='utf-8') as f:
                 self.assertIn('orderNo', f.read())
             with open(os.path.join(output, '参数.xlsx.md'), encoding='utf-8') as f:
                 self.assertIn('太原采购', f.read())
+
+    def test_attachment_converter_routes_four_office_formats_and_records_converter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, 'out')
+            paths = {}
+            for extension in ('.doc', '.docx', '.xls', '.xlsx'):
+                path = os.path.join(directory, 'sample' + extension)
+                with open(path, 'wb') as f:
+                    f.write(b'office')
+                paths[extension] = path
+
+            with mock.patch.object(converter, '_markitdown_to_markdown', return_value='MarkItDown 内容'):
+                docx = converter.convert_file(paths['.docx'], output)
+                xls = converter.convert_file(paths['.xls'], output)
+                xlsx = converter.convert_file(paths['.xlsx'], output)
+            self.assertEqual(docx['converter'], 'markitdown')
+            self.assertEqual(xls['converter'], 'markitdown')
+            self.assertEqual(xlsx['converter'], 'markitdown')
+
+            with mock.patch.object(
+                    converter, '_libreoffice_then_parse',
+                    return_value=('旧版 Word 内容', 'libreoffice+markitdown')) as office:
+                doc = converter.convert_file(paths['.doc'], output)
+            self.assertEqual(doc['converter'], 'libreoffice+markitdown')
+            office.assert_called_once_with(paths['.doc'], '.doc', '.docx', converter.DEFAULT_MAX_BYTES)
+
+    def test_xls_falls_back_to_libreoffice_after_markitdown_content_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'sample.xls')
+            with open(path, 'wb') as f:
+                f.write(b'legacy-xls')
+            with mock.patch.object(
+                    converter, '_markitdown_to_markdown',
+                    side_effect=converter._MarkItDownFailure('xlrd failed')), \
+                    mock.patch.object(
+                        converter, '_libreoffice_then_parse',
+                        return_value=('表格内容', 'libreoffice+builtin-fallback')):
+                result = converter.convert_file(path, os.path.join(directory, 'out'))
+        self.assertEqual(result['status'], 'converted')
+        self.assertEqual(result['converter'], 'libreoffice+builtin-fallback')
+        self.assertEqual(result['converter_chain'], 'libreoffice+builtin-fallback')
+
+    def test_libreoffice_failure_and_timeout_are_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'sample.doc')
+            with open(path, 'wb') as f:
+                f.write(b'legacy-doc')
+            failed = mock.Mock(returncode=1, stdout='', stderr='bad input')
+            for outcome, expected in (
+                    (failed, 'LibreOffice 转换失败'),
+                    (converter.subprocess.TimeoutExpired('soffice', 60), 'LibreOffice 转换超时')):
+                with self.subTest(expected=expected), \
+                        mock.patch.object(converter.shutil, 'which', return_value='/usr/bin/soffice'), \
+                        mock.patch.object(converter.subprocess, 'run', side_effect=[outcome] if outcome is failed else outcome):
+                    result = converter.convert_file(path, os.path.join(directory, 'out'))
+                self.assertEqual(result['status'], 'error')
+                self.assertIn(expected, result['reason'])
+
+    def test_attachment_converter_rejects_oversized_file_and_cleans_excel_nan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'sample.xlsx')
+            with open(path, 'wb') as f:
+                f.write(b'oversized')
+            oversized = converter.convert_file(path, os.path.join(directory, 'out'), max_bytes=2)
+            self.assertEqual(oversized['status'], 'skipped')
+            self.assertIn('文件超过', oversized['reason'])
+
+        cleaned = converter._clean_markitdown_output('| A | B |\n| --- | --- |\n| 2201A | NaN |', '.xlsx')
+        self.assertNotIn('NaN', cleaned)
+        self.assertIn('2201A', cleaned)
+
+    def test_attachment_converter_rejects_empty_content_and_routes_only_pptx(self):
+        with tempfile.TemporaryDirectory() as directory:
+            docx = os.path.join(directory, 'empty.docx')
+            pptx = os.path.join(directory, 'slides.pptx')
+            ppt = os.path.join(directory, 'legacy.ppt')
+            for path in (docx, pptx, ppt):
+                with open(path, 'wb') as f:
+                    f.write(b'x')
+            with mock.patch.object(converter, '_markitdown_to_markdown', return_value=''):
+                empty = converter.convert_file(docx, os.path.join(directory, 'out'))
+            self.assertEqual(empty['status'], 'unsupported')
+            self.assertIn('未提取到可读内容', empty['reason'])
+            with mock.patch.object(converter, '_markitdown_to_markdown', return_value='演示内容') as markitdown:
+                slides = converter.convert_file(pptx, os.path.join(directory, 'out'))
+            self.assertEqual(slides['status'], 'converted')
+            self.assertEqual(slides['converter'], 'markitdown')
+            markitdown.assert_called_once()
+            legacy = converter.convert_file(ppt, os.path.join(directory, 'out'))
+            self.assertEqual(legacy['status'], 'unsupported')
+
+    def test_attachment_converter_precheck_reports_actual_format_capabilities(self):
+        with mock.patch.object(converter, '_module_ready', return_value=True), \
+                mock.patch.object(converter, '_soffice_info', return_value={
+                    'ready': True, 'path': '/usr/bin/soffice', 'version': 'LibreOffice 7.4'}), \
+                mock.patch.object(converter.importlib.metadata, 'version', return_value='0.1.7'), \
+                mock.patch.dict(os.environ, {'AUTO_REQ_RUNTIME_IMAGE': 'office:test'}):
+            ready = converter.precheck()
+        self.assertTrue(ready['ok'])
+        self.assertEqual(ready['markitdown']['version'], '0.1.7')
+        self.assertTrue(ready['capabilities']['.pptx']['ready'])
+        self.assertTrue(all(ready['formats'].values()))
+        self.assertTrue(ready['fixed_runtime_verified'])
+
+        def modules(name):
+            return name != 'xlrd'
+
+        with mock.patch.object(converter, '_module_ready', side_effect=modules), \
+                mock.patch.object(converter, '_soffice_info', return_value={
+                    'ready': True, 'path': '/usr/bin/soffice', 'version': 'LibreOffice 7.4'}), \
+                mock.patch.object(converter.importlib.metadata, 'version', return_value='0.1.7'), \
+                mock.patch.dict(os.environ, {'AUTO_REQ_RUNTIME_IMAGE': 'office:test'}):
+            missing = converter.precheck()
+        self.assertTrue(missing['ok'])
+        self.assertIn('libreoffice+ooxml-parser', missing['capabilities']['.xls']['chains'])
+
+        with mock.patch.object(converter, '_module_ready', return_value=True), \
+                mock.patch.object(converter, '_soffice_info', return_value={
+                    'ready': True, 'path': '/usr/bin/soffice', 'version': 'LibreOffice 7.4'}), \
+                mock.patch.object(converter.importlib.metadata, 'version', return_value='0.1.7'), \
+                mock.patch.dict(os.environ, {}, clear=True):
+            host_only = converter.precheck()
+        self.assertTrue(host_only['ok'])
+        self.assertFalse(host_only['fixed_runtime_verified'])
+        self.assertEqual(host_only['runtime_mode'], 'builtin-only')
+        self.assertTrue(host_only['warnings'])
+
+    def test_attachment_precheck_does_not_block_pdf_for_unrelated_office_dependency(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(converter, '_module_ready', side_effect=lambda name: name == 'fitz'), \
+                mock.patch.object(converter, '_soffice_info', return_value={
+                    'ready': False, 'path': None, 'version': None}):
+            with open(os.path.join(directory, '规范.pdf'), 'wb') as handle:
+                handle.write(b'pdf')
+            result = converter.precheck(directory)
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['requested_formats'], ['.pdf'])
+        self.assertEqual(result['blocked_formats'], [])
+
+    def test_attachment_runtime_inventory_cannot_inject_install_packages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for name in ('正常.pdf', '恶意;brew install bad.xls', '说明.txt'):
+                with open(os.path.join(directory, name), 'wb') as handle:
+                    handle.write(b'x')
+            extensions = attachment_runtime._inventory_extensions(directory)
+        self.assertEqual(extensions, ['.pdf', '.txt', '.xls'])
+        self.assertEqual(attachment_runtime._requirement_groups(extensions),
+                         ['python-markitdown'])
+
+    def test_attachment_dependency_lock_pins_markitdown_with_hashes(self):
+        direct = (attachment_runtime.SKILL_ROOT / 'runtime' /
+                  'requirements-attachments.txt').read_text(encoding='utf-8').strip()
+        locked = attachment_runtime.LOCK_FILES['python-markitdown'].read_text(encoding='utf-8')
+        self.assertEqual(direct, 'markitdown[xls,xlsx,pdf,docx,pptx]==0.1.7')
+        self.assertIn('markitdown==0.1.7', locked)
+        self.assertIn('--hash=sha256:', locked)
+
+    def test_attachment_runtime_rejects_corrupt_cache_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = pathlib.Path(directory)
+            python = runtime / 'venv' / 'bin' / 'python'
+            python.parent.mkdir(parents=True)
+            python.write_text('', encoding='utf-8')
+            (runtime / 'runtime-manifest.json').write_text('{bad json', encoding='utf-8')
+            self.assertFalse(attachment_runtime._runtime_valid(runtime, 'cache-key'))
+
+    def test_attachment_runtime_system_install_commands_are_fixed(self):
+        with mock.patch.object(attachment_runtime.os, 'geteuid', return_value=501), \
+                mock.patch.object(attachment_runtime.shutil, 'which', return_value='/usr/bin/sudo'):
+            linux = attachment_runtime._system_install_commands('Linux', '/usr/bin/apt-get')
+        self.assertEqual(linux[0], ['/usr/bin/sudo', '-n', '/usr/bin/apt-get', 'update'])
+        self.assertEqual(linux[1][-3:],
+                         ['libreoffice-calc', 'libreoffice-writer', 'fonts-noto-cjk'])
+        self.assertEqual(
+            attachment_runtime._system_install_commands('Darwin', '/opt/homebrew/bin/brew'),
+            [['/opt/homebrew/bin/brew', 'install', '--cask', 'libreoffice']])
+
+    def test_attachment_runtime_redacts_credentials_from_install_errors(self):
+        redacted = attachment_runtime._redact(
+            'https://user:secret@example.test/simple TFS_PAT=abc TOKEN=def')
+        self.assertNotIn('secret', redacted)
+        self.assertNotIn('abc', redacted)
+        self.assertNotIn('def', redacted)
+
+    def test_attachment_runtime_reuses_valid_cache_without_reinstalling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, 'source')
+            os.makedirs(source)
+            with open(os.path.join(source, '规范.pdf'), 'wb') as handle:
+                handle.write(b'pdf')
+            with mock.patch.object(attachment_runtime, '_cache_key', return_value='cache-key'), \
+                    mock.patch.object(attachment_runtime, '_runtime_valid', return_value=True), \
+                    mock.patch.object(attachment_runtime, '_smoke_runtime', return_value={
+                        'ok': True, 'requested_formats': ['.pdf'], 'capabilities': {},
+                        'blocked_formats': [], 'warnings': []}), \
+                    mock.patch.object(attachment_runtime, '_ensure_libreoffice', return_value={
+                        'ready': True, 'path': '/usr/bin/soffice', 'version': 'LibreOffice'}), \
+                    mock.patch.object(attachment_runtime, '_find_python') as find_python:
+                prepared = attachment_runtime.prepare_runtime(
+                    source, os.path.join(directory, 'runtime'))
+        self.assertEqual(prepared['preflight']['install_required'], [])
+        self.assertEqual(prepared['preflight']['installations'], [])
+        find_python.assert_not_called()
+
+    def test_attachment_runtime_still_runs_converter_after_prepare_degradation(self):
+        prepared = {
+            'python': sys.executable,
+            'environment': os.environ.copy(),
+            'preflight': {'ok': False, 'warnings': ['install failed']},
+        }
+        completed = mock.Mock(returncode=0, stdout=json.dumps({
+            'total': 2, 'converted': 1, 'needs_read': [], 'skipped': 1,
+            'errors': 0, 'files': []}), stderr='')
+        with mock.patch.object(attachment_runtime, 'prepare_runtime', return_value=prepared), \
+                mock.patch.object(attachment_runtime.subprocess, 'run', return_value=completed):
+            result = attachment_runtime.convert('in', 'out', 1024)
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['converted'], 1)
+        self.assertEqual(result['preflight']['warnings'], ['install failed'])
+
+    def test_attachment_runtime_doc_system_failure_does_not_discard_python_runtime(self):
+        completed = mock.Mock(returncode=1, stdout=json.dumps({
+            'ok': False, 'markitdown': {'ready': True}, 'blocked_formats': ['.doc'],
+        }), stderr='')
+        with mock.patch.object(attachment_runtime.subprocess, 'run', return_value=completed):
+            result = attachment_runtime._smoke_runtime(
+                sys.executable, 'input', ['python-markitdown'], os.environ.copy())
+        self.assertEqual(result['blocked_formats'], ['.doc'])
+
+    def test_attachment_runtime_rejects_missing_direct_markitdown_capability(self):
+        completed = mock.Mock(returncode=1, stdout=json.dumps({
+            'ok': False, 'markitdown': {'ready': True}, 'blocked_formats': ['.pdf'],
+        }), stderr='')
+        with mock.patch.object(attachment_runtime.subprocess, 'run', return_value=completed), \
+                self.assertRaisesRegex(RuntimeError, '格式烟测失败'):
+            attachment_runtime._smoke_runtime(
+                sys.executable, 'input', ['python-markitdown'], os.environ.copy())
 
     def test_menu_index_keeps_products_separate_by_area_and_trims_noise(self):
         def source(mcode, caption):
@@ -421,6 +685,8 @@ class TfsClientTests(unittest.TestCase):
             self.assertEqual(menu_index.products_for_area(index, 'UNKNOWN'), [])
             self.assertNotIn('vue_file', index['menus'][0])
             self.assertNotIn('page_type', index['menus'][0])
+            self.assertNotIn('apis', index['menus'][0])
+            self.assertNotIn('tfs_area_values', index['menus'][0])
             duplicate = dict(manifest)
             duplicate['sources'] = [dict(item) for item in manifest['sources']]
             duplicate['sources'][1]['tfs_area_values'] = ['AREA-A']
@@ -470,6 +736,45 @@ class TfsClientTests(unittest.TestCase):
             with open(path, 'r', encoding='utf-8') as f:
                 self.assertEqual(f.read(), before)
 
+    def test_load_config_project_override_rebuilds_base_url(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_tfs_config(directory, project='CfgProj')
+            with mock.patch.dict(os.environ, {}, clear=True):
+                client = tfs.load_config(path, project_override='Other-Project')
+        self.assertEqual(client['project'], 'Other-Project')
+        collection_encoded = tfs.urllib.parse.quote('CfgColl')
+        self.assertIn(f'/tfs/{collection_encoded}/{tfs.urllib.parse.quote("Other-Project")}',
+                      client['base_url'])
+
+    def test_load_config_project_priority_cli_over_env_over_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_tfs_config(directory, project='CfgProj')
+            # 配置默认（无 env、无 override）
+            with mock.patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(tfs.load_config(path)['project'], 'CfgProj')
+            # 环境变量 TFS_PROJECT > 配置
+            with mock.patch.dict(os.environ, {'TFS_PROJECT': 'EnvProj'}, clear=True):
+                self.assertEqual(tfs.load_config(path)['project'], 'EnvProj')
+                # CLI override > 环境变量 > 配置
+                self.assertEqual(
+                    tfs.load_config(path, project_override='CliProj')['project'], 'CliProj')
+
+    def test_list_iterations_project_flag_via_main(self):
+        # list-iterations 的 --project 迁到共享 conn_parent 后：仍必填，且同时进
+        # load_config(project_override) 与 list_iterations(project)。
+        with mock.patch.object(tfs, 'load_config', return_value={'base_url': 'u'}) as lc, \
+                mock.patch.object(tfs, 'list_iterations', return_value={'ok': True}) as li, \
+                mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(sys, 'argv',
+                                   ['tfs_client.py', 'list-iterations', '--expected-date', '2026-08-31']):
+                self.assertRaises(SystemExit, tfs.main)  # 缺 --project → ap.error
+            with mock.patch.object(sys, 'argv',
+                                   ['tfs_client.py', '--config', 'c.json',
+                                    'list-iterations', '--project', 'TeamProj']):
+                tfs.main()
+        self.assertEqual(li.call_args.args[1], 'TeamProj')
+        self.assertEqual(lc.call_args.args[-1], 'TeamProj')
+
 
 class PipelinePlanTests(unittest.TestCase):
     def write_analysis_plan(self, directory, categories, run_id='run_12345678',
@@ -505,21 +810,38 @@ class PipelinePlanTests(unittest.TestCase):
                 '- **成功衡量**：保存后操作人员可识别成功结果。',
                 '- **非目标**：不新增字段、流程、权限或数据修改。',
             ])
-        lines.extend([
-            '## 三、分析者描述',
-            '- **需求类别**：' + '、'.join(f'`{category}`' for category in categories),
-            '- **路径**：菜单路径：业务管理 > 测试功能；操作路径：测试功能 → 编辑 → 保存',
-        ])
+        lines.append('## 三、分析者描述')
+        if analysis_profile != 'concise-v3':
+            lines.extend([
+                '- **需求类别**：' + '、'.join(f'`{category}`' for category in categories),
+                '- **路径**：菜单路径：业务管理 > 测试功能；操作路径：测试功能 → 编辑 → 保存',
+            ])
+        if analysis_rule == 'evidence-loop-v1' and analysis_profile != 'concise-v3':
+            lines.extend([
+                '- **决策结论**：调整既有保存提示，使操作结果可直接识别。',
+                '- **生效路径与条件**：测试功能编辑页保存成功后生效。',
+                '- **决策边界**：不改变保存流程、数据写入和权限。',
+                '- **验收要点**：保存后操作人员可识别成功提示。',
+            ])
         for category in categories:
             lines.append(f'### {category}（测试类别）')
             if analysis_profile == 'concise-v1':
                 requirements = pipeline.CONCISE_ANALYSIS_DESCRIPTION_REQUIREMENTS[category]
             elif analysis_profile == 'concise-v2':
                 requirements = pipeline.CONCISE_V2_ANALYSIS_DESCRIPTION_REQUIREMENTS[category]
+            elif analysis_profile == 'concise-v3':
+                requirements = pipeline.CONCISE_V3_ANALYSIS_DESCRIPTION_REQUIREMENTS[category]
             else:
                 requirements = pipeline.ANALYSIS_DESCRIPTION_REQUIREMENTS[category]
             lines.extend(f'- **{label}**：已明确{label}'
                          for label in requirements)
+        if analysis_rule == 'evidence-loop-v1':
+            lines.extend([
+                '## 四、范围—方案—验收追踪',
+                '| ID | 范围/改动点 | 方案/目标行为 | 验收场景与结果 | 结论状态 | 依据或缺口 |',
+                '| --- | --- | --- | --- | --- | --- |',
+                '| R1 | 保存结果提示 | 保存后展示明确提示 | 保存成功后操作人员可识别结果 | 已证实 | 工作项 |',
+            ])
         with open(os.path.join(directory, artifact_name), 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines) + '\n')
         plan = {
@@ -553,6 +875,12 @@ class PipelinePlanTests(unittest.TestCase):
             })
         return plan, plan_path, os.path.join(directory, artifact_name)
 
+    def write_current_analysis_plan(self, directory, categories, run_id='run_12345678'):
+        """生成当前 concise-v3 分析计划；旧 helper 默认值保留历史格式测试。"""
+        return self.write_analysis_plan(
+            directory, categories, run_id=run_id,
+            analysis_rule='evidence-loop-v1', analysis_profile='concise-v3')
+
     def make_manual_plan(self, directory, gaps):
         plan, plan_path, _ = self.write_analysis_plan(directory, ['existing-ui-simple'])
         plan.update({
@@ -564,6 +892,168 @@ class PipelinePlanTests(unittest.TestCase):
         plan.pop('auto_scopes')
         return plan, plan_path
 
+    def requirements_evidence(self, state='已证实', source_tool='get_work_item'):
+        return {
+            'ready': True,
+            'coverage': {
+                'collection': 'WN_PH-Platform', 'project': 'NETHIS5.5',
+                'created_from': '2023-07-31T00:00:00Z',
+                'created_before': '2026-08-01T00:00:00Z',
+            },
+            'tools_used': list(dict.fromkeys(['get_requirements_summary', source_tool])),
+            'findings': [{
+                'work_item_id': 260001,
+                'fact': '历史需求明确保存后提示的验收条件。',
+                'state': state,
+                'source_tool': source_tool,
+            }],
+            'note': '已读取覆盖范围并核验历史工作项正文。',
+        }
+
+    def complete_acquisition(self, **overrides):
+        """构造四源均 COMPLETE+exhausted+HIT 的合法 evidence_acquisition（v2 基线）。"""
+        acq = {}
+        for source in pipeline.EVIDENCE_ACQUISITION_SOURCES:
+            acq[source] = {
+                'availability': 'READY',
+                'coverage_status': 'COMPLETE',
+                'query_status': 'HIT',
+                'queries': [{'terms': '测试查询词', 'truncated': False, 'returned': 1}],
+                'stop_reason': 'exhausted',
+            }
+        for source, override in overrides.items():
+            acq[source] = {**acq[source], **override}
+        return acq
+
+    def write_v2_analysis_plan(self, directory, categories, run_id='run_12345678',
+                               acquisition=None):
+        """evidence-loop-v2 计划：复用 v1 证据闭环骨架，换规则源并挂 evidence_acquisition。"""
+        plan, plan_path, artifact = self.write_analysis_plan(
+            directory, categories, run_id=run_id, analysis_rule='evidence-loop-v1')
+        plan['rules_source']['analysis'] = 'evidence-loop-v2'
+        plan['evidence_acquisition'] = (
+            acquisition if acquisition is not None else self.complete_acquisition())
+        return plan, plan_path, artifact
+
+    def test_v1_evidence_loop_plan_still_passes_without_evidence_acquisition(self):
+        # 向后兼容：evidence-loop-v1 计划不要求 evidence_acquisition
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_analysis_plan(
+                directory, ['existing-ui-simple'], analysis_rule='evidence-loop-v1')
+            self.assertNotIn('evidence_acquisition', plan)
+            self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
+    def test_v2_complete_acquisition_plan_passes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_v2_analysis_plan(directory, ['existing-ui-simple'])
+            self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
+    def test_v2_plan_requires_evidence_acquisition_object(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_v2_analysis_plan(directory, ['existing-ui-simple'])
+            plan.pop('evidence_acquisition')
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('必须含 evidence_acquisition 对象' in e for e in result['errors']))
+
+    def test_v2_plan_requires_all_four_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_v2_analysis_plan(directory, ['existing-ui-simple'])
+            plan['evidence_acquisition'].pop('db_knowledge')
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('evidence_acquisition 缺少来源' in e for e in result['errors']))
+
+    def test_v2_dedup_ran_requires_non_empty_queries(self):
+        # 约束1：dedup_ran=true 但 tfs_requirements.queries 为空 → 失败
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_v2_analysis_plan(directory, ['existing-ui-simple'])
+            plan['evidence_acquisition']['tfs_requirements']['queries'] = []
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('dedup_ran=true' in e and '不得为空' in e for e in result['errors']))
+
+    def test_v2_auto_requires_complete_or_outofscope_dedup_coverage(self):
+        # 约束2：AUTO-ANA 查重覆盖 PARTIAL → 失败（须改判 MANUAL）
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_v2_analysis_plan(directory, ['existing-ui-simple'])
+            plan['evidence_acquisition']['tfs_requirements']['coverage_status'] = 'PARTIAL'
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('AUTO-ANA' in e and 'coverage_status' in e for e in result['errors']))
+
+    def test_v2_complete_requires_exhausted_and_no_truncation(self):
+        # 约束3：COMPLETE 须 availability=READY ∧ stop_reason=exhausted ∧ 无截断
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_v2_analysis_plan(directory, ['existing-ui-simple'])
+            plan['evidence_acquisition']['gitnexus']['stop_reason'] = 'verified_hit'
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('coverage_status=COMPLETE 要求 stop_reason=exhausted' in e
+                                for e in result['errors']))
+            plan['evidence_acquisition']['gitnexus']['stop_reason'] = 'exhausted'
+            plan['evidence_acquisition']['gitnexus']['queries'] = [{'terms': '词', 'truncated': True}]
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('truncated=true' in e for e in result['errors']))
+
+    def test_v2_no_hit_requires_complete_coverage(self):
+        # 约束4：query_status=NO_HIT 须 coverage_status=COMPLETE（覆盖不全不得声明无命中）
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_v2_analysis_plan(directory, ['existing-ui-simple'])
+            plan['evidence_acquisition']['wiki']['query_status'] = 'NO_HIT'
+            plan['evidence_acquisition']['wiki']['coverage_status'] = 'PARTIAL'
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('query_status=NO_HIT 要求 coverage_status=COMPLETE' in e
+                                for e in result['errors']))
+
+    def test_v2_maturity_landed_requires_confirmed_state(self):
+        # 约束5：maturity=已落地 须 state=已证实
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_v2_analysis_plan(directory, ['existing-ui-simple'])
+            plan['tfs_requirements'] = self.requirements_evidence(state='候选')
+            plan['tfs_requirements']['findings'][0]['maturity'] = '已落地'
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('maturity=已落地 要求 state=已证实' in e for e in result['errors']))
+
+    def test_v2_bad_enum_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_v2_analysis_plan(directory, ['existing-ui-simple'])
+            plan['evidence_acquisition']['wiki']['availability'] = 'MAYBE'
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('evidence_acquisition.wiki.availability 必须为' in e
+                                for e in result['errors']))
+
+    def test_evidence_gaps_accept_background_kind_type_and_product_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_analysis_plan(
+                directory, ['existing-ui-simple'], analysis_rule='evidence-loop-v1')
+            plan.update({'verdict': 'MANUAL-REVIEW', 'tags': ['PM-AI-MANUAL-REVIEW'], 'state_to': None})
+            plan.pop('auto_scopes')
+            plan['evidence_gaps'] = [{
+                'id': 'gap-wiki-missing', 'topic': '物资管理 wiki',
+                'missing': 'wiki 未覆盖物资管理模块', 'impact': '无法佐证物资业务边界',
+                'owner': '产品', 'next_action': '补建 wiki 物资管理文章',
+                'type': 'WIKI_TOPIC_MISSING', 'kind': 'background',
+            }]
+            self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
+    def test_evidence_gaps_reject_unknown_type(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_analysis_plan(
+                directory, ['existing-ui-simple'], analysis_rule='evidence-loop-v1')
+            plan.update({'verdict': 'MANUAL-REVIEW', 'tags': ['PM-AI-MANUAL-REVIEW'], 'state_to': None})
+            plan.pop('auto_scopes')
+            plan['evidence_gaps'] = [{
+                'id': 'gap-bad', 'topic': 'x', 'missing': 'y', 'impact': 'z',
+                'owner': '研发', 'next_action': '补', 'type': 'NOT_A_REAL_TYPE'}]
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('evidence_gaps[1].type 必须为' in e for e in result['errors']))
+
     def test_evidence_loop_plan_requires_complete_closure_and_keeps_legacy_compatible(self):
         with tempfile.TemporaryDirectory() as directory:
             legacy, legacy_path, _ = self.write_analysis_plan(directory, ['existing-ui-simple'])
@@ -571,6 +1061,54 @@ class PipelinePlanTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             plan, plan_path, _ = self.write_analysis_plan(
                 directory, ['existing-ui-simple'], analysis_rule='evidence-loop-v1')
+            self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
+    def test_evidence_loop_requires_decision_summary_and_scope_solution_acceptance_traceability(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, artifact_path = self.write_analysis_plan(
+                directory, ['existing-ui-simple'], analysis_rule='evidence-loop-v1')
+            with open(artifact_path, 'r', encoding='utf-8') as f:
+                original = f.read()
+
+            with open(artifact_path, 'w', encoding='utf-8') as f:
+                f.write(original.replace('- **验收要点**：保存后操作人员可识别成功提示。\n', ''))
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertIn('分析者描述必须且只能包含一个非空“验收要点”决策摘要', result['errors'])
+
+            with open(artifact_path, 'w', encoding='utf-8') as f:
+                f.write(original.replace('| 已证实 | 工作项 |', '| 待业务确认 | 工作项 |'))
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('待业务确认必须关联既有 analysis-gap:<id>' in error
+                                for error in result['errors']))
+
+            gap = {
+                'id': 'gap-prompt-rule', 'topic': '提示规则', 'missing': '保存失败时是否沿用既有提示',
+                'impact': '无法确定失败场景验收', 'question': '保存失败时是否沿用既有提示？',
+                'options': ['沿用既有提示'], 'allow_other': True,
+            }
+            plan.update({
+                'verdict': 'MANUAL-REVIEW', 'tags': ['PM-AI-MANUAL-REVIEW'], 'state_to': None,
+                'analysis_gaps': [gap],
+            })
+            plan.pop('auto_scopes')
+            followup_name = f'待确认清单_1_{plan["run_id"]}.md'
+            plan['artifacts'].append({'kind': 'manual-followup', 'path': followup_name})
+            with open(os.path.join(directory, followup_name), 'w', encoding='utf-8') as f:
+                f.write('\n'.join([
+                    f'<!-- auto-req-run:{plan["run_id"]} -->',
+                    '## 需要确认的需求分析信息',
+                    '### gap-prompt-rule · 提示规则',
+                    '<!-- analysis-gap:gap-prompt-rule -->',
+                    '- **缺失信息**：保存失败时是否沿用既有提示',
+                    '- **对分析/验收的影响**：无法确定失败场景验收',
+                    '- **需确认的问题**：保存失败时是否沿用既有提示？',
+                    '- **候选口径**：沿用既有提示',
+                    '- **允许自由补充**：是',
+                ]))
+            with open(artifact_path, 'w', encoding='utf-8') as f:
+                f.write(original.replace('| 已证实 | 工作项 |', '| 待业务确认 | analysis-gap:gap-prompt-rule |'))
             self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
 
     def test_skip_analysis_is_terminal_and_has_no_tfs_mutation_contract(self):
@@ -622,7 +1160,8 @@ class PipelinePlanTests(unittest.TestCase):
             response = pipeline.apply_plan(plan, '/tmp/skip-plan.json', True, 'config.json')
         self.assertTrue(response['ok'])
         self.assertEqual(response['actions'], [])
-        publish.assert_called_once_with(plan, 'execute', 'C', 'config.json')
+        publish.assert_called_once_with(plan, 'execute', 'C', 'config.json',
+                                        analysis_description_html='', work_item='')
         for mutation in (remove_tag, add_tag, upload_attachment, replace_detail,
                          write_field, set_state, set_assignee):
             mutation.assert_not_called()
@@ -659,13 +1198,96 @@ class PipelinePlanTests(unittest.TestCase):
             self.assertNotIn('- **生效场景**：', content)
             self.assertNotIn('- **不涉及范围**：', content)
 
+    def test_concise_v3_supports_all_categories_and_multiple_categories(self):
+        categories = tuple(pipeline.CONCISE_V3_ANALYSIS_DESCRIPTION_REQUIREMENTS)
+        self.assertEqual(set(categories), set(pipeline.ANALYSIS_DESCRIPTION_REQUIREMENTS))
+        for category in categories:
+            with tempfile.TemporaryDirectory() as directory:
+                plan, plan_path, _ = self.write_current_analysis_plan(directory, [category])
+                self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'], category)
+
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_current_analysis_plan(
+                directory, ['report', 'third-party-new', 'existing-complex'])
+            self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
+    def test_concise_v3_rejects_missing_category_dimensions(self):
+        for category, requirements in pipeline.CONCISE_V3_ANALYSIS_DESCRIPTION_REQUIREMENTS.items():
+            with tempfile.TemporaryDirectory() as directory:
+                plan, plan_path, artifact_path = self.write_current_analysis_plan(directory, [category])
+                missing = requirements[0]
+                with open(artifact_path, 'r', encoding='utf-8') as f:
+                    content = f.read().replace(f'- **{missing}**：已明确{missing}\n', '')
+                with open(artifact_path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                result = pipeline.validate_plan(plan, plan_path)
+                self.assertFalse(result['ok'], category)
+                self.assertIn(f'分析类别 {category} 缺少非空维度“{missing}”', result['errors'])
+
+    def test_concise_v3_rejects_public_metadata_and_decision_summaries(self):
+        forbidden = {
+            '需求类别': '`existing-ui-simple`',
+            '路径': '菜单路径：业务管理；操作路径：编辑 → 保存',
+            '决策结论': '调整保存提示。',
+            '生效路径与条件': '保存成功后生效。',
+            '决策边界': '不改变数据写入。',
+            '验收要点': '保存后显示新提示。',
+        }
+        for label, value in forbidden.items():
+            with tempfile.TemporaryDirectory() as directory:
+                plan, plan_path, artifact_path = self.write_current_analysis_plan(
+                    directory, ['existing-ui-simple'])
+                with open(artifact_path, 'r', encoding='utf-8') as f:
+                    content = f.read().replace(
+                        '## 三、分析者描述\n',
+                        f'## 三、分析者描述\n- **{label}**：{value}\n')
+                with open(artifact_path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                result = pipeline.validate_plan(plan, plan_path)
+                self.assertFalse(result['ok'], label)
+                self.assertTrue(any(label in error for error in result['errors']), result['errors'])
+
+    def test_concise_v3_rejects_legacy_version_and_extra_dimensions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, artifact_path = self.write_current_analysis_plan(
+                directory, ['existing-ui-simple'])
+            plan['version'] = 1
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertIn('concise-v3 仅允许 version=2 的新分析计划', result['errors'])
+
+            plan['version'] = pipeline.PLAN_VERSION
+            with open(artifact_path, 'r', encoding='utf-8') as f:
+                content = f.read().replace(
+                    '- **界面优化方案**：已明确界面优化方案\n',
+                    '- **界面优化方案**：已明确界面优化方案\n- **影响范围**：重复展开\n')
+            with open(artifact_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertIn(
+                "分析类别 existing-ui-simple 含 concise-v3 非法维度：['影响范围']",
+                result['errors'])
+
+    def test_concise_v3_allows_business_sections_after_analysis_description(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, artifact_path = self.write_current_analysis_plan(
+                directory, ['existing-ui-simple'])
+            with open(artifact_path, 'r', encoding='utf-8') as f:
+                content = f.read() + '\n## 五、业务规则与变更范围\n- **业务规则**：保存后显示明确提示。\n'
+            with open(artifact_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
     def test_v2_plan_cannot_bypass_evidence_loop_with_fallback_rule_source(self):
         with tempfile.TemporaryDirectory() as directory:
             plan, plan_path, _ = self.write_analysis_plan(directory, ['existing-ui-simple'])
             plan['version'] = pipeline.PLAN_VERSION
             result = pipeline.validate_plan(plan, plan_path)
             self.assertFalse(result['ok'])
-            self.assertIn("rules_source.analysis 必须为 ['evidence-loop-v1']", result['errors'])
+            self.assertIn(
+                "rules_source.analysis 必须为 ['evidence-loop-v1', 'evidence-loop-v2']",
+                result['errors'])
 
     def test_evidence_refs_bind_auto_conclusions_and_evidence_gaps_stay_internal(self):
         evidence_gap = {
@@ -698,6 +1320,86 @@ class PipelinePlanTests(unittest.TestCase):
             plan.pop('auto_scopes')
             self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
 
+    def test_requirement_history_refs_require_confirmed_detail_or_relation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_analysis_plan(
+                directory, ['existing-ui-simple'], analysis_rule='evidence-loop-v1')
+            plan['tfs_requirements'] = self.requirements_evidence()
+            plan['evidence_refs']['问题与目标'] = ['work-item', 'req:0']
+            self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
+            plan['tfs_requirements']['findings'][0]['state'] = '候选'
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertIn(
+                'evidence_refs.问题与目标 引用的 req:0 必须指向 '
+                'tfs_requirements.findings 的已证实项', result['errors'])
+
+            plan['tfs_requirements']['findings'][0]['state'] = '未确认'
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertIn(
+                'evidence_refs.问题与目标 引用的 req:0 必须指向 '
+                'tfs_requirements.findings 的已证实项', result['errors'])
+
+            for source_tool in ('search_requirements', 'get_requirements_summary'):
+                plan['tfs_requirements'] = self.requirements_evidence(source_tool=source_tool)
+                result = pipeline.validate_plan(plan, plan_path)
+                self.assertFalse(result['ok'])
+                self.assertIn(
+                    'tfs_requirements.findings[0] 只有 get_work_item 或 '
+                    'get_related_work_items 的结果可标为已证实', result['errors'])
+
+            plan['tfs_requirements'] = self.requirements_evidence()
+            plan['evidence_refs']['问题与目标'] = ['req:1']
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertIn(
+                'evidence_refs.问题与目标 引用的 req:1 必须指向 '
+                'tfs_requirements.findings 的已证实项', result['errors'])
+
+            plan['evidence_refs']['问题与目标'] = ['req:0']
+            plan.pop('tfs_requirements')
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertIn(
+                'evidence_refs.问题与目标 引用的 req:0 必须指向 '
+                'tfs_requirements.findings 的已证实项', result['errors'])
+
+    def test_requirement_history_cannot_release_qc_or_replace_auto_code_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_analysis_plan(
+                directory, ['existing-ui-simple'], analysis_rule='evidence-loop-v1')
+            plan['tfs_requirements'] = self.requirements_evidence()
+            plan['qc_evidence_resolution'] = {
+                'initial_verdict': 'NEED-REVIEW',
+                'post_evidence_verdict': 'PASS',
+                'items': [{
+                    'id': 'history-only',
+                    'initial_gap': '当前业务范围未证实。',
+                    'resolution': '历史需求描述了相似范围。',
+                    'evidence_refs': ['req:0'],
+                }],
+            }
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertIn(
+                'qc_evidence_resolution.items[1] 的 req:0 必须指向 '
+                'kb/wiki.findings 的已证实项', result['errors'])
+
+            plan.pop('qc_evidence_resolution')
+            for heading in ('现状基线', '差异与范围', '方案取舍'):
+                plan['evidence_refs'][heading] = ['req:0']
+            plan.pop('kb')
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertIn(
+                'AUTO-ANA 要求 kb.ready=true 且 kb.dedup_ran=true',
+                '\n'.join(result['errors']))
+            self.assertIn(
+                'AUTO-ANA 的 evidence_refs.现状基线 必须包含 kb: 已证实证据引用',
+                result['errors'])
+
     def test_qc_evidence_resolution_requires_confirmed_kb_or_wiki_findings(self):
         with tempfile.TemporaryDirectory() as directory:
             plan, plan_path, _ = self.write_analysis_plan(
@@ -706,9 +1408,9 @@ class PipelinePlanTests(unittest.TestCase):
                 'initial_verdict': 'NEED-REVIEW',
                 'post_evidence_verdict': 'PASS',
                 'items': [{
-                    'id': 'expiry-threshold',
-                    'initial_gap': '有效期预警分段与月份计算口径未明确。',
-                    'resolution': '已证实同业务范围的既有规则采用自然月分段且红色优先。',
+                    'id': 'dispensing-boundary',
+                    'initial_gap': '门诊发退药与药库出库的业务边界未明确。',
+                    'resolution': '已证实门诊发退药归药房管理，药库出库归药库库存管理。',
                     'evidence_refs': ['kb:0'],
                 }],
             }
@@ -722,7 +1424,8 @@ class PipelinePlanTests(unittest.TestCase):
                 result['errors'])
 
             plan['wiki'] = {
-                'findings': [{'entity': '药品效期预警标准', 'state': 'wiki-确认', 'source': 'wiki/药房药库.md'}]
+                'findings': [{'entity': '门诊发退药与药库出库的业务边界', 'state': 'wiki-确认',
+                              'source': 'wiki/门诊/门诊药品流转.md'}]
             }
             plan['qc_evidence_resolution']['items'][0]['evidence_refs'] = ['wiki:0']
             self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
@@ -876,11 +1579,34 @@ class PipelinePlanTests(unittest.TestCase):
             plan['wiki'] = {
                 'ready': True,
                 'modules_matched': ['药房药库'],
-                'findings': [{'entity': '药房=发药点/药库=中心库', 'state': 'wiki-确认',
-                              'source': 'wiki/sources/2026-07-27-药房药库.md'}],
-                'note': '命中药房药库模块',
+                'findings': [{'entity': '门诊发退药归药房管理，药库出库归药库库存管理', 'state': 'wiki-确认',
+                              'source': 'wiki/门诊/门诊药品流转.md'}],
+                'note': '命中门诊药品流转；已复核 raw/平台/药房药库.md',
             }
             self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
+    def test_tfs_requirements_audit_field_is_optional_and_validated(self):
+        """历史计划可省略需求历史；新计划携带时必须满足正式证据结构。"""
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_analysis_plan(directory, ['existing-ui-simple'])
+            self.assertNotIn('tfs_requirements', plan)
+            self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
+            plan['tfs_requirements'] = self.requirements_evidence()
+            self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
+            plan['tfs_requirements']['coverage'] = {}
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertIn('tfs_requirements.ready=true 时 coverage 不得为空', result['errors'])
+
+            plan['tfs_requirements'] = self.requirements_evidence()
+            plan['tfs_requirements']['tools_used'].remove('get_requirements_summary')
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertIn(
+                'tfs_requirements.ready=true 时 tools_used 必须包含 get_requirements_summary',
+                result['errors'])
 
     def test_plan_rejects_unsafe_artifact_and_duplicate_tags(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -995,6 +1721,80 @@ class PipelinePlanTests(unittest.TestCase):
             plan['kb'] = {'ready': True, 'dedup_ran': True, 'findings': [
                 {'entity': 'x', 'state': '图谱事实', 'source_tool': 'context'}]}
             self.assertFalse(pipeline.validate_plan(plan, plan_path)['ok'])
+
+    def test_existing_feature_satisfied_blocks_auto_ana(self):
+        # 功能已存在（existing_feature.satisfied=true）→ 硬闸禁止 AUTO-ANA
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_analysis_plan(directory, ['existing-ui-simple'])
+            plan['existing_feature'] = {
+                'satisfied': True, 'requirement_ids': [260647],
+                'note': '需求 260647 已实现退药数量列前置'}
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any(
+                '禁止 AUTO-ANA' in e and '功能已存在' in e and '改判 MANUAL-REVIEW' in e
+                for e in result['errors']))
+
+    def test_existing_feature_satisfied_allowed_on_manual_review(self):
+        # MANUAL-REVIEW 可声明 existing_feature（不触发硬闸）
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path = self.make_manual_plan(directory, [])
+            plan['existing_feature'] = {'satisfied': True, 'requirement_ids': [260647]}
+            self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
+    def test_existing_feature_absent_backward_compatible(self):
+        # 字段缺省 → 既有计划行为不变
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_analysis_plan(directory, ['existing-ui-simple'])
+            self.assertNotIn('existing_feature', plan)
+            self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
+    def test_existing_feature_satisfied_false_allowed_on_auto(self):
+        # satisfied=false（相似但本次是新增量改动）→ 显式未满足，不阻断 AUTO
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_analysis_plan(directory, ['existing-ui-simple'])
+            plan['existing_feature'] = {'satisfied': False, 'note': '相似但本次是新增量改动'}
+            self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
+    def test_existing_feature_must_be_object(self):
+        for bad in ('yes', [{'satisfied': True}]):
+            with tempfile.TemporaryDirectory() as directory:
+                plan, plan_path, _ = self.write_analysis_plan(directory, ['existing-ui-simple'])
+                plan['existing_feature'] = bad
+                result = pipeline.validate_plan(plan, plan_path)
+                self.assertFalse(result['ok'])
+                self.assertTrue(any('existing_feature 必须为对象' in e for e in result['errors']))
+
+    def test_existing_feature_requirement_ids_must_be_unique_positive_ints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path = self.make_manual_plan(directory, [])
+            plan['existing_feature'] = {
+                'satisfied': True, 'requirement_ids': [0, 260647, 260647]}
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any(
+                'requirement_ids' in e and '正整数' in e for e in result['errors']))
+
+    def test_existing_feature_note_must_be_nonempty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path = self.make_manual_plan(directory, [])
+            plan['existing_feature'] = {'satisfied': True, 'note': '   '}
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('note' in e and '非空字符串' in e for e in result['errors']))
+
+    def test_skip_analysis_rejects_existing_feature(self):
+        plan = {
+            'version': 1, 'run_id': 'run_skip_ef', 'skill': 'auto-req-analysis',
+            'work_item_id': 1, 'expected_rev': 5, 'expected_state': '已建议',
+            'verdict': 'SKIP-ANALYSIS', 'rules_source': {'qc': 'pre-qc-v1'},
+            'tags': [], 'state_to': None, 'artifacts': [],
+            'skip_reason': '仅联调，无新增业务分析面。',
+            'existing_feature': {'satisfied': True, 'requirement_ids': [260647]},
+        }
+        result = pipeline.validate_plan(plan, '/tmp/skip-ef.json')
+        self.assertFalse(result['ok'])
+        self.assertIn('SKIP-ANALYSIS 计划不得声明 existing_feature', result['errors'])
 
     def test_assignee_to_only_allowed_on_auto_ana(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1258,6 +2058,30 @@ class PipelinePlanTests(unittest.TestCase):
         self.assertNotIn('`', rendered)
         self.assertNotIn('## 四、', rendered)
 
+    def test_render_concise_v3_outputs_only_business_dimensions(self):
+        content = '\n'.join([
+            '# 变更方案',
+            '## 三、分析者描述',
+            '### existing-ui-simple（既有功能简单界面优化）',
+            '- **界面优化方案**：费用录入页保存后显示“A <script>alert(1)</script>”，不改变数据写入。',
+            '## 四、范围—方案—验收追踪',
+        ])
+        rendered = pipeline.render_analysis_description_html(content, 'concise-v3')
+        self.assertIn('<strong>界面优化方案：</strong>', rendered)
+        self.assertIn('&lt;script&gt;alert(1)&lt;/script&gt;', rendered)
+        self.assertNotIn('existing-ui-simple', rendered)
+        self.assertNotIn('既有功能简单界面优化', rendered)
+        self.assertNotIn('需求类别', rendered)
+        self.assertNotIn('路径：', rendered)
+        self.assertNotIn('决策结论', rendered)
+
+        invalid = content.replace(
+            '### existing-ui-simple（既有功能简单界面优化）',
+            '- **路径**：菜单路径：费用管理；操作路径：费用录入 → 保存\n'
+            '### existing-ui-simple（既有功能简单界面优化）')
+        with self.assertRaisesRegex(ValueError, 'concise-v3 分析者描述不得包含“路径”'):
+            pipeline.render_analysis_description_html(invalid, 'concise-v3')
+
     def test_render_analysis_description_html_allows_flat_numbered_change_points(self):
         content = '\n'.join([
             '# 变更方案',
@@ -1360,6 +2184,7 @@ class PipelinePlanTests(unittest.TestCase):
     def test_apply_preflight_failure_records_error_audit(self):
         with tempfile.TemporaryDirectory() as directory:
             plan, plan_path, _ = self.write_analysis_plan(directory, ['existing-ui-simple'])
+            plan['tfs_requirements'] = self.requirements_evidence()
             with mock.patch.object(tfs, 'load_config', return_value={}), \
                     mock.patch.object(tfs, 'precheck', return_value={'ok': True}), \
                     mock.patch.object(pipeline, 'preflight', return_value={'ok': False, 'error': '版本已变化'}), \
@@ -1368,6 +2193,7 @@ class PipelinePlanTests(unittest.TestCase):
         self.assertFalse(response['ok'])
         self.assertEqual(response['audit'], 'error-audit.json')
         self.assertEqual(record.call_args.args[2], 'ERROR')
+        self.assertEqual(record.call_args.args[7]['tfs_requirements'], plan['tfs_requirements'])
 
     def test_repair_analysis_placement_uses_strict_two_step_repair(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1396,6 +2222,7 @@ class PipelinePlanTests(unittest.TestCase):
             'attachments': {'ready': True, 'downloaded': [], 'parsed': [], 'skipped': [], 'errors': []},
             'wiki': {'ready': True, 'modules_matched': ['药房药库'],
                      'findings': [], 'note': '命中药房药库模块'},
+            'tfs_requirements': self.requirements_evidence(),
         }
         with mock.patch.object(tfs, 'load_config', return_value={'collection': 'DefaultCollection'}), \
              mock.patch.object(tfs, 'precheck', return_value={'ok': True}), \
@@ -1408,10 +2235,67 @@ class PipelinePlanTests(unittest.TestCase):
         self.assertEqual(record.call_args.args[7]['attachments'], plan['attachments'])
         # wiki 审计字段透传到 record 的 extra 字典
         self.assertEqual(record.call_args.args[7]['wiki'], plan['wiki'])
+        self.assertEqual(record.call_args.args[7]['tfs_requirements'], plan['tfs_requirements'])
         # redis 结果降级不阻断，并入审计 extra 与返回
         self.assertEqual(record.call_args.args[7]['redis']['key'], 'auto-req:qc:plan:DefaultCollection:1')
         self.assertEqual(result['redis']['key'], 'auto-req:qc:plan:DefaultCollection:1')
-        publish.assert_called_once_with(plan, 'dry-run', 'DefaultCollection', 'config.json')
+        publish.assert_called_once_with(plan, 'dry-run', 'DefaultCollection', 'config.json',
+                                        analysis_description_html='', work_item='')
+
+    def test_pipeline_validates_enriched_attachment_runtime_audit(self):
+        plan = {
+            'version': 1, 'run_id': 'run_12345678', 'skill': 'auto-req-qc', 'work_item_id': 1,
+            'expected_rev': 5, 'expected_state': '活动', 'verdict': 'PASS',
+            'tags': [], 'state_to': None, 'rules_source': 'pre-qc-v1', 'artifacts': [],
+            'attachments': {
+                'ready': True,
+                'downloaded': [{'name': '规范.pdf'}],
+                'parsed': [{
+                    'name': '规范.pdf', 'status': 'parsed', 'output': '附件解析/规范.pdf.md',
+                    'converter': 'builtin-fallback', 'converter_chain': 'builtin-fallback',
+                    'runtime_mode': 'managed-host', 'tool_versions': {'pymupdf': '1.27.2.3'},
+                }],
+                'skipped': [], 'errors': [],
+                'preflight': {
+                    'requested_formats': ['.pdf'],
+                    'capabilities': {'.pdf': {'ready': True, 'chains': ['pymupdf']}},
+                    'install_required': ['python-markitdown'],
+                    'installations': [{
+                        'group': 'python-markitdown', 'manager': 'pip',
+                        'packages': ['markitdown[xls,xlsx,pdf,docx,pptx]==0.1.7'],
+                        'started_at': '2026-08-03T00:00:00Z',
+                        'finished_at': '2026-08-03T00:00:01Z',
+                        'status': 'installed', 'exit_code': 0, 'error': '',
+                    }],
+                    'runtime_dir': '过程文件/.runtime/attachments/cache',
+                    'runtime_cache_key': 'cache', 'runtime_mode': 'managed-host',
+                    'blocked_formats': [], 'warnings': [],
+                },
+            },
+        }
+        result = pipeline.validate_plan(plan, os.path.join(tempfile.gettempdir(), 'plan.json'), False)
+        self.assertTrue(result['ok'], result['errors'])
+
+        plan['attachments']['parsed'][0]['converter_chain'] = 'shell-command'
+        invalid = pipeline.validate_plan(plan, os.path.join(tempfile.gettempdir(), 'plan.json'), False)
+        self.assertFalse(invalid['ok'])
+        self.assertTrue(any('转换链' in error or 'converter_chain' in error
+                            for error in invalid['errors']))
+
+    def test_pipeline_rejects_attachment_with_multiple_terminal_outcomes(self):
+        plan = {
+            'version': 1, 'run_id': 'run_12345678', 'skill': 'auto-req-qc', 'work_item_id': 1,
+            'expected_rev': 5, 'expected_state': '活动', 'verdict': 'PASS',
+            'tags': [], 'state_to': None, 'rules_source': 'pre-qc-v1', 'artifacts': [],
+            'attachments': {
+                'ready': False, 'downloaded': [{'name': 'a.pdf'}],
+                'parsed': [{'name': 'a.pdf', 'status': 'parsed', 'converter': 'builtin-fallback'}],
+                'skipped': [{'name': 'a.pdf', 'reason': 'duplicate'}], 'errors': [],
+            },
+        }
+        result = pipeline.validate_plan(plan, os.path.join(tempfile.gettempdir(), 'plan.json'), False)
+        self.assertFalse(result['ok'])
+        self.assertTrue(any('一个终态' in error for error in result['errors']))
 
     def test_apply_plan_threads_collection_override_to_load_config(self):
         plan = {
@@ -1426,9 +2310,9 @@ class PipelinePlanTests(unittest.TestCase):
                 mock.patch.object(redis_client, 'publish_plan', return_value={'ok': True}), \
                 mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}):
             pipeline.apply_plan(plan, os.path.join(tempfile.gettempdir(), 'plan.json'), False,
-                                'config.json', 'pat-x', 'CollX')
-        # collection_override 作为第三位置参数透传给 load_config
-        self.assertEqual(load_config.call_args.args, ('config.json', 'pat-x', 'CollX'))
+                                'config.json', 'pat-x', 'CollX', 'ProjX')
+        # pat/collection/project override 透传给 load_config
+        self.assertEqual(load_config.call_args.args, ('config.json', 'pat-x', 'CollX', 'ProjX'))
 
     # -------- 字段流转：resolve_assignee_to_winning --------
 
@@ -1457,8 +2341,10 @@ class PipelinePlanTests(unittest.TestCase):
             'Demand.Expected.date': '2026-09-06T16:00:00Z',
             'Winning.Dev.Leader': 'zhang_dong(张栋) <WINNING\\zhang_dong>'}}
         iter_resp = {'ok': True, 'earliest': {'path': 'NETHIS5.5\\2026\\V6.0.2608.28', 'finish': '2026-08-28T00:00:00Z'}}
+        local_date = lambda value=None: datetime.date(2026, 8, 28) if value else datetime.date(2026, 8, 1)
         with mock.patch.object(tfs, 'fetch_raw', return_value=raw), \
                 mock.patch.object(tfs, 'list_iterations', return_value=iter_resp), \
+                mock.patch.object(tfs, 'beijing_date', side_effect=local_date), \
                 mock.patch.object(tfs, 'write_field', return_value={'ok': True}) as write_field, \
                 mock.patch.object(tfs, 'set_state', return_value={'ok': True}) as set_state, \
                 mock.patch.object(tfs, 'set_assignee', return_value={'ok': True}) as set_assignee:
@@ -1469,6 +2355,8 @@ class PipelinePlanTests(unittest.TestCase):
         set_state.assert_any_call(mock.ANY, 1, '活动', True)
         set_state.assert_any_call(mock.ANY, 1, '已分析', True)
         set_assignee.assert_called_once_with(mock.ANY, 1, 'WINNING\\zhang_dong', True)
+        start_call = next(c for c in write_field.call_args_list if c.args[2] == tfs.F_START_DATE)
+        self.assertEqual(start_call.args[3], '2026-08-01')
         for c in write_field.call_args_list:  # dry_run=True 透传给每个 write_field
             self.assertTrue(c.args[-1])
 
@@ -1596,6 +2484,7 @@ class PipelinePlanTests(unittest.TestCase):
                 mock.patch.object(tfs, 'write_field', return_value={'ok': True}), \
                 mock.patch.object(tfs, 'set_state', return_value={'ok': True}), \
                 mock.patch.object(tfs, 'set_assignee', return_value={'ok': True}), \
+                mock.patch.object(tfs, 'beijing_timestamp', return_value='20260801000506'), \
                 mock.patch.object(tfs, 'record', return_value={'audit': 'flow-audit.json'}) as record:
             response = pipeline.flow_item(2, False, 'config.json')
         self.assertTrue(response['ok'])
@@ -1604,6 +2493,7 @@ class PipelinePlanTests(unittest.TestCase):
         self.assertEqual(record.call_args.args[2], 'FIELD-FLOW')   # verdict
         self.assertEqual(record.call_args.args[4], '已建议')         # state_from
         self.assertEqual(record.call_args.args[5], '已分析')         # state_to
+        self.assertTrue(record.call_args.args[8].startswith('flow_20260801000506_'))
 
     def test_flow_item_expected_rev_gate_blocks_before_flow(self):
         raw = {'id': 2, 'rev': 9, 'fields': {
@@ -1677,13 +2567,128 @@ class RedisClientTests(unittest.TestCase):
         self.assertNotIn('plan_json', fields)
         self.assertNotIn('plan_path', fields)
         self.assertIn(('SADD', 'auto-req:qc:ids:CollectionA', '1'), commands)
-        # 分析终局清掉遗留的 checklist/work_item/next
-        for stale in ('checklist', 'work_item', 'next', 'skip_reason'):
+        # 分析终局清掉遗留的 checklist/work_item/next/analysis_description/knowledge
+        for stale in ('checklist', 'work_item', 'next', 'skip_reason',
+                      'analysis_description', 'knowledge'):
             self.assertIn(('HDEL', 'auto-req:qc:plan:CollectionA:1', stale), commands)
         analysis_hset = [command for command in commands if command[0] == 'HSET'][1]
         analysis_fields = dict(zip(analysis_hset[2::2], analysis_hset[3::2]))
-        for stale in ('checklist', 'work_item', 'next', 'skip_reason'):
+        for stale in ('checklist', 'work_item', 'next', 'skip_reason',
+                      'analysis_description', 'knowledge'):
             self.assertNotIn(stale, analysis_fields)
+        # 该分析 plan 无 kb/description：仅 6 基础字段
+        self.assertEqual(set(analysis_fields),
+                         {'run_id', 'verdict', 'tags', 'state_to', 'generated_at_utc', 'run_mode'})
+
+    def test_publish_plan_writes_analysis_description_and_knowledge_summary(self):
+        commands = []
+
+        class Connection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return None
+
+            def execute(self, *args):
+                commands.append(args)
+                return 1
+
+        plan = {
+            'work_item_id': 1, 'run_id': 'run_auto_1234', 'verdict': 'AUTO-ANA',
+            'tags': ['PM-AI-AUTO-ANA'], 'state_to': '已分析',
+            'generated_at_utc': '2026-08-04T00:00:00Z',
+            'kb': {'ready': True, 'tools_used': ['query', 'context'], 'dedup_ran': True,
+                   'findings': [{'entity': '初核=医嘱校对 adviceProofread', 'state': '已证实',
+                                 'source_tool': 'query+context', 'note': '冗长备注应丢弃'}],
+                   'note': '代码图谱就绪'},
+            'wiki': {'ready': True, 'modules_matched': ['住院护士站'],
+                     'findings': [{'entity': '初核业务规则', 'state': 'wiki-确认',
+                                   'source': 'wiki/topics/住院.md'}]},
+            'tfs_requirements': {'ready': True, 'coverage': {'collection': 'x'},
+                                 'findings': [{'work_item_id': 260001, 'fact': '既有出院带药提示',
+                                               'state': '已证实', 'maturity': '已落地',
+                                               'source_tool': 'get_work_item'}]},
+        }
+        html = '<div><br></div><div>核心改造点：xxx</div><div><br></div>'
+        with mock.patch.object(redis_client, '_Connection', return_value=Connection()), \
+                mock.patch.object(redis_client, 'load_redis_config', return_value={'ttl_seconds': 0}):
+            response = redis_client.publish_plan(plan, 'execute', 'CollectionA', 'config.json',
+                                                 analysis_description_html=html,
+                                                 work_item='1 医嘱校对-出院带药强提示')
+        self.assertTrue(response['ok'])
+        fields = dict(zip(commands[0][2::2], commands[0][3::2]))
+        # work_item：所有终局统一写入（apply_plan 传 live <id> <标题>）
+        self.assertEqual(fields['work_item'], '1 医嘱校对-出院带药强提示')
+        # 分析者描述：与写入 TFS 的 HTML 同源同值
+        self.assertEqual(fields['analysis_description'], html)
+        # knowledge：三类来源精简投影，仅留定位 + 作用字段
+        knowledge = json.loads(fields['knowledge'])
+        self.assertEqual(set(knowledge), {'code_graph', 'wiki', 'history'})
+        self.assertEqual(knowledge['code_graph']['tools'], ['query', 'context'])
+        self.assertEqual(knowledge['code_graph']['findings'], [
+            {'entity': '初核=医嘱校对 adviceProofread', 'state': '已证实',
+             'source_tool': 'query+context'}])
+        self.assertNotIn('note', knowledge['code_graph'])
+        self.assertNotIn('dedup_ran', knowledge['code_graph'])
+        self.assertEqual(knowledge['wiki']['modules'], ['住院护士站'])
+        self.assertEqual(knowledge['wiki']['findings'], [
+            {'entity': '初核业务规则', 'state': 'wiki-确认', 'source': 'wiki/topics/住院.md'}])
+        self.assertEqual(knowledge['history']['findings'], [
+            {'work_item_id': 260001, 'fact': '既有出院带药提示',
+             'state': '已证实', 'maturity': '已落地'}])
+        self.assertNotIn('coverage', knowledge['history'])
+        # 原计划对象未被原地修改
+        self.assertIn('note', plan['kb'])
+
+        # 切到 NEED-REVIEW（带 kb、不传描述）：analysis_description 应被 HDEL，knowledge 仍在
+        commands.clear()
+        qc_plan = {'work_item_id': 1, 'run_id': 'run_qc_1234', 'verdict': 'NEED-REVIEW',
+                   'tags': ['PM-AI-QC-NEED-REVIEW'], 'state_to': None,
+                   'kb': {'ready': True, 'findings': [{'entity': 'e', 'state': '候选',
+                            'source_tool': 'search_knowledge'}]}}
+        with mock.patch.object(redis_client, '_Connection', return_value=Connection()), \
+                mock.patch.object(redis_client, 'load_redis_config', return_value={'ttl_seconds': 0}):
+            redis_client.publish_plan(qc_plan, 'dry-run', 'CollectionA', 'config.json')
+        hdel_fields = {cmd[2] for cmd in commands
+                       if cmd[:2] == ('HDEL', 'auto-req:qc:plan:CollectionA:1')}
+        self.assertIn('analysis_description', hdel_fields)
+        self.assertNotIn('knowledge', hdel_fields)  # kb 在 → knowledge 保留，不清理
+        qc_fields = dict(zip(commands[0][2::2], commands[0][3::2]))
+        self.assertIn('knowledge', qc_fields)
+        self.assertNotIn('analysis_description', qc_fields)
+
+    def test_knowledge_summary_helper(self):
+        # 三类来源缺失或为空 dict → {}
+        self.assertEqual(redis_client._knowledge_summary({}), {})
+        self.assertEqual(redis_client._knowledge_summary({'kb': {}, 'wiki': {}, 'tfs_requirements': {}}), {})
+        plan = {
+            'kb': {'ready': True, 'tools_used': ['query'], 'dedup_ran': True,
+                   'findings': [{'entity': 'e1', 'state': '已证实', 'source_tool': 'query',
+                                 'note': 'drop'}], 'note': 'drop'},
+            'wiki': {'ready': False, 'modules_matched': ['m1'],
+                     'findings': [{'entity': 'e2', 'state': 'wiki-冲突', 'source': 'p.md'}]},
+            'tfs_requirements': {'ready': True, 'coverage': {'collection': 'x'},
+                                 'findings': [{'work_item_id': 9, 'fact': 'f', 'state': '候选',
+                                               'maturity': '', 'source_tool': 'search_requirements'}]},
+        }
+        summary = redis_client._knowledge_summary(plan)
+        self.assertEqual(set(summary), {'code_graph', 'wiki', 'history'})
+        self.assertEqual(summary['code_graph']['tools'], ['query'])
+        self.assertEqual(summary['code_graph']['findings'], [
+            {'entity': 'e1', 'state': '已证实', 'source_tool': 'query'}])
+        self.assertNotIn('dedup_ran', summary['code_graph'])
+        self.assertNotIn('note', summary['code_graph'])
+        self.assertEqual(summary['wiki']['modules'], ['m1'])
+        self.assertEqual(summary['wiki']['findings'], [
+            {'entity': 'e2', 'state': 'wiki-冲突', 'source': 'p.md'}])
+        self.assertNotIn('coverage', summary['history'])
+        self.assertEqual(summary['history']['findings'], [
+            {'work_item_id': 9, 'fact': 'f', 'state': '候选', 'maturity': ''}])
+        # 存在但 findings 为空：仍报来源键（ready/tools 有用），findings=[]
+        self.assertEqual(
+            redis_client._knowledge_summary({'kb': {'ready': False, 'tools_used': [], 'findings': []}}),
+            {'code_graph': {'ready': False, 'tools': [], 'findings': []}})
 
     def test_publish_skip_analysis_exposes_reason_and_removes_question_fields(self):
         commands = []
@@ -1802,6 +2807,57 @@ class RedisClientTests(unittest.TestCase):
             self.assertEqual(json.loads(data['checklist']),
                              {'responsible': '产品', 'items': plan['checklist']['items']})
             self.assertNotIn('plan_json', data)
+        finally:
+            try:
+                with redis_client._Connection(redis_client.load_redis_config(config)) as c:
+                    c.execute('DEL', f'auto-req:qc:plan:{collection}:{wid}')
+                    c.execute('SREM', f'auto-req:qc:ids:{collection}', wid)
+            except Exception:
+                pass
+
+    def test_publish_plan_roundtrip_analysis_and_knowledge_if_redis_up(self):
+        config = os.path.join(os.path.dirname(__file__), 'tfs-config.json')
+        if not redis_client.ping(config):
+            self.skipTest('本机 Redis 未启动，跳过 round-trip')
+        wid = 999000998  # 测试专用 id，避免污染真实工作项
+        plan = {'version': 2, 'run_id': 'run_auto_demo', 'skill': 'auto-req-analysis',
+                'work_item_id': wid, 'expected_rev': 1, 'expected_state': '已分析',
+                'verdict': 'AUTO-ANA', 'tags': ['PM-AI-AUTO-ANA'], 'state_to': '已分析',
+                'rules_source': {'qc': 'pre-qc-v1', 'analysis': 'evidence-loop-v1'},
+                'generated_at_utc': '2026-08-04', 'artifacts': [],
+                'analysis_description': {'categories': ['existing-ui-simple']},
+                'kb': {'ready': True, 'dedup_ran': True, 'tools_used': ['query', 'context'],
+                       'findings': [{'entity': '初核=医嘱校对 adviceProofread', 'state': '已证实',
+                                     'source_tool': 'query+context'}], 'note': '代码图谱就绪'},
+                'wiki': {'ready': True, 'modules_matched': ['住院护士站'],
+                         'findings': [{'entity': '初核业务规则', 'state': 'wiki-确认',
+                                       'source': 'wiki/topics/住院.md'}]},
+                'tfs_requirements': {'ready': True,
+                                     'findings': [{'work_item_id': 260001, 'fact': '既有出院带药提示',
+                                                   'state': '已证实', 'maturity': '已落地',
+                                                   'source_tool': 'get_work_item'}]}}
+        html = '<div><br></div><div>核心改造点：在医嘱校对界面增加出院带药强提示</div><div><br></div>'
+        collection = 'auto_req_test'
+        try:
+            r = redis_client.publish_plan(plan, 'execute', collection, config,
+                                          analysis_description_html=html,
+                                          work_item=f'{wid} 医嘱校对-出院带药强提示（测试）')
+            self.assertTrue(r['ok'])
+            data = redis_client.hgetall(f'auto-req:qc:plan:{collection}:{wid}', config)
+            self.assertEqual(data['verdict'], 'AUTO-ANA')
+            self.assertEqual(data['run_mode'], 'execute')
+            self.assertIn('PM-AI-AUTO-ANA', data['tags'])
+            self.assertEqual(data['work_item'], f'{wid} 医嘱校对-出院带药强提示（测试）')
+            self.assertEqual(data['analysis_description'], html)
+            # 新字段：knowledge 三类来源「定位 + 作用」精简投影
+            knowledge = json.loads(data['knowledge'])
+            self.assertEqual(set(knowledge), {'code_graph', 'wiki', 'history'})
+            self.assertEqual(knowledge['code_graph']['tools'], ['query', 'context'])
+            self.assertEqual(knowledge['wiki']['modules'], ['住院护士站'])
+            self.assertEqual(knowledge['history']['findings'][0]['work_item_id'], 260001)
+            self.assertNotIn('plan_json', data)
+            print('\n=== Redis HGETALL auto-req:qc:plan:%s:%s ===' % (collection, wid))
+            print(json.dumps(data, ensure_ascii=False, indent=2))
         finally:
             try:
                 with redis_client._Connection(redis_client.load_redis_config(config)) as c:

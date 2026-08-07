@@ -5,6 +5,8 @@ description: >-
   PPTX、PPT 专用 RAGFlow 数据集“区卫平台6.0标准方案”
   (2fc6554e857011f18194cb9696436b2e)。只允许调用 regional_platform_general_search；
   禁止通用 ragflow_search、ragflow_list_datasets、Web、Wiki 文件工具和其他数据集。
+allowed-tools:
+  - regional_platform_general_search
 ---
 
 # 区域平台通用文档 RAG 问答
