@@ -8,7 +8,7 @@ import { I18nProvider } from "@/core/i18n/context";
 import { detectLocaleServer } from "@/core/i18n/server";
 
 export const metadata: Metadata = {
-  title: "DeerFlow",
+  title: "WiNEX Region智能体平台",
   description: "A LangChain-based framework for building super agents.",
 };
 

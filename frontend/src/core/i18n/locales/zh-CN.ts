@@ -3,7 +3,6 @@ import {
   GraduationCapIcon,
   ImageIcon,
   MicroscopeIcon,
-  PenLineIcon,
   ShapesIcon,
   SparklesIcon,
   VideoIcon,
@@ -64,12 +63,11 @@ export const zhCN: Translations = {
   // Welcome
   welcome: {
     greeting: "你好，欢迎回来！",
-    description:
-      "欢迎使用 🦌 DeerFlow，一个完全开源的超级智能体。通过内置和自定义的 Skills，\nDeerFlow 可以帮你搜索网络、分析数据，还能为你生成幻灯片、\n图片、视频、播客及网页等，几乎可以做任何事情。",
+    description: "WiNEX Region 智能体平台——一站式完成方案检索、文档输出与需求分析。",
 
     createYourOwnSkill: "创建你自己的 Agent SKill",
     createYourOwnSkillDescription:
-      "创建你的 Agent Skill 来释放 DeerFlow 的潜力。通过自定义技能，DeerFlow\n可以帮你搜索网络、分析数据，还能为你生成幻灯片、\n网页等作品，几乎可以做任何事情。",
+      "创建你的 Agent Skill 来释放 WiNEX Region智能体平台的潜力。通过自定义技能，可以帮你检索解决方案、输出产品文档、分析需求。",
   },
 
   // Clipboard
@@ -179,11 +177,6 @@ export const zhCN: Translations = {
     compactSkipped: "当前上下文还不需要压缩。",
     compactFailed: "上下文压缩失败。",
     suggestions: [
-      {
-        suggestion: "写作",
-        prompt: "撰写一篇关于[主题]的博客文章",
-        icon: PenLineIcon,
-      },
       {
         suggestion: "研究",
         prompt: "深入浅出的研究一下[主题]，并总结发现。",

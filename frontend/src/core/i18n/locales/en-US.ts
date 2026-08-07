@@ -3,7 +3,6 @@ import {
   GraduationCapIcon,
   ImageIcon,
   MicroscopeIcon,
-  PenLineIcon,
   ShapesIcon,
   SparklesIcon,
   VideoIcon,
@@ -65,11 +64,11 @@ export const enUS: Translations = {
   welcome: {
     greeting: "Hello, again!",
     description:
-      "Welcome to 🦌 DeerFlow, an open source super agent. With built-in and custom skills, DeerFlow helps you search on the web, analyze data, and generate artifacts like slides, web pages and do almost anything.",
+      "WiNEX Region Agent Platform — an all-in-one solution for solution search, documentation output, and requirement analysis.",
 
     createYourOwnSkill: "Create Your Own Skill",
     createYourOwnSkillDescription:
-      "Create your own skill to release the power of DeerFlow. With customized skills,\nDeerFlow can help you search on the web, analyze data, and generate\n artifacts like slides, web pages and do almost anything.",
+      "Create your own Agent Skill to unlock the potential of WiNEX Region Agent Platform. With custom skills, you can search for solutions, produce product documentation, and analyze requirements.",
   },
 
   // Clipboard
@@ -191,11 +190,6 @@ export const enUS: Translations = {
     compactSkipped: "The current context does not need compaction yet.",
     compactFailed: "Context compaction failed.",
     suggestions: [
-      {
-        suggestion: "Write",
-        prompt: "Write a blog post about the latest trends on [topic]",
-        icon: PenLineIcon,
-      },
       {
         suggestion: "Research",
         prompt:
