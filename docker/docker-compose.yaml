@@ -104,9 +104,6 @@ services:
       - ${DEER_FLOW_EXTENSIONS_CONFIG_PATH}:/app/backend/extensions_config.json:ro
       # Custom tools for auto-req-analysis (replaces bash)
       - /opt/deer-flow/backend/tools_auto_req.py:/app/backend/tools_auto_req.py:ro
-      # Regional-platform RAG scoped tools (regional_platform_scoped_tools + its ragflow_tools dependency)
-      - /opt/deer-flow/backend/ragflow_tools.py:/app/backend/ragflow_tools.py:ro
-      - /opt/deer-flow/backend/regional_platform_scoped_tools.py:/app/backend/regional_platform_scoped_tools.py:ro
       - /opt/deer-flow/skills:/app/skills:ro
       - /opt/deer-flow/skills:/mnt/skills:ro
       - ${DEER_FLOW_HOME}:/app/backend/.deer-flow

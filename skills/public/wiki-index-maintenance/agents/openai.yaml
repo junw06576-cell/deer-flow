@@ -1,0 +1,4 @@
+interface:
+  display_name: "Wiki 索引维护"
+  short_description: "为产品 Wiki 受控生成并校验检索别名 JSON 数据"
+  default_prompt: "Use $wiki-index-maintenance to maintain retrieval aliases for the current Wiki base index."

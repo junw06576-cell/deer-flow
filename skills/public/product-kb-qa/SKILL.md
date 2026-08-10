@@ -4,7 +4,7 @@ description: >-
   基于 /mnt/knowledge 下的 WiNEX Region 产品 Wiki 回答产品、方案、功能、
   技术参数、合规、市场销售和通用素材问题。适用于挂载了
   winex-region-playbook 稀疏工作区（仅 00-工作台 至 04-通用素材）的
-  wiki-kb Agent。必须先读取 wiki_index.md，再使用 read_file、grep、glob
+  reg-wiki-kb Agent。必须先读取 wiki_index.md，再使用 read_file、grep、glob
   定位原文；禁止使用 Web、RAGFlow 或通用知识补写产品事实。
 allowed-tools:
   - read_file

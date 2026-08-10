@@ -1,0 +1,7 @@
+name: auto-analysis-agent
+description: Requirement evaluation and requirement document generation with TFS write-back.
+skills:
+  - reg-auto-req-analysis
+tool_groups:
+  - bash
+recursion_limit: 500

@@ -1,0 +1,114 @@
+{
+  "mcpInterceptors": [
+    "my_package.mcp.auth:build_auth_interceptor"
+  ],
+  "mcpServers": {
+    "github": {
+      "enabled": false,
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-github"
+      ],
+      "env": {
+        "GITHUB_TOKEN": "$GITHUB_TOKEN"
+      },
+      "tool_call_timeout": 60,
+      "description": "GitHub MCP server for repository operations"
+    },
+    "postgres": {
+      "enabled": false,
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-postgres",
+        "postgresql://localhost/mydb"
+      ],
+      "env": {},
+      "description": "PostgreSQL database access",
+      "routing": {
+        "mode": "prefer",
+        "priority": 50,
+        "keywords": [
+          "database",
+          "SQL",
+          "table",
+          "订单",
+          "用户"
+        ]
+      },
+      "tools": {
+        "query": {
+          "routing": {
+            "mode": "prefer",
+            "priority": 100,
+            "keywords": [
+              "查库",
+              "订单表",
+              "指标"
+            ]
+          }
+        }
+      }
+    },
+    "tfs-requirements": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.192:4751/mcp",
+      "headers": {},
+      "description": "TFS需求历史 — 历史业务背景、工作项关系、验收条件、附件清单与变更原因",
+      "routing": {
+        "mode": "prefer",
+        "priority": 80,
+        "keywords": [
+          "需求历史",
+          "历史需求",
+          "验收条件",
+          "工作项关系",
+          "变更原因"
+        ]
+      }
+    },
+    "gitnexus-team": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.192:4747/api/mcp",
+      "headers": {},
+      "description": "代码图谱 — 路由、调用链、影响分析、跨项目代码、模块/类/方法定位",
+      "routing": {
+        "mode": "prefer",
+        "priority": 70,
+        "keywords": [
+          "代码",
+          "路由",
+          "调用链",
+          "模块",
+          "接口",
+          "类",
+          "方法"
+        ]
+      }
+    },
+    "db-knowledge": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.192:4748/mcp",
+      "headers": {},
+      "description": "数据库图谱 — 表、字段、读写关系、文档说明",
+      "routing": {
+        "mode": "prefer",
+        "priority": 60,
+        "keywords": [
+          "数据库",
+          "表",
+          "字段",
+          "表结构",
+          "数据模型"
+        ]
+      }
+    }
+  },
+  "skills": {}
+}
