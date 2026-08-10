@@ -71,3 +71,5 @@ config.yaml.bak
 .monocle/
 
 .workbuddy/
+
+*.zip
