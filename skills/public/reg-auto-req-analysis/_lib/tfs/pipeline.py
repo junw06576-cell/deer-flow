@@ -87,6 +87,7 @@ ANALYSIS_DECISION_SUMMARY_REQUIREMENTS = (
     '决策结论', '生效路径与条件', '决策边界', '验收要点',
 )
 ANALYSIS_EMPHASIS_LABELS = {
+    '菜单路径',
     '核心改造点', '修改方案', '改造内容', '功能方案', '修复方案', '优化方案',
     '修改内容', '现有接口变更', '操作规则', '协作事项',
     '报表分析', '联调说明', '接口调整方案', '业务节点与触发时机',
@@ -120,6 +121,8 @@ EVIDENCE_GAP_TYPES = {
     'WIKI_TOPIC_MISSING', 'WIKI_BROKEN_LINK', 'TFS_SNAPSHOT_LAG', 'TFS_SEARCH_TRUNCATED',
     'GITNEXUS_REPO_MISSING', 'GITNEXUS_EMBEDDINGS_DISABLED', 'DB_SCHEMA_PARTIAL',
     'DB_RELATION_PARTIAL', 'EXISTING_IMPL_LOCATION', 'SIMILAR_IMPL_DEDUP',
+    'PRODUCT_ROUTE_UNRESOLVED', 'SOURCE_MCP_UNAVAILABLE', 'SOURCE_SCOPE_PARTIAL',
+    'SOURCE_VERIFICATION_INCOMPLETE',
 }
 QC_EVIDENCE_RESOLUTION_FIELDS = ('id', 'initial_gap', 'resolution', 'evidence_refs')
 TFS_REQUIREMENTS_FINDING_FIELDS = ('work_item_id', 'fact', 'state', 'source_tool')
@@ -129,6 +132,7 @@ TFS_REQUIREMENTS_TOOLS = {
 }
 TFS_REQUIREMENTS_CONFIRMED_TOOLS = {'get_related_work_items', 'get_work_item'}
 TFS_MATURITY_STATES = {'设想', '分析确认', '已落地'}
+HUMAN_EVIDENCE_FIELDS = ('conclusion', 'evidence', 'boundary')
 # evidence-loop-v2 采集状态契约（四源同构）：区分「已命中 / 完整查询后无命中 / 覆盖不完整 / 来源不可用」。
 # 只有 coverage_status=COMPLETE ∧ stop_reason=exhausted ∧ 未截断 的 NO_HIT 才能支撑「无相似/无现有实现」负面结论。
 EVIDENCE_ACQUISITION_SOURCES = ('tfs_requirements', 'wiki', 'gitnexus', 'db_knowledge')
@@ -142,7 +146,20 @@ ATTACHMENT_CONVERTERS = {
 }
 ATTACHMENT_RUNTIME_MODES = {'fixed-image', 'managed-host', 'builtin-only'}
 CHECKLIST_ITEM_FIELDS = ('id', 'question', 'options', 'allow_other')
-MAX_QC_ITEMS = 3
+MAX_QC_ITEMS = 5
+SINGLE_CONFIRMATION_POLICY = 'qc-single-batch-v1'
+KNOWLEDGE_ROUTE_STATUSES = {
+    'RESOLVED', 'AREA_UNMAPPED', 'AREA_AMBIGUOUS', 'PROFILE_MISSING', 'PROFILE_INVALID',
+}
+KNOWLEDGE_ROUTE_ROLES = ('requirements_history', 'code_graph', 'source_code', 'database')
+SOURCE_CODE_TOOLS = {'search_source', 'search_symbol'}
+UI_BASELINE_SOURCE_FAMILIES = {
+    'wiki': 'product-knowledge',
+    'runtime-observation': 'runtime',
+    'attachment': 'runtime',
+    'code-graph': 'implementation',
+    'source-code': 'implementation',
+}
 
 # 字段流转：指派人账号解析（身份字段必须 WINNING\account 格式；bare display name TFS 报「未知标识」HTTP400）
 ASSIGNEE_FULL_RE = re.compile(r'<([^>]+)>')                      # Dev.Leader 全格式里的 <WINNING\account>
@@ -342,6 +359,10 @@ def validate_checklist(plan, errors):
         item_id = item['id']
         if not isinstance(item_id, str) or not ANALYSIS_GAP_ID_RE.fullmatch(item_id):
             errors.append(f'checklist.items[{index}].id 必须为稳定的字母开头标识')
+        elif single_confirmation_enabled(plan) and re.fullmatch(r'q[0-9]+', item_id):
+            errors.append(
+                f'checklist.items[{index}].id 在单次集中确认策略下必须使用语义稳定 ID；'
+                '不得按本轮顺序使用 q1/q2（示例：q-scope、q-value-rule、q-acceptance）')
         elif item_id in ids:
             errors.append(f'checklist.items.id 不可重复：{item_id}')
         else:
@@ -353,6 +374,217 @@ def validate_checklist(plan, errors):
             errors.append(f'checklist.items[{index}].options 必须为非空字符串数组')
         if not isinstance(item['allow_other'], bool):
             errors.append(f'checklist.items[{index}].allow_other 必须为布尔值')
+
+
+def single_confirmation_enabled(plan):
+    return plan.get('confirmation_policy') == SINGLE_CONFIRMATION_POLICY
+
+
+def validate_confirmation_policy(plan, errors):
+    """新计划把全部 PM 业务确认前置到 QC；字段缺失时按历史契约回放。"""
+    policy = plan.get('confirmation_policy')
+    if policy is None:
+        return
+    if policy != SINGLE_CONFIRMATION_POLICY:
+        errors.append(f'confirmation_policy 仅允许 {SINGLE_CONFIRMATION_POLICY!r}')
+        return
+    if plan['verdict'] in ROUTING_VERDICTS or plan['verdict'] == 'PASS':
+        errors.append('confirmation_policy 仅用于 QC NEED-* 或分析终局计划')
+    if plan['verdict'] in ANALYSIS_VERDICTS and plan.get('analysis_gaps'):
+        errors.append(
+            '单次集中确认策略要求分析计划 analysis_gaps=[]；'
+            'PM 可回答的业务缺口必须回退 QC NEED-REVIEW 并合并进 checklist')
+    kb = plan.get('kb')
+    if not isinstance(kb, dict):
+        errors.append('新策略的非 SKIP 计划必须含 kb 对象')
+        return
+    if not kb:
+        errors.append('新策略的非 SKIP 计划 kb 对象不得为空')
+        return
+    if kb:
+        if not isinstance(kb.get('ready'), bool):
+            errors.append('新策略的 kb.ready 必须明确代码图谱是否就绪')
+        if not isinstance(kb.get('source_ready'), bool):
+            errors.append('新策略的 kb.source_ready 必须明确源码 MCP 是否就绪')
+        if not isinstance(kb.get('source_required'), bool):
+            errors.append('新策略的 kb.source_required 必须明确本轮是否需要源码核验')
+        if not isinstance(kb.get('database_ready'), bool):
+            errors.append('新策略的 kb.database_ready 必须明确数据库图谱是否就绪')
+        for index, finding in enumerate(kb.get('findings') or [], start=1):
+            if (not isinstance(finding, dict)
+                    or finding.get('source_type') not in ('code', 'database')):
+                errors.append(
+                    f'新策略的 kb.findings[{index}].source_type 必须为 code 或 database')
+            if isinstance(finding, dict):
+                for field in HUMAN_EVIDENCE_FIELDS:
+                    if not isinstance(finding.get(field), str) or not finding[field].strip():
+                        errors.append(
+                            f'新策略的 kb.findings[{index}].{field} 必须为非空字符串，'
+                            '供 Redis 佐证清单直接展示')
+                if finding.get('source_tool') in TFS_REQUIREMENTS_TOOLS:
+                    errors.append(
+                        f'新策略的 kb.findings[{index}].source_tool 属于需求历史工具；'
+                        '必须改写到 tfs_requirements.findings，不得混入代码图谱')
+        tools_used = kb.get('tools_used') or []
+        source_tools_used = SOURCE_CODE_TOOLS & set(tools_used) if isinstance(tools_used, list) else set()
+        source_findings = [
+            finding for finding in (kb.get('findings') or [])
+            if isinstance(finding, dict) and finding.get('source_tool') in SOURCE_CODE_TOOLS
+        ]
+        for index, finding in enumerate(kb.get('findings') or [], start=1):
+            if (isinstance(finding, dict) and finding.get('source_tool') in SOURCE_CODE_TOOLS
+                    and finding.get('source_type') != 'code'):
+                errors.append(
+                    f'源码 MCP finding kb.findings[{index}].source_type 必须为 code')
+            if (isinstance(finding, dict) and finding.get('source_tool') in SOURCE_CODE_TOOLS
+                    and finding.get('source_tool') not in source_tools_used):
+                errors.append(
+                    f'源码 MCP finding kb.findings[{index}].source_tool 必须出现在 tools_used')
+        if source_tools_used and kb.get('source_required') is not True:
+            errors.append('调用 search_source/search_symbol 时 kb.source_required 必须为 true')
+        if source_findings and kb.get('source_required') is not True:
+            errors.append('携带源码 MCP finding 时 kb.source_required 必须为 true')
+        if source_findings and kb.get('source_ready') is not True:
+            errors.append('携带源码 MCP finding 时 kb.source_ready 必须为 true')
+        if kb.get('source_required') is True and kb.get('source_ready') is True:
+            if not source_tools_used:
+                errors.append('kb.source_required=true 且源码 MCP 就绪时必须实际调用 '
+                              'search_source 或 search_symbol')
+            if not source_findings:
+                errors.append('kb.source_required=true 且源码 MCP 就绪时必须留下源码 finding')
+
+    for source in ('wiki', 'tfs_requirements'):
+        evidence = plan.get(source)
+        if not isinstance(evidence, dict):
+            continue
+        for index, finding in enumerate(evidence.get('findings') or [], start=1):
+            if not isinstance(finding, dict):
+                continue
+            for field in HUMAN_EVIDENCE_FIELDS:
+                if not isinstance(finding.get(field), str) or not finding[field].strip():
+                    errors.append(
+                        f'新策略的 {source}.findings[{index}].{field} 必须为非空字符串，'
+                        '供 Redis 佐证清单直接展示')
+
+
+def validate_ui_baseline(plan, errors):
+    """界面 AUTO 计划须用至少两类独立证据闭合当前 UI 基线。"""
+    baseline = plan.get('ui_baseline')
+    required = (
+        plan.get('verdict') == 'AUTO-ANA'
+        and 'field-ui-copy' in (plan.get('auto_scopes') or [])
+        and single_confirmation_enabled(plan)
+    )
+    if baseline is None:
+        if required:
+            errors.append(
+                '新策略 AUTO-ANA 的 field-ui-copy 范围必须含 ui_baseline，'
+                '并由产品知识、运行观察、实现证据中至少两类交叉证实')
+        return
+    if not isinstance(baseline, dict):
+        errors.append('ui_baseline 必须为对象')
+        return
+    sources = baseline.get('sources')
+    if not isinstance(sources, list) or not sources:
+        errors.append('ui_baseline.sources 必须为非空数组')
+        return
+
+    families = set()
+    identities = set()
+    kb_findings = (plan.get('kb') or {}).get('findings') or []
+    for index, source in enumerate(sources, start=1):
+        if not isinstance(source, dict):
+            errors.append(f'ui_baseline.sources[{index}] 必须为对象')
+            continue
+        source_type = source.get('type')
+        ref = source.get('ref')
+        if source_type not in UI_BASELINE_SOURCE_FAMILIES:
+            errors.append(
+                f'ui_baseline.sources[{index}].type 必须为 '
+                f'{sorted(UI_BASELINE_SOURCE_FAMILIES)} 之一')
+            continue
+        if not isinstance(ref, str) or not ref.strip():
+            errors.append(f'ui_baseline.sources[{index}].ref 必须为非空字符串')
+            continue
+        identity = (source_type, ref.strip())
+        if identity in identities:
+            errors.append(f'ui_baseline.sources[{index}] 与前项重复')
+            continue
+        identities.add(identity)
+        families.add(UI_BASELINE_SOURCE_FAMILIES[source_type])
+
+        if source_type == 'wiki':
+            if not re.fullmatch(r'wiki:[0-9]+', ref):
+                errors.append(f'ui_baseline.sources[{index}] 的 wiki ref 必须为 wiki:<索引>')
+            elif not is_confirmed_evidence_ref(plan, ref):
+                errors.append(
+                    f'ui_baseline.sources[{index}] 的 {ref} 必须指向 wiki.findings 的已证实项')
+        elif source_type in {'code-graph', 'source-code'}:
+            if not re.fullmatch(r'kb:[0-9]+', ref):
+                errors.append(f'ui_baseline.sources[{index}] 的实现证据 ref 必须为 kb:<索引>')
+                continue
+            if not is_confirmed_evidence_ref(plan, ref):
+                errors.append(
+                    f'ui_baseline.sources[{index}] 的 {ref} 必须指向 kb.findings 的已证实项')
+                continue
+            finding = kb_findings[int(ref[3:])]
+            is_source_code = finding.get('source_tool') in SOURCE_CODE_TOOLS
+            if source_type == 'source-code' and not is_source_code:
+                errors.append(
+                    f'ui_baseline.sources[{index}] 的 source-code ref 必须指向源码 MCP finding')
+            if source_type == 'code-graph' and is_source_code:
+                errors.append(
+                    f'ui_baseline.sources[{index}] 的 code-graph ref 不得指向源码 MCP finding')
+
+    if required and len(families) < 2:
+        errors.append(
+            '新策略 AUTO-ANA 的 field-ui-copy 范围要求 ui_baseline 至少覆盖两类独立证据：'
+            '产品知识、运行观察、实现证据；同一类多条不能互相交叉证实')
+
+
+def validate_knowledge_route(plan, errors):
+    """新非 SKIP 计划必须快照产品路由；历史计划保持兼容。"""
+    route = plan.get('knowledge_route')
+    if plan['verdict'] in ROUTING_VERDICTS:
+        if route not in (None, {}):
+            errors.append('SKIP-ANALYSIS 计划不得声明 knowledge_route')
+        return
+    if not single_confirmation_enabled(plan):
+        return
+    if not isinstance(route, dict):
+        errors.append('新策略的非 SKIP 计划必须含 knowledge_route 对象')
+        return
+    status = route.get('status')
+    if status not in KNOWLEDGE_ROUTE_STATUSES:
+        errors.append(f'knowledge_route.status 必须为 {sorted(KNOWLEDGE_ROUTE_STATUSES)} 之一')
+        return
+    area = route.get('area')
+    if not isinstance(area, str) or not area.strip():
+        errors.append('knowledge_route.area 必须为非空字符串')
+    servers = route.get('servers')
+    if status == 'RESOLVED':
+        for field in ('product_id', 'product_name'):
+            if not isinstance(route.get(field), str) or not route[field].strip():
+                errors.append(f'knowledge_route.{field} 在 RESOLVED 时必须为非空字符串')
+        if not isinstance(route.get('profile_version'), int) or route['profile_version'] < 1:
+            errors.append('knowledge_route.profile_version 在 RESOLVED 时必须为正整数')
+        if not isinstance(servers, dict) or set(servers) != set(KNOWLEDGE_ROUTE_ROLES):
+            errors.append('knowledge_route.servers 在 RESOLVED 时必须精确包含四类 MCP 角色')
+        elif not all(value is None or isinstance(value, str) and value.strip()
+                     for value in servers.values()):
+            errors.append('knowledge_route.servers 的值必须为非空 server name 或 null')
+    else:
+        if servers != {}:
+            errors.append('knowledge_route 未解析时 servers 必须为空对象，禁止默认或跨产品回退')
+        for source in ('kb', 'tfs_requirements', 'wiki'):
+            value = plan.get(source)
+            if not isinstance(value, dict):
+                continue
+            if value.get('ready') is True or value.get('tools_used') or value.get('findings'):
+                errors.append(
+                    f'knowledge_route 未解析时 {source} 不得声明就绪、调用工具或携带 finding')
+        if plan['verdict'] == 'AUTO-ANA':
+            errors.append('AUTO-ANA 要求 knowledge_route.status=RESOLVED，禁止跨产品或默认 MCP')
 
 
 def expected_for(plan):
@@ -372,7 +604,7 @@ def expected_for(plan):
         return (set(), None, set())
     if verdict in ANALYSIS_VERDICTS:
         required_kinds = {'change-plan'}
-        if plan.get('analysis_gaps'):
+        if plan.get('analysis_gaps') and not single_confirmation_enabled(plan):
             required_kinds.add('manual-followup')
         if verdict == 'AUTO-ANA':
             return ({'PM-AI-AUTO-ANA'}, '已分析', required_kinds)
@@ -961,9 +1193,13 @@ def validate_analysis_description(plan, plan_path, check_files, errors):
 
     path_values = re.findall(
         r'^\s*-\s*\*\*路径\*\*：\s*(\S.*?)\s*$', analysis_section, re.MULTILINE)
+    menu_path_values = re.findall(
+        r'^\s*-\s*\*\*菜单路径\*\*：\s*(\S.*?)\s*$', analysis_section, re.MULTILINE)
     if profile == 'concise-v3':
         if path_values:
             errors.append('concise-v3 分析者描述不得包含固定“路径”行')
+        if len(menu_path_values) != 1:
+            errors.append('concise-v3 分析者描述必须且只能包含一个非空“菜单路径”')
     elif len(path_values) != 1:
         errors.append('分析者描述必须且只能包含一个非空“路径”')
     elif not ANALYSIS_PATH_VALUE_RE.fullmatch(path_values[0]):
@@ -975,8 +1211,10 @@ def validate_analysis_description(plan, plan_path, check_files, errors):
     if profile == 'concise-v3':
         first_header = re.search(r'^### [a-z-]+(?:\s|（|$)', analysis_section, re.MULTILINE)
         preamble = analysis_section[:first_header.start()] if first_header else analysis_section
-        if re.search(r'^\s*-\s*\*\*.+?\*\*：', preamble, re.MULTILINE):
-            errors.append('concise-v3 业务维度必须写在对应类别标题下')
+        preamble_labels = re.findall(
+            r'^\s*-\s*\*\*(.+?)\*\*：', preamble, re.MULTILINE)
+        if any(label != '菜单路径' for label in preamble_labels):
+            errors.append('concise-v3 除“菜单路径”外的业务维度必须写在对应类别标题下')
     for index, header in enumerate(headers):
         end = headers[index + 1].start() if index + 1 < len(headers) else len(category_content)
         sections[header.group(1)] = category_content[header.end():end]
@@ -1175,6 +1413,8 @@ def validate_plan(plan, plan_path, check_files=True):
         return result(False, errors=errors)
 
     validate_rules_source(plan, errors)
+    validate_confirmation_policy(plan, errors)
+    validate_knowledge_route(plan, errors)
 
     try:
         expected_tags, expected_state_to, required_kinds = expected_for(plan)
@@ -1203,7 +1443,7 @@ def validate_plan(plan, plan_path, check_files=True):
             errors.append('SKIP-ANALYSIS 计划必须含非空 skip_reason')
         for field in ('checklist', 'analysis_description', 'analysis_profile', 'analysis_gaps',
                       'evidence_refs', 'evidence_gaps', 'auto_scopes', 'assignee_to',
-                      'tfs_requirements', 'existing_feature'):
+                      'tfs_requirements', 'existing_feature', 'ui_baseline'):
             if field in plan and plan[field] not in (None, [], {}):
                 errors.append(f'SKIP-ANALYSIS 计划不得声明 {field}')
 
@@ -1240,6 +1480,18 @@ def validate_plan(plan, plan_path, check_files=True):
                     f'AUTO-ANA 的优化类类别 {sorted(hit)} 须在 kb.findings 含至少一条 '
                     'state=已证实 的现有实现锚点；缺失时改判 MANUAL-REVIEW '
                     '并在 evidence_gaps 记录“现有实现定位”缺口')
+            if kb.get('source_required') is True:
+                source_confirmed = any(
+                    isinstance(finding, dict)
+                    and finding.get('source_tool') in SOURCE_CODE_TOOLS
+                    and finding.get('source_type') == 'code'
+                    and finding.get('state') == '已证实'
+                    for finding in kb.get('findings') or [])
+                if kb.get('source_ready') is not True or not source_confirmed:
+                    errors.append(
+                        'AUTO-ANA 在 kb.source_required=true 时要求 source_ready=true 且至少一条 '
+                        'search_source/search_symbol 的 state=已证实 源码 finding；'
+                        '否则改判 MANUAL-REVIEW 并记录源码核验缺口')
 
     validate_tfs_requirements(plan, errors)
     validate_attachments(plan, errors)
@@ -1251,6 +1503,7 @@ def validate_plan(plan, plan_path, check_files=True):
         analysis_gaps = validate_analysis_gaps(plan, errors)
         validate_evidence_gaps(plan, errors)
         validate_evidence_refs(plan, errors)
+        validate_ui_baseline(plan, errors)
         validate_qc_evidence_resolution(plan, errors)
         validate_evidence_acquisition(plan, errors)
         if check_files:
@@ -1359,8 +1612,10 @@ def record_failure(plan, error, run_mode, state_from='', state_to='', actions=No
         'analysis_gaps': plan.get('analysis_gaps'),
         'evidence_refs': plan.get('evidence_refs'),
         'evidence_gaps': plan.get('evidence_gaps'),
+        'ui_baseline': plan.get('ui_baseline'),
         'qc_evidence_resolution': plan.get('qc_evidence_resolution'),
         'qc_recheck': plan.get('qc_recheck'),
+        'confirmation_policy': plan.get('confirmation_policy'),
         'wiki': plan.get('wiki'),
         'tfs_requirements': plan.get('tfs_requirements'),
     }
@@ -1559,9 +1814,11 @@ def apply_plan(plan, plan_path, execute, config_path, pat_override=None, collect
                         'analysis_gaps': plan.get('analysis_gaps'),
                         'evidence_refs': plan.get('evidence_refs'),
                         'evidence_gaps': plan.get('evidence_gaps'),
+                        'ui_baseline': plan.get('ui_baseline'),
                         'qc_evidence_resolution': plan.get('qc_evidence_resolution'),
                         'assignee_to': plan.get('assignee_to'),
                         'qc_recheck': plan.get('qc_recheck'),
+                        'confirmation_policy': plan.get('confirmation_policy'),
                         'skip_reason': plan.get('skip_reason'),
                         'plan': os.path.abspath(plan_path),
                         'redis': redis_result,

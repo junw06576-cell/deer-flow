@@ -4,18 +4,32 @@
 import argparse
 import json
 import os
+from urllib.parse import urlparse
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SOURCES = os.path.join(SCRIPT_DIR, 'menu-sources.json')
 DEFAULT_OUTPUT = os.path.join(SCRIPT_DIR, 'menu-business-index.json')
+DEFAULT_ROUTES = os.path.normpath(os.path.join(SCRIPT_DIR, '..', 'config',
+                                               'product-mcp-routes.json'))
 REQUIRED_FIELDS = ('mcode', 'pcaption', 'menu_path', 'business_domain', 'match_status')
 OPTIONAL_FIELDS = ('module_url', 'subproject', 'repo')
+MCP_ROLES = ('requirements_history', 'code_graph', 'source_code', 'database')
 
 
-def read_json(path):
+def _reject_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f'JSON 键不可重复: {key}')
+        result[key] = value
+    return result
+
+
+def read_json(path, reject_duplicate_keys=False):
     with open(path, 'r', encoding='utf-8') as f:
-        return json.load(f)
+        return json.load(f, object_pairs_hook=_reject_duplicate_keys
+                         if reject_duplicate_keys else None)
 
 
 def validate_sources(data, manifest_path):
@@ -97,6 +111,96 @@ def products_for_area(index, area):
             if area and area in product.get('tfs_area_values', [])]
 
 
+def validate_mcp_routes(data):
+    """校验产品 MCP profile；返回规范化 profile，不提供任何默认路由。"""
+    if not isinstance(data, dict) or data.get('version') != 1:
+        raise ValueError('product-mcp-routes.json version 必须为 1')
+    profiles = data.get('profiles')
+    if not isinstance(profiles, dict) or not profiles:
+        raise ValueError('product-mcp-routes.json 必须含非空 profiles 对象')
+    seen_servers = set()
+    normalized = {}
+    for product_id, profile in profiles.items():
+        if not isinstance(product_id, str) or not product_id.strip():
+            raise ValueError('MCP profile 的 product_id 必须为非空字符串')
+        if not isinstance(profile, dict):
+            raise ValueError(f'{product_id} 的 MCP profile 必须为对象')
+        missing = [role for role in MCP_ROLES if role not in profile]
+        unknown = sorted(set(profile) - set(MCP_ROLES))
+        if missing or unknown:
+            raise ValueError(
+                f'{product_id} 的 MCP 角色不完整：missing={missing}, unknown={unknown}')
+        normalized_profile = {}
+        for role in MCP_ROLES:
+            config = profile[role]
+            if not isinstance(config, dict) or not isinstance(config.get('enabled'), bool):
+                raise ValueError(f'{product_id}.{role}.enabled 必须为布尔值')
+            if config['enabled'] is False:
+                reason = config.get('reason')
+                if not isinstance(reason, str) or not reason.strip():
+                    raise ValueError(f'{product_id}.{role} 禁用时必须含非空 reason')
+                normalized_profile[role] = {'enabled': False, 'reason': reason.strip()}
+                continue
+            server_name = config.get('server_name')
+            url = config.get('url')
+            tools = config.get('tools')
+            if not isinstance(server_name, str) or not server_name.strip():
+                raise ValueError(f'{product_id}.{role}.server_name 必须为非空字符串')
+            parsed = urlparse(url) if isinstance(url, str) else None
+            if not parsed or parsed.scheme not in ('http', 'https') or not parsed.netloc:
+                raise ValueError(f'{product_id}.{role}.url 必须为有效 HTTP(S) URL')
+            if (not isinstance(tools, list) or not tools
+                    or not all(isinstance(tool, str) and tool.strip() for tool in tools)
+                    or len(tools) != len(set(tools))):
+                raise ValueError(f'{product_id}.{role}.tools 必须为不重复的非空字符串数组')
+            if server_name in seen_servers:
+                raise ValueError(f'MCP server_name 不可跨产品重复: {server_name}')
+            seen_servers.add(server_name)
+            normalized_profile[role] = {
+                'enabled': True,
+                'server_name': server_name,
+                'url': url,
+                'tools': tools,
+            }
+        normalized[product_id] = normalized_profile
+    return {'version': 1, 'profiles': normalized}
+
+
+def resolve_mcp_route(index, routes, area):
+    """按 Area 唯一路由产品 MCP；非 RESOLVED 状态绝不返回候选 servers。"""
+    products = products_for_area(index, area)
+    base = {'ok': False, 'area': area, 'servers': {}}
+    if not products:
+        return {**base, 'route_status': 'AREA_UNMAPPED'}
+    if len(products) != 1:
+        return {**base, 'route_status': 'AREA_AMBIGUOUS'}
+    product = products[0]
+    product_fields = {
+        'product_id': product.get('product_id'),
+        'product_name': product.get('product_name'),
+    }
+    try:
+        normalized = validate_mcp_routes(routes)
+    except ValueError as exc:
+        return {**base, **product_fields, 'route_status': 'PROFILE_INVALID', 'error': str(exc)}
+    profile = normalized['profiles'].get(product_fields['product_id'])
+    if profile is None:
+        return {**base, **product_fields, 'route_status': 'PROFILE_MISSING',
+                'profile_version': normalized['version']}
+    servers = {
+        role: config.get('server_name') if config.get('enabled') else None
+        for role, config in profile.items()
+    }
+    return {
+        'ok': True,
+        'route_status': 'RESOLVED',
+        'area': area,
+        **product_fields,
+        'profile_version': normalized['version'],
+        'servers': servers,
+    }
+
+
 def write_index(index, output_path):
     directory = os.path.dirname(os.path.abspath(output_path))
     os.makedirs(directory, exist_ok=True)
@@ -118,6 +222,12 @@ def main():
                         help='TFS 区域（System.AreaPath 首级；缺失才用 teamProject）')
     lookup.add_argument('--index', default=DEFAULT_OUTPUT, help='索引 JSON 路径')
 
+    route = sub.add_parser('resolve-route', help='按 TFS 区域解析产品及其 MCP 服务组')
+    route.add_argument('--area', required=True,
+                       help='TFS 区域（System.AreaPath 首级；缺失才用 teamProject）')
+    route.add_argument('--index', default=DEFAULT_OUTPUT, help='索引 JSON 路径')
+    route.add_argument('--routes', default=DEFAULT_ROUTES, help='产品 MCP 路由配置 JSON')
+
     args = parser.parse_args()
 
     if args.cmd == 'lookup':
@@ -128,6 +238,20 @@ def main():
                               'products': products}, ensure_ascii=False, indent=2))
         except (OSError, json.JSONDecodeError) as exc:
             print(json.dumps({'ok': False, 'error': str(exc)}, ensure_ascii=False, indent=2))
+            raise SystemExit(1)
+        return
+
+    if args.cmd == 'resolve-route':
+        try:
+            resolved = resolve_mcp_route(
+                read_json(args.index), read_json(args.routes, reject_duplicate_keys=True),
+                args.area)
+            print(json.dumps(resolved, ensure_ascii=False, indent=2))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(json.dumps({
+                'ok': False, 'route_status': 'PROFILE_INVALID', 'area': args.area,
+                'servers': {}, 'error': str(exc),
+            }, ensure_ascii=False, indent=2))
             raise SystemExit(1)
         return
 

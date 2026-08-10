@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "profiles": {
+    "cloudhis-v56": {
+      "requirements_history": {
+        "enabled": true,
+        "server_name": "tfs-requirements",
+        "url": "http://172.16.0.192:4751/mcp",
+        "tools": [
+          "get_requirements_summary",
+          "get_related_work_items",
+          "search_requirements",
+          "get_work_item"
+        ]
+      },
+      "code_graph": {
+        "enabled": true,
+        "server_name": "gitnexus-team",
+        "url": "http://172.16.0.192:4747/api/mcp",
+        "tools": [
+          "list_repos",
+          "query",
+          "context",
+          "route_map",
+          "impact",
+          "cypher"
+        ]
+      },
+      "source_code": {
+        "enabled": true,
+        "server_name": "cloudhis-source",
+        "url": "http://172.16.0.192:4752/mcp",
+        "tools": [
+          "search_source",
+          "search_symbol"
+        ]
+      },
+      "database": {
+        "enabled": true,
+        "server_name": "db-knowledge",
+        "url": "http://172.16.0.192:4748/mcp",
+        "tools": [
+          "search_knowledge",
+          "get_table_knowledge",
+          "traverse_graph",
+          "inspect_node"
+        ]
+      }
+    }
+  }
+}

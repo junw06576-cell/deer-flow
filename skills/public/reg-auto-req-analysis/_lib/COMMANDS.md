@@ -19,7 +19,7 @@
 - `fetch` 返回的 `workItem` → 直接读字段；
 - `rev` 比较 / `expected_rev` 取值 → 上下文算术。
 
-**知识库（tfs-requirements / GitNexus / db-knowledge）用 MCP 工具，产品 wiki 用 grep**——见末节，没有也无需 `.py` 客户端，别为 KB 工作找/写 Python。
+**产品 MCP 先路由再调用，知识库用 MCP 工具，产品 wiki 用 grep**——非 SKIP 先以 `resolve-route` 将 Area 唯一路由到 `product_id`，只使用该 profile 的需求历史 / GitNexus / 源码 / 数据库工具；见末节。没有也无需 `.py` 客户端，别为 KB 工作找/写 Python。
 
 ## CWD
 
@@ -37,7 +37,7 @@
 ```
 
 - `work_item_id`：必填。
-- `human_feedback`：可选（A），重跑时对上轮 `待确认清单`/`analysis_gaps` 逐条回答，每项 `{question_id, question, answer}`；`question_id` 对齐上轮 item/gap 的 id（如 `q1`/`g1`），`question` 原文自描述。
+- `human_feedback`：可选（A），新策略下优先回答上轮 QC `checklist.items`；历史计划仍兼容 `待确认清单`/`analysis_gaps`。每项 `{question_id, question, answer}`；`question_id` 对齐稳定 item/gap id（如新策略 `q-scope`/历史 `g1`），`question` 原文自描述。已回答 ID 除非与当前 revision/新附件直接冲突，否则不得重复询问。
 - `additional_info`：可选（B），超出上轮所问的额外反馈/纠正（文本）。
 - `collection_name` / `tfs_project` / `tfs_pat`：可选连接参数。编排器运行时优先注入环境变量 `TFS_COLLECTION`/`TFS_PROJECT`/`TFS_PAT`（见 `与 deerflow 对接接口文档/tfs-buddy-interface.md` §7）；slash 交互时由模型按需传 `--collection`/`--project`/`--pat`。缺省回落 `tfs-config.json`。
 - skill 据此分 A/B，并在同工作项有更早分析轮时触发「重分析诊断」，见 `references/round-diagnosis-rules.md` §1。无更早分析轮或两项均空时自动忽略，不影响任何终局。全程非交互取得，不得用 `AskUserQuestion` 等方式索取。
@@ -124,19 +124,23 @@ python3 skills/reg-auto-req-analysis/_lib/tfs/attachment_runtime.py convert \
 |---|---|---|
 | `build` | `build [--sources <menu-sources.json>] [--output <menu-business-index.json>]` | 按 `menu-sources.json` 构建 area→菜单索引（无子命令时按缺省 `--sources`/`--output` 构建） |
 | `lookup` | `lookup --area <area> [--index <menu-business-index.json>]` | **按 TFS 区域查候选产品**（area 取 `System.AreaPath` 首级，缺失才用 `teamProject`）。返回 `{ok, area, count, products}`（仅产品级）；代码定位锚点走 wiki 子系统名/仓库名 + GitNexus `query`→`context`，不依赖菜单级字段 |
+| `resolve-route` | `resolve-route --area <area> [--index <menu-business-index.json>] [--routes <product-mcp-routes.json>]` | **唯一解析产品 MCP profile**。返回 `route_status/product_id/product_name/profile_version/servers`；未映射、歧义、缺 profile 或非法 profile 时 `ok=false, servers={}`，禁止默认或跨产品回退 |
 
-## 知识库 —— 是 MCP 工具 / 文本源，**不是 `.py` 脚本**
+## 产品知识源 —— 先路由，再用 MCP 工具 / 文本源
 
-别为 KB 工作找或写 Python；按下列接口用原生 MCP 工具。探活/三态/降级见 `_lib/knowledge-base.md`。
+产品 MCP 注册表固定为 `config/product-mcp-routes.json`，以菜单索引的稳定 `product_id` 为键。非 SKIP 工作项先运行 `resolve-route`，只使用返回 profile 的原生工具；不得按下表 server name 猜默认产品。探活/三态/降级见 `_lib/knowledge-base.md`。
 
-| 来源 | 工具 | 何时用 |
+当前 `cloudhis-v56` profile 如下；这些地址是 CloudHIS 当前实例示例，不是其它产品的全局默认：
+
+| 角色 / 当前 server | 工具 | 何时用 |
 |---|---|---|
-| 需求历史 `tfs-requirements`（`http://172.16.0.192:4751/mcp`） | `get_requirements_summary` / `get_related_work_items` / `search_requirements` / `get_work_item` | 补充最近采集范围内的历史背景、显式关系、验收条件和变更原因；实时当前项字段仍只认 `fetch`，当前代码实现仍只认 GitNexus/受控源码 |
-| 代码图谱 `gitnexus-team` | `list_repos` / `query` / `context` / `route_map` / `impact` / `cypher` | 模块定位、调用链、查重、影响分析（主干 + 兜底） |
-| 数据库图谱 `db-knowledge` | `search_knowledge` / `get_table_knowledge` / `traverse_graph` / `inspect_node` | 字段/迁移/统计口径（**按需**，须先有代码锚点；字段类按 `_lib/module-location-recipe.md §6` 闭环） |
+| 需求历史 `tfs-requirements` | `get_requirements_summary` / `get_related_work_items` / `search_requirements` / `get_work_item` | 补充当前产品最近采集范围内的历史背景、显式关系、验收条件和变更原因；实时当前项字段仍只认 `fetch` |
+| 代码图谱 `gitnexus-team` | `list_repos` / `query` / `context` / `route_map` / `impact` / `cypher` | 当前产品模块定位、调用链、查重、影响分析（主干 + 兜底） |
+| 源码检索 `cloudhis-source` | `search_source` / `search_symbol` | 仅在当前产品 GitNexus 给出精确 repo/路径/符号锚点后，核验条件分支、字段赋值、配置、SQL 或模板等实现细节；最多 3–5 个关键文件 |
+| 数据库图谱 `db-knowledge` | `search_knowledge` / `get_table_knowledge` / `traverse_graph` / `inspect_node` | 当前产品字段/迁移/统计口径（**按需**，须先有代码锚点；字段类按 `_lib/module-location-recipe.md §6` 闭环） |
 | 产品 wiki | **读/grep `wiki/`**（先完整读 `wiki/index.md` → 按门诊/住院/电子病历/平台/数据库定位文章 → 关键事实按需沿 `Raw` 相对链接复核），非 MCP | 业务语义/规则/口径/验收 + 子系统名（GitNexus **之前**的业务语义层；未覆盖记限制继续） |
 
-`tfs-requirements` 调用规则：先用 `get_requirements_summary` 探活并记录覆盖范围；显式关系用 `get_related_work_items`；`search_requirements` 命中只算候选，必须再用 `get_work_item` 读取正文/验收/按需修订历史后才可标为已证实。接入、降级和引用规则见 `_lib/knowledge-base.md`。
+当前 CloudHIS 源码 MCP 地址为 `http://172.16.0.192:4752/mcp`，只读且由服务端限制白名单仓库/允许路径；无命中、截断、白名单外或路径拒绝只算覆盖不足，不得推断源码不存在。`tfs-requirements` 调用规则：先用 `get_requirements_summary` 探活并记录覆盖范围；显式关系用 `get_related_work_items`；`search_requirements` 命中只算候选，必须再用 `get_work_item` 读取正文/验收/按需修订历史后才可标为已证实。接入、降级和引用规则见 `_lib/knowledge-base.md`。
 
 其它接入/查询方法：`_lib/module-location-recipe.md`、`_lib/wiki-kb-recipe.md`。
 

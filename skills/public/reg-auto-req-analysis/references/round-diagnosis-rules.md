@@ -29,7 +29,7 @@
 ```
 
 补充信息分两类：
-- **A｜`human_feedback`**：对上轮 `待确认清单`/`analysis_gaps` 的逐条回答，每项 `{question_id, question, answer}`；`question_id` 对齐上轮 item/gap 的 id（如 `q1`/`g1`，作主键），`question` 为上轮原问题文本、自描述兜底，`answer` 成对。
+- **A｜`human_feedback`**：新策略下对上轮 QC `checklist.items` 逐条回答；历史计划兼容 `待确认清单`/`analysis_gaps`。每项 `{question_id, question, answer}`；`question_id` 对齐稳定 item/gap id（如新策略 `q-scope`/历史 `g1`，作主键），`question` 为上轮原问题文本、自描述兜底，`answer` 成对。QC 回答继承与禁止重复询问由 RUNBOOK 步骤 1 执行，不要求上轮必须已有分析产物。
 - **B｜`additional_info`**：超出上轮所问的额外反馈/纠正（如"分析者描述格式不满意"）。
 - `collection_name`/`tfs_project`/`tfs_pat` 属连接参数，由运行时注入环境变量，**不参与 A/B 诊断**。
 

@@ -26,7 +26,9 @@
 
 > 任一改动不属于白名单、同时包含未列出的改动，或无法明确归类 → `MANUAL-REVIEW`。`AUTO-ANA` 计划必须写入非空 `auto_scopes`（仅能使用上表值）并在变更方案中逐项说明依据。
 > **迭代分析闭环前置**：先按 `iteration-analysis-closure.md` 形成现状、问题、差异、方案取舍、成功衡量和非目标。方向、根因、业务范围、取数口径或权限口径不清 → 回退 QC `NEED-REVIEW`；现有实现、相似能力或方案取舍未证实 → `MANUAL-REVIEW` 并按规则记录仅审计的 `evidence_gaps`。不得用候选实现、未确认根因或“按现有逻辑”替代业务结论。
-> **AUTO-ANA 额外硬前置**：`kb.ready=true` 且 `kb.dedup_ran=true`（相似实现查重必须实际执行，落审计字段 `kb.dedup_ran`）；优化类类别（`existing-*`、`bug-fix`、`print-adjustment`、`data-management`、`permission-config`、`performance`、`mobile-adaptation`）还须在 `kb.findings` 至少一条 `state=已证实` 锚定被改现有模块/入口（见 §下文「现有实现基线」）。KB 未就绪 / 查重未跑 / 无已证实锚点 → 改判 `MANUAL-REVIEW`（不加 `STOP-AUTO`，属信息缺口而非高风险）。此条由 `pipeline.py` 强制校验。
+> **单次集中确认**：新计划固定 `confirmation_policy=qc-single-batch-v1`。任何 PM 可回答且会改变方案或验收的业务缺口，无论在质控预演还是阶段二才发现，都必须回退 QC `NEED-REVIEW` 并合并进唯一 checklist；分析计划固定 `analysis_gaps=[]`，不得生成 `manual-followup`。高风险、非 AUTO 白名单或技术证据不足仍可判 MANUAL，但不再次向用户提问。
+> **AUTO-ANA 额外硬前置**：`knowledge_route.status=RESOLVED`、`kb.ready=true` 且 `kb.dedup_ran=true`（相似实现查重必须实际执行）；优化类类别还须在 `kb.findings` 至少一条 `state=已证实` 锚定被改现有模块/入口。`kb.source_required=true` 时还必须 `source_ready=true`、实际调用 `search_source|search_symbol` 并至少一条已证实源码 finding。任一不满足 → 改判 `MANUAL-REVIEW`（不加 `STOP-AUTO`，属技术证据缺口）。此条由 `pipeline.py` 强制校验。
+> **界面 AUTO 基线硬前置**：新策略 `AUTO-ANA` 的 `auto_scopes` 含 `field-ui-copy` 时，必须用 `ui_baseline.sources` 从产品知识（wiki/Raw）、运行观察（受控页面/截图/已解析附件）、实现证据（GitNexus/源码）三类中至少取两类交叉证实现状；同类多条只算一类。wiki 是按需优先源，不是固定必需源。无法闭合两类 → `MANUAL-REVIEW` 并记“界面现状交叉证据不足”。此条由 `pipeline.py` 强制校验。
 > **功能已存在排除**：`existing_feature.satisfied=true`（一套公版下，既有能力已覆盖本次诉求）时禁止 `AUTO-ANA`（由 `pipeline.py` 强制）；须改判 `MANUAL-REVIEW` 并在分析者描述以“该功能已存在”+需求号领起。与上一条同属 AUTO-ANA 硬前置，缺一即降级。
 > **治标警惕（根因/方向存疑→不分析、回退质控）**：需求描述含性能/异常抱怨（卡顿/慢/等待/超时/延迟/崩溃/数据错乱等）但变更方案为**使用层规避**（上限/提醒/分批/限制/阈值等）而非根因优化时，**不得判 AUTO-ANA**，也**不得选 `performance` 类别把规避方案写成"优化方案"兜底、或用 `existing-ui-simple` 等类别绕过根因**——按 `SKILL.md` 回退通路回质控 `NEED-REVIEW`（产品 + 研发负责人），审计 `qc_recheck=analysis-rootcause-mismatch`。详见 `references/qc-checklist.md` §一 #10。
 > **BUG 语义优先于标题/类型**：既有功能出现错误、字段条件分支有值/为空不一致或结果偏离既有预期时，即使工作项类型为功能性、标题写“优化/调整”，也优先选 `bug-fix`；不得包装成新功能、打印调整或界面优化。字段/打印异常须枚举全部取值分支；未闭环来源进入 `evidence_gaps` 并判 MANUAL。
@@ -44,10 +46,10 @@
 
 ## 4. 知识库接线说明（非规则·图谱为内部佐证）
 
-> **权威来源：`../_lib/knowledge-base.md`**（TFS 需求历史 + GitNexus 代码图谱 + 数据库图谱 + 产品 wiki，两阶段共用）。
+> **权威来源：`../_lib/knowledge-base.md`**（产品路由 + 当前产品的 TFS 需求历史 / GitNexus 代码图谱 / 受控源码 / 数据库图谱 / wiki，两阶段共用）。
 > **需求历史只作业务追溯佐证**：`tfs-requirements` 用于历史背景、关联工作项、验收条件和变更原因；已核验 finding 可用 `req:<索引>` 补充 `evidence_refs`。它不得覆盖实时 `fetch`、不得证明当前代码实现、不得进入 `qc_evidence_resolution`，也不得满足 AUTO 的 `kb.ready` / `kb.dedup_ran` / `kb:` 现有实现证据。
-> **代码图谱定位是内部佐证，不进 PM 视角变更方案正文**——变更方案是业务视角（见 `references/change-plan-template.md`）。“分析者描述”的 `路径` 仅写菜单路径和操作路径，不写仓库、代码符号、接口、Mapper 或表字段。
-> **产品 wiki 同样作业务内部佐证**（业务规则/流程/数据口径/验收），结果落 `wiki.findings`、**不进正文**；查询见 `../_lib/wiki-kb-recipe.md`，读序在 GitNexus 之前。**代码事实为准、wiki 仅补充——二者冲突时以 GitNexus 为准**（代码库最准）。
+> **代码图谱定位与受控源码核验都是内部佐证，不进 PM 视角变更方案正文**。GitNexus 负责发现、关系和查重；源码 MCP 只在当前产品“精确 repo + API/路径/符号/技术字面量”锚点后核验 3–5 个关键文件，锚点优先来自 GitNexus，也可来自已解析附件、工作项明确技术信息、菜单索引或 wiki。GitNexus 不可用时源码只核验已有锚点，不替代发现和查重；二者均不证明现场部署。“分析者描述”只写菜单路径和操作路径，不写仓库、代码符号、接口、Mapper 或表字段。
+> **产品 wiki 同样作业务内部佐证**，结果落 `wiki.findings`、不进正文；子系统名/仓库名只作当前产品 GitNexus 候选锚点。
 
 - **内部定位**：按 `../_lib/module-location-recipe.md` 完整方法（探活→三组词→从流程选模块→候选记录+3 文件验证→双闸确认）定位主模块/调用链/关键文件/配置关联，结果落 **`kb.findings`**（三态 + 置信度），**用于**：① 印证 AUTO/MANUAL 的**业务改动类型**判断；② 查重（支撑 `references/confidence-heuristic.md` 第 4 项）；③ 高风险定性佐证（③④⑥，要改动面才看得出）。**不打印进变更方案正文**（类/方法/调用链/接口/Mapper/表字段不入产物）。
 - **AUTO/MANUAL 从业务改动描述判**：改文案/补单测/调配置（白名单内）→ 倾向 AUTO；改业务规则/流程/数据写入 → MANUAL；代码图谱内部印证。

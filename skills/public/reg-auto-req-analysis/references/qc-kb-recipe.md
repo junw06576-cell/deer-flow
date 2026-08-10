@@ -8,7 +8,7 @@
 
 ## 发现链（单需求约 ≤10 次调用，信号够即停）
 
-> **读序**：实时工作项/附件 → 按需需求历史 → 菜单索引 → 产品 wiki → 下方代码图谱 Steps → 按需数据库。wiki 发现同源写 `checklist.items`/`kb_note`/`wiki.findings`，不判终局。
+> **读序**：实时工作项/附件 → 产品路由 → 按需当前产品需求历史 → 菜单索引 → 产品 wiki → 当前产品代码图谱 → 按需受控源码 → 按需数据库。路由未解析时不得调用任何产品 MCP；wiki 发现同源写 `checklist.items`/`kb_note`/`wiki.findings`，不判终局。
 
 ### Step R：按需补充需求历史
 
@@ -22,7 +22,7 @@
 
 ### Step 0：探活并固定范围
 
-1. 调用 `gitnexus-team.list_repos`，**从实时返回的清单中选定明确 `repo`**（菜单/wiki 候选 repo 必须实际存在才采用；**不硬编码仓库名——实测 `cloudhis-unified` 不在清单，旧默认值已废止**），记录索引时间、节点/流程数和 `embeddings`（**当前全部仓库 `embeddings=0`**，查询须走精确锚点 + [`../_lib/business-keyword-dictionary.md`](../_lib/business-keyword-dictionary.md) 同义词）。**注意 `list_repos` 回包很大（数十 repo × 全量 stats）**：质控仅用于探活 + 选 repo，只需取「图谱就绪」结论与目标 repo 的索引时间/`embeddings`，不必逐条处理所有 stats；若 repo 已由共享菜单索引唯一确定，可只取探活结论。
+1. 先用 `resolve-route` 固定 `knowledge_route`；只在 `RESOLVED` 时调用 `knowledge_route.servers.code_graph` 对应服务的 `list_repos`，从实时清单选定明确 `repo`，不硬编码仓库名。记录索引时间、节点/流程数和 `embeddings`；质控只需目标 repo 的探活与覆盖摘要，不必处理全部 stats。
 2. 代码图谱不可用、超时或重建中：记 `kb_ready=false`，按 `config/qc-rules.md` 默认规则继续，不阻断、不转 ERROR。
 3. 数据库工具只在 Step 3 需要时探活；数据库不可用不影响代码侧佐证。
 
@@ -33,7 +33,7 @@
 3. **首轮空回退链（强制）**：首轮 `query` 全空时不得记缺口了事，依次试 ①字典同义词/拼音缩写 ②`cypher` 结构查 ③`impact` 反向找调用方 ④`traverse_graph` ⑤换 repo；仍空才记"代码图谱覆盖缺口"。
 4. 从候选页面/API/符号提取精确 API 路径、Controller、DTO、Mapper 或方法名，再做第二轮检索。
 5. 对候选使用 `query → context → route_map（有精确 API 时）→ context` 建立入口和关系。`processes` 或 `route_map` 为空时，继续用 `context` 查 Controller、Service、Mapper 的调用边。
-6. 质控只需证明对象/动作、可追踪入口和明确关系；不做完整调用链枚举或源码验证。高风险需估计影响面时可调用 `impact`；接口风险分层可调用 `api_impact` 或 `route_map`。
+6. 质控只需证明对象/动作、可追踪入口和明确关系；不做完整调用链枚举。高风险需估计影响面时可调用 `impact`；接口风险分层可调用 `route_map`。
 
 ### Step 2：判定与记录
 
@@ -42,6 +42,10 @@
 - 图谱无关系或索引覆盖不足：记为**未确认**；不得按名称猜测后端、表或调用链。
 
 每条同时标注“图谱事实 / 推断 / 未确认”。将命名实体用于补强现有 `qc-checklist.md` #3 可识别性或 #5 重复问题，不新增 KB 专属规则或 verdict。
+
+### Step 2.5：按条件核验源码
+
+只当已有 GitNexus 精确 repo、路径或符号锚点，且方法体、条件分支、字段赋值、配置、SQL 或模板绑定可直接消除质控阻断时，置 `kb.source_required=true` 并调用当前 profile 的源码 MCP。已知符号用 `search_symbol`，精确路径/字面量用 `search_source`，每轮最多 3–5 个关键文件。禁止无锚点全仓搜索，GitNexus 不可用时不得用源码 MCP 代替发现。无命中、截断、白名单外或路径拒绝只记覆盖不足，不证明实现不存在。
 
 ### Step 3：按需数据库联查
 
@@ -55,7 +59,7 @@
 
 - `checklist.items`：把抽象问题变为带实体名和证据状态的选择式问题。
 - `checklist.kb_note`：简洁汇总已证实、候选、未确认及图谱限制。
-- 顶层 `kb.findings`：写 `[{entity, state, source_tool}]` 供审计和下游机读。
+- 顶层 `kb.findings`：写 `[{entity, state, source_tool, source_type}]` 供审计和下游机读；`source_type` 固定为 `code|database`。`kb.ready` 表示代码图谱，`kb.source_ready` 表示源码 MCP 工具已注入，`kb.source_required` 表示本轮结论依赖源码核验，`kb.database_ready` 表示数据库图谱。源码 finding 的 `source_tool` 仅允许 `search_source|search_symbol` 且 `source_type=code`。
 
 初判 `NEED-REVIEW` 时，先逐项判断该 finding 是否直接回答初判问题。只有 `kb:` 或 `wiki:` 的**已证实** finding 同时满足“同业务范围、现状规则明确、与需求不冲突、无剩余正确性/方向类缺口”时，才在后续分析计划写 `qc_evidence_resolution.items[]` 并复核为 `PASS`。不得用 `work-item`、候选/推断、名称相似或只定位到技术实体的发现放行。
 

@@ -1,22 +1,23 @@
-# 后端模块定位方法论（module-location-recipe）
+# 当前产品模块定位与源码核验方法（module-location-recipe）
 
 > **共享权威源**：`auto-req-analysis` 的阶段一质控（佐证子集）与阶段二分析（完整）共读本文件。工具目录、探活、三态标注和降级规则以 [`knowledge-base.md`](knowledge-base.md) 为准；本文件只规定模块定位的顺序与判据。
 >
-> **口诀：先固定 repo，再用三组词和精确锚点收敛，最后以入口和关系取证；文件名只作线索，不作结论。**
+> **口诀：先固定产品与 repo，再用三组词和精确锚点收敛，最后以入口和关系取证；源码只核验精确锚点，文件名只作线索，不作结论。**
 
 ## §0 何时跑
 
-- **质控**：需求触及判定面（高风险 ①②⑤⑥，**或触及 [`business-keyword-dictionary.md`](business-keyword-dictionary.md) 任一业务概念**——不再限于"结算/费用/医保/上传/校验/明细"等枚举）时，跑 §1、§2 和 §5 的佐证子集，只为核对可识别性、查重和高风险；不做完整调用链与源码验证。
-- **分析**：生成变更方案时跑 §1–§5 完整方法，作为内部佐证；结果落 `kb.findings`，不把仓库、代码符号、接口、Mapper 或表字段写入 PM 视角变更方案正文。分析者描述的 `路径` 仅写业务菜单路径和操作路径。
+- **质控**：需求触及判定面（高风险 ①②⑤⑥，**或触及 [`business-keyword-dictionary.md`](business-keyword-dictionary.md) 任一业务概念**）时，跑 §1、§2 和 §5 的佐证子集，只为核对可识别性、查重和高风险；不枚举完整调用链。仅当已锨定的实现细节可直接消除质控阻断时，按 §4 条件调用源码 MCP。
+- **分析**：生成变更方案时跑 §1–§5 完整方法，作为内部佐证；结果落 `kb.findings`，不把仓库、代码符号、接口、Mapper 或表字段写入 PM 视角变更方案正文。`concise-v3` 分析者描述单列的“菜单路径”仅写业务菜单入口，操作步骤写入对应方案行。
 
 ## §1 固定检索范围与探活
 
-1. 若共享菜单索引存在，先用工作项 `area` 精确选择 `tfs_area_values`；唯一命中的菜单只能提供 repo、页面路径和 API **候选**。未命中、未配置或不唯一时记录范围未确认，继续后续步骤，不猜测产品。
-2. 调用 `gitnexus-team.list_repos` 后明确 `repo`：菜单候选 repo 必须实际存在才可采用；**从实时返回的清单中选定，不硬编码仓库名（实测 `cloudhis-unified` 不在清单，旧默认值已废止）**。
-3. 记录 `indexedAt`、`lastCommit`、节点数、流程数和 `embeddings`（**当前全部仓库 `embeddings=0`**，查询词须走精确锚点 + [`business-keyword-dictionary.md`](business-keyword-dictionary.md) 同义词/拼音缩写）。索引稍旧但可查询时可继续，并标注局限；`LadybugDB unavailable`、`rebuilding` 或超时才是不可查，应按共享规范降级。
-4. 不得省略 repo 范围直接搜索，也不得把第一次命中的文件当结论。
+1. 先以工作项 `area` 执行 `resolve-route`，只有 `RESOLVED` 才能使用返回 profile 的产品 MCP。未映射、多映射、profile 缺失或非法时记录 `PRODUCT_ROUTE_UNRESOLVED`，不猜产品、不回退 CloudHIS 或全局默认服务。
+2. 使用该产品的菜单索引唯一命中 `tfs_area_values`；菜单只能提供 repo、页面路径和 API **候选**。
+3. 调用 `knowledge_route.servers.code_graph` 对应服务的 `list_repos` 后明确 `repo`：菜单候选 repo 必须实际存在才可采用；从实时返回的清单中选定，不硬编码仓库名。
+4. 记录 `indexedAt`、`lastCommit`、节点数、流程数和 `embeddings`。索引稍旧但可查询时可继续，并标注局限；服务不可用、重建中或超时才是不可查，按共享规范降级。
+5. 不得省略 repo 范围直接搜索，也不得把第一次命中的文件当结论。
 
-> **wiki 桥接（技术锚点来源之一）**：在 GitNexus 检索**之前**按 [`wiki-kb-recipe.md`](wiki-kb-recipe.md) §2 读 wiki，其业务叙述里常带**子系统名/仓库名**（如 `batmed-yfyk-base-frame`、`batwce-v5.6`）——优先用作下文 §2 的"技术锚点"组检索词与 §3 `query`/`context` 的首选锚点。wiki 是业务语义、非代码事实：子系统名只提供**候选**，仍须经 §3 `query → context → route_map → context` 证据链证实，不得据此跳过验证。
+> **wiki 桥接（按需技术锚点来源之一）**：命中 [`wiki-kb-recipe.md`](wiki-kb-recipe.md) §1 触发条件时，在 GitNexus 检索前按 §2 读 wiki；其业务叙述里常带**子系统名/仓库名**（如 `batmed-yfyk-base-frame`、`batwce-v5.6`），可用作下文 §2 的“技术锚点”检索词。wiki 是业务语义、非代码事实：子系统名只提供候选；若要证明调用关系仍须经 §3 图谱证据链，若只核验方法体细节则须同时具备当前产品精确 repo 与 API/路径/符号锚点。
 
 ## §2 两轮检索
 
@@ -51,7 +52,11 @@ query(业务对象/动作)
 
 ## §4 候选记录与有限源码验证
 
-每个候选记录模块/cluster、入口、已证实关系、关键文件、排除理由，并标注“图谱事实 / 推断 / 未确认”。需要读源码时，最后只验证入口、编排、落库等 3–5 个关键文件，不全仓翻找。
+每个候选记录模块/cluster、入口、已证实关系、关键文件、排除理由，并标注“图谱事实 / 推断 / 未确认”。结论依赖方法体、条件分支、字段赋值、配置、SQL 或模板绑定时，只有先取得当前产品的“精确 repo + API/路径/符号/技术字面量”锚点，才置 `kb.source_required=true` 并调用当前 profile 的源码 MCP。锚点优先来自 GitNexus，也可来自已解析附件、当前工作项明确技术信息、菜单索引或 wiki 中可追溯的精确记录。
+
+- 已知类、方法或符号用 `search_symbol`；`search_source` 只接受精确路径、字面量或技术锚点。
+- 每轮只核验入口、编排、落库等 3–5 个关键文件；禁止业务词无锚点全仓搜索。GitNexus 不可用时，源码 MCP 只核验既有精确锚点，不替代模块发现、跨层关系或相似实现查重。
+- 无命中、截断、白名单外或路径拒绝只记录覆盖不足；源码事实不证明部署版本、现场行为或已上线。
 
 ## §5 证据判定与输出
 
@@ -69,7 +74,7 @@ query(业务对象/动作)
 
 “图谱事实 / 推断 / 未确认”描述单条证据性质；“已证实 / 候选 / 未确认”描述模块定位结论。名称相似、单个文件命中或未经关系验证的表不得升级为已证实。
 
-**AUTO-ANA 候选的额外要求**：优化类类别（既有功能优化）判 `AUTO-ANA` 时，`kb.findings` 必须至少一条 `state=已证实` 锚定**被改的现有模块/入口**，并在 v2 `evidence_refs` 中被现状、差异或方案结论引用——仅"图谱事实"等证据态不足以放行（由 `pipeline.py` 强制，见 `../config/analysis-rules.md` §1）。目标部署页面的受控观察、可追溯截图、工作项已解析附件**或 wiki 界面布局描述（含 Raw 复核，`state=wiki-确认`）**可作为”现有 UI 行为/范围”的直接证据：记录来源、采集时间/页面路径、项目/版本、菜单或 URL、可见状态；它们能替代候选源码对**布局与交互事实**的证明，但不能推导未观察到的后端规则。**界面/布局类需求的现状基线至少须两源交叉证实（见 `../references/iteration-analysis-closure.md` §1），wiki 为首选源之一。**无法证实现有实现或现场 UI 行为 → 不判 `AUTO-ANA`，降 `MANUAL-REVIEW` 并在内部 `evidence_gaps` 记录缺口。
+**AUTO-ANA 候选的额外要求**：优化类类别（既有功能优化）判 `AUTO-ANA` 时，`kb.findings` 必须至少一条 `state=已证实` 锚定**被改的现有模块/入口**，并在 v2 `evidence_refs` 中被现状、差异或方案结论引用——仅"图谱事实"等证据态不足以放行（由 `pipeline.py` 强制，见 `../config/analysis-rules.md` §1）。界面/布局类需求还须从三类中至少取两类交叉证实：产品知识（wiki/Raw）、运行观察（受控页面/可追溯截图/已解析附件）、实现证据（GitNexus/已核验源码）；同类多条只算一类。新策略的 `AUTO-ANA + field-ui-copy` 将来源写入 `ui_baseline.sources`。wiki 是业务语义优先源，但未覆盖本身不降级；无法闭合两类现状证据时才不判 `AUTO-ANA`，降 `MANUAL-REVIEW` 并在内部 `evidence_gaps` 记录缺口。实现证据不能单独证明部署版本或现场行为。
 
 `kb.findings` 至少记录：结论分级、模块/目录范围、入口、已证实关系、关键文件（≤5）、已证实的配置关联、复用/影响、置信度和每项所依据的路径/符号/API。
 
@@ -98,20 +103,22 @@ query(业务对象/动作)
 
 ## §7 降级与两 skill 边界
 
-- 代码图谱不可查：记 `kb_ready=false`，质控按默认规则继续，分析跳过相似实现命中并走置信度启发式；不得阻断、转 ERROR 或因此判 MANUAL。
+- 代码图谱不可查：记 `kb.ready=false`；若已有来自工作项、附件、菜单或 wiki 的当前产品精确 repo + 技术锚点，可用源码 MCP 有限核验该锚点，但不得做无锚点发现、跨层关系补全或查重替代。质控在不依赖缺失证据时按既有降级规则继续；AUTO 候选仍因图谱/查重门槛未闭合降 `MANUAL-REVIEW` 并记技术缺口。
+- 源码 MCP 未就绪、范围受限或核验不完整：依次记 `SOURCE_MCP_UNAVAILABLE` / `SOURCE_SCOPE_PARTIAL` / `SOURCE_VERIFICATION_INCOMPLETE`；`source_required=true` 的 AUTO 候选必须降 MANUAL。
 - 数据库图谱未就绪或无命中：保留已证实的代码级结论，记录限制；除非数据库事实是需求的必要前提，不得否定模块或改变终局。
 - 质控只把发现写进 `checklist.items`、`kb_note` 和 `kb.findings`，不新增 KB 专属 verdict；分析把技术定位结果仅作 AUTO/MANUAL、查重和高风险的内部佐证。业务菜单路径和操作路径可写入分析者描述，但不得混入技术定位。
 
 ## §8 分析用一键 prompt
 
 ```text
-请使用 GitNexus MCP 分析需求“{需求名称/需求描述}”，定位对应的现有后端业务模块。只读，不修改代码、配置或 TFS。
+请先用工作项 Area 解析产品路由，再使用该 profile 的 GitNexus MCP 分析需求“{需求名称/需求描述}”，定位对应的现有业务模块。只读，不修改代码、配置或 TFS。
 
 1. 先调用 list_repos，明确 repo（已知项目优先单仓库），检查 indexedAt、节点/流程数和 embeddings。
 2. 分别用业务对象、业务动作、技术锚点检索；从候选页面/API/符号提取精确路径、Controller、DTO、方法或表名后做第二轮检索。
 3. 用 query → context → route_map（有精确 API 路径时）→ context 建立入口和关系。processes 或 route_map 为空时继续用 context，不得判业务不存在。
 4. 仅在“对象与动作匹配 + 可追踪入口 + 明确调用/导入/路由/代码 SQL 读写关系”同时成立时判为已证实；否则分为候选或未确认。
 5. 仅在涉及字段、迁移、统计、数据权限、性能或数据库脚本时，用已证实的代码锚点联查数据库；两轮无命中时记录数据库图谱覆盖缺口，不用相似表补链。
+6. 取得当前产品“精确 repo + API/路径/符号/技术字面量”锚点后，按需用源码 MCP 核验 3–5 个关键文件；锚点优先来自 GitNexus，也可来自已解析附件、工作项明确技术信息、菜单索引或 wiki。已知符号用 search_symbol，精确路径/字面量用 search_source；GitNexus 不可用时只核验已有锚点，不替代发现和查重。无命中或范围受限只记覆盖缺口。
 
 输出：已证实、候选、未确认；每项附文件路径、符号或 API 证据，并说明待确认项。
 ```

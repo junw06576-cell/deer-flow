@@ -20,6 +20,22 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import build_menu_business_index as menu_index  # noqa: E402
 
 
+def resolved_knowledge_route():
+    return {
+        'status': 'RESOLVED',
+        'area': 'NETHIS5.5',
+        'product_id': 'cloudhis-v56',
+        'product_name': '云HIS 5.6',
+        'profile_version': 1,
+        'servers': {
+            'requirements_history': 'tfs-requirements',
+            'code_graph': 'gitnexus-team',
+            'source_code': 'cloudhis-source',
+            'database': 'db-knowledge',
+        },
+    }
+
+
 class TfsClientTests(unittest.TestCase):
     def test_map_workitem_exposes_pre_qc_fields(self):
         item = tfs.map_workitem({'id': 1, 'rev': 2, 'fields': {
@@ -695,6 +711,131 @@ class TfsClientTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, '区域只能归属一个产品'):
                 menu_index.build_index(manifest_path)
 
+    def test_product_mcp_route_selects_only_the_area_product(self):
+        index = {
+            'products': [
+                {'product_id': 'product-a', 'product_name': '产品 A',
+                 'tfs_area_values': ['AREA-A']},
+                {'product_id': 'product-b', 'product_name': '产品 B',
+                 'tfs_area_values': ['AREA-B']},
+            ],
+        }
+
+        def profile(prefix, port):
+            return {
+                role: {
+                    'enabled': True,
+                    'server_name': f'{prefix}-{role}',
+                    'url': f'http://127.0.0.1:{port + offset}/mcp',
+                    'tools': [f'{role}_tool'],
+                }
+                for offset, role in enumerate(menu_index.MCP_ROLES)
+            }
+
+        routes = {'version': 1, 'profiles': {
+            'product-a': profile('a', 4700),
+            'product-b': profile('b', 4800),
+        }}
+        result = menu_index.resolve_mcp_route(index, routes, 'AREA-B')
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['route_status'], 'RESOLVED')
+        self.assertEqual(result['product_id'], 'product-b')
+        self.assertEqual(result['servers']['source_code'], 'b-source_code')
+        self.assertNotIn('a-', json.dumps(result))
+
+    def test_cloudhis_area_resolves_to_current_profile(self):
+        result = menu_index.resolve_mcp_route(
+            menu_index.read_json(menu_index.DEFAULT_OUTPUT),
+            menu_index.read_json(menu_index.DEFAULT_ROUTES),
+            'NETHIS5.5',
+        )
+        self.assertEqual(result, {
+            'ok': True,
+            'route_status': 'RESOLVED',
+            'area': 'NETHIS5.5',
+            'product_id': 'cloudhis-v56',
+            'product_name': '云HIS 5.6',
+            'profile_version': 1,
+            'servers': {
+                'requirements_history': 'tfs-requirements',
+                'code_graph': 'gitnexus-team',
+                'source_code': 'cloudhis-source',
+                'database': 'db-knowledge',
+            },
+        })
+
+    def test_product_mcp_route_returns_stable_unresolved_statuses_without_servers(self):
+        profile = {
+            role: {'enabled': False, 'reason': '尚未提供'}
+            for role in menu_index.MCP_ROLES
+        }
+        routes = {'version': 1, 'profiles': {'product-a': profile}}
+        unmapped = menu_index.resolve_mcp_route({'products': []}, routes, 'UNKNOWN')
+        self.assertEqual(unmapped['route_status'], 'AREA_UNMAPPED')
+        self.assertEqual(unmapped['servers'], {})
+
+        ambiguous_index = {'products': [
+            {'product_id': 'product-a', 'product_name': 'A', 'tfs_area_values': ['AREA']},
+            {'product_id': 'product-b', 'product_name': 'B', 'tfs_area_values': ['AREA']},
+        ]}
+        ambiguous = menu_index.resolve_mcp_route(ambiguous_index, routes, 'AREA')
+        self.assertEqual(ambiguous['route_status'], 'AREA_AMBIGUOUS')
+        self.assertEqual(ambiguous['servers'], {})
+
+        missing = menu_index.resolve_mcp_route({
+            'products': [{'product_id': 'product-b', 'product_name': 'B',
+                          'tfs_area_values': ['AREA-B']}],
+        }, routes, 'AREA-B')
+        self.assertEqual(missing['route_status'], 'PROFILE_MISSING')
+        self.assertEqual(missing['servers'], {})
+
+    def test_product_mcp_route_rejects_invalid_profile(self):
+        valid_role = {'enabled': True, 'server_name': 'shared',
+                      'url': 'http://127.0.0.1:4700/mcp', 'tools': ['tool']}
+        missing_role = {'version': 1, 'profiles': {
+            'product-a': {'requirements_history': valid_role},
+        }}
+        with self.assertRaisesRegex(ValueError, 'MCP 角色不完整'):
+            menu_index.validate_mcp_routes(missing_role)
+
+        disabled_without_reason = {'version': 1, 'profiles': {
+            'product-a': {
+                role: {'enabled': False} for role in menu_index.MCP_ROLES
+            },
+        }}
+        with self.assertRaisesRegex(ValueError, '禁用时必须含非空 reason'):
+            menu_index.validate_mcp_routes(disabled_without_reason)
+
+        invalid_url = {'version': 1, 'profiles': {
+            'product-a': {
+                role: {'enabled': True, 'server_name': f'a-{role}',
+                       'url': 'file:///tmp/mcp', 'tools': ['tool']}
+                for role in menu_index.MCP_ROLES
+            },
+        }}
+        with self.assertRaisesRegex(ValueError, r'有效 HTTP\(S\) URL'):
+            menu_index.validate_mcp_routes(invalid_url)
+
+        def profile(prefix):
+            return {
+                role: {'enabled': True, 'server_name': 'duplicate' if role == 'source_code'
+                       else f'{prefix}-{role}', 'url': 'http://127.0.0.1:4700/mcp',
+                       'tools': ['tool']}
+                for role in menu_index.MCP_ROLES
+            }
+        duplicate_server = {'version': 1, 'profiles': {
+            'product-a': profile('a'), 'product-b': profile('b'),
+        }}
+        with self.assertRaisesRegex(ValueError, '不可跨产品重复'):
+            menu_index.validate_mcp_routes(duplicate_server)
+
+        with tempfile.TemporaryDirectory() as directory:
+            route_path = os.path.join(directory, 'routes.json')
+            with open(route_path, 'w', encoding='utf-8') as f:
+                f.write('{"version":1,"profiles":{"product-a":{},"product-a":{}}}')
+            with self.assertRaisesRegex(ValueError, 'JSON 键不可重复: product-a'):
+                menu_index.read_json(route_path, reject_duplicate_keys=True)
+
     def _write_tfs_config(self, directory, collection='CfgColl', project='健康医养'):
         path = os.path.join(directory, 'tfs-config.json')
         with open(path, 'w', encoding='utf-8') as f:
@@ -811,7 +952,9 @@ class PipelinePlanTests(unittest.TestCase):
                 '- **非目标**：不新增字段、流程、权限或数据修改。',
             ])
         lines.append('## 三、分析者描述')
-        if analysis_profile != 'concise-v3':
+        if analysis_profile == 'concise-v3':
+            lines.append('- **菜单路径**：业务管理 > 测试功能')
+        else:
             lines.extend([
                 '- **需求类别**：' + '、'.join(f'`{category}`' for category in categories),
                 '- **路径**：菜单路径：业务管理 > 测试功能；操作路径：测试功能 → 编辑 → 保存',
@@ -877,9 +1020,65 @@ class PipelinePlanTests(unittest.TestCase):
 
     def write_current_analysis_plan(self, directory, categories, run_id='run_12345678'):
         """生成当前 concise-v3 分析计划；旧 helper 默认值保留历史格式测试。"""
-        return self.write_analysis_plan(
+        plan, plan_path, artifact_path = self.write_analysis_plan(
             directory, categories, run_id=run_id,
             analysis_rule='evidence-loop-v1', analysis_profile='concise-v3')
+        plan['confirmation_policy'] = pipeline.SINGLE_CONFIRMATION_POLICY
+        plan['kb']['database_ready'] = False
+        plan['kb']['source_ready'] = True
+        plan['kb']['source_required'] = False
+        plan['knowledge_route'] = self.resolved_knowledge_route()
+        for finding in plan['kb']['findings']:
+            finding['source_type'] = 'code'
+            finding['conclusion'] = '已定位测试功能的现有实现入口'
+            finding['evidence'] = finding['entity']
+            finding['boundary'] = '仅证明测试代码图谱中的入口，不代表现场已部署。'
+        if 'field-ui-copy' in plan['auto_scopes']:
+            plan['ui_baseline'] = {
+                'sources': [
+                    {'type': 'code-graph', 'ref': 'kb:0'},
+                    {'type': 'runtime-observation', 'ref': '受控测试页面：业务管理 > 测试功能'},
+                ]
+            }
+        return plan, plan_path, artifact_path
+
+    def test_current_ui_auto_requires_two_independent_baseline_source_families(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_current_analysis_plan(
+                directory, ['existing-ui-simple'])
+            plan.pop('ui_baseline')
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('必须含 ui_baseline' in error for error in result['errors']))
+
+            plan['kb']['source_required'] = True
+            plan['kb']['tools_used'].append('search_symbol')
+            plan['kb']['findings'].append({
+                'entity': '测试源码锚点', 'state': '已证实',
+                'source_tool': 'search_symbol', 'source_type': 'code',
+                'conclusion': '源码中存在测试保存入口',
+                'evidence': '测试源码锚点',
+                'boundary': '仅证明受控仓库源码，不代表现场已部署。',
+            })
+            plan['ui_baseline'] = {
+                'sources': [
+                    {'type': 'code-graph', 'ref': 'kb:0'},
+                    {'type': 'source-code', 'ref': 'kb:1'},
+                ]
+            }
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('至少覆盖两类独立证据' in error for error in result['errors']))
+
+    def test_current_ui_auto_allows_runtime_plus_code_without_wiki(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_current_analysis_plan(
+                directory, ['existing-ui-simple'])
+            self.assertNotIn('wiki', plan)
+            self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
+    def resolved_knowledge_route(self):
+        return resolved_knowledge_route()
 
     def make_manual_plan(self, directory, gaps):
         plan, plan_path, _ = self.write_analysis_plan(directory, ['existing-ui-simple'])
@@ -1224,6 +1423,41 @@ class PipelinePlanTests(unittest.TestCase):
                 self.assertFalse(result['ok'], category)
                 self.assertIn(f'分析类别 {category} 缺少非空维度“{missing}”', result['errors'])
 
+    def test_concise_v3_requires_single_menu_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, artifact_path = self.write_current_analysis_plan(
+                directory, ['existing-ui-simple'])
+            with open(artifact_path, 'r', encoding='utf-8') as f:
+                original = f.read()
+
+            without_menu = original.replace('- **菜单路径**：业务管理 > 测试功能\n', '')
+            with open(artifact_path, 'w', encoding='utf-8') as f:
+                f.write(without_menu)
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertIn(
+                'concise-v3 分析者描述必须且只能包含一个非空“菜单路径”',
+                result['errors'])
+
+            no_menu_entry = original.replace(
+                '- **菜单路径**：业务管理 > 测试功能',
+                '- **菜单路径**：无菜单入口：由第三方接口回调触发')
+            with open(artifact_path, 'w', encoding='utf-8') as f:
+                f.write(no_menu_entry)
+            self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
+            duplicate_menu = original.replace(
+                '- **菜单路径**：业务管理 > 测试功能\n',
+                '- **菜单路径**：业务管理 > 测试功能\n'
+                '- **菜单路径**：重复菜单\n')
+            with open(artifact_path, 'w', encoding='utf-8') as f:
+                f.write(duplicate_menu)
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertIn(
+                'concise-v3 分析者描述必须且只能包含一个非空“菜单路径”',
+                result['errors'])
+
     def test_concise_v3_rejects_public_metadata_and_decision_summaries(self):
         forbidden = {
             '需求类别': '`existing-ui-simple`',
@@ -1515,15 +1749,32 @@ class PipelinePlanTests(unittest.TestCase):
         plan_path = os.path.join(tempfile.gettempdir(), 'plan.json')
         # inline qc-followup：无需磁盘文件即可通过
         self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
-        # 问题数量硬上限：超过 3 项必须先合并/收敛
+        plan['confirmation_policy'] = pipeline.SINGLE_CONFIRMATION_POLICY
+        plan['knowledge_route'] = self.resolved_knowledge_route()
+        plan['kb'] = {'ready': False, 'source_ready': False, 'source_required': False,
+                      'database_ready': False, 'tools_used': [], 'findings': []}
+        # 普通需求仍目标 1-3 个主题；复杂需求允许最多 5 个主题。
+        decision_ids = ['q-scope', 'q-value-rule', 'q-business-rule',
+                        'q-permission-exception', 'q-acceptance']
         plan['checklist']['items'] = [
-            {'id': f'q{index}', 'question': f'问题 {index}?',
+            {'id': decision_id, 'question': f'问题 {index}?',
              'options': ['口径 A', '口径 B'], 'allow_other': True}
-            for index in range(1, 5)
+            for index, decision_id in enumerate(decision_ids, start=1)
         ]
+        self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+        plan['checklist']['items'].append(
+            {'id': 'q-extra', 'question': '问题 6?',
+             'options': ['口径 A', '口径 B'], 'allow_other': True})
         result = pipeline.validate_plan(plan, plan_path)
         self.assertFalse(result['ok'])
-        self.assertIn('checklist.items 最多 3 项', result['errors'][0])
+        self.assertIn('checklist.items 最多 5 项', result['errors'][0])
+        plan['checklist']['items'] = [{
+            'id': 'q1', 'question': '范围是什么?',
+            'options': ['全部'], 'allow_other': True,
+        }]
+        result = pipeline.validate_plan(plan, plan_path)
+        self.assertFalse(result['ok'])
+        self.assertTrue(any('语义稳定 ID' in error for error in result['errors']))
         # 缺 checklist.items → 不通过
         plan['checklist'] = {'responsible': '产品'}
         self.assertFalse(pipeline.validate_plan(plan, plan_path)['ok'])
@@ -1607,6 +1858,112 @@ class PipelinePlanTests(unittest.TestCase):
             self.assertIn(
                 'tfs_requirements.ready=true 时 tools_used 必须包含 get_requirements_summary',
                 result['errors'])
+
+    def test_current_non_skip_plan_requires_resolved_product_route(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_current_analysis_plan(
+                directory, ['existing-ui-simple'])
+            plan.pop('kb')
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('必须含 kb 对象' in error for error in result['errors']))
+
+            plan, plan_path, _ = self.write_current_analysis_plan(
+                directory, ['existing-ui-simple'])
+            plan.pop('knowledge_route')
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('必须含 knowledge_route' in error for error in result['errors']))
+
+            plan['knowledge_route'] = {
+                'status': 'PROFILE_MISSING', 'area': 'OTHER', 'servers': {},
+            }
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('不得声明就绪' in error for error in result['errors']))
+            self.assertTrue(any('AUTO-ANA 要求 knowledge_route.status=RESOLVED' in error
+                                for error in result['errors']))
+
+    def test_current_source_verification_contract_and_auto_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_current_analysis_plan(
+                directory, ['existing-ui-simple'])
+            self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
+            plan['kb']['source_required'] = True
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('必须实际调用' in error for error in result['errors']))
+
+            plan['kb']['tools_used'].append('search_symbol')
+            plan['kb']['findings'].append({
+                'entity': 'repo-a:src/Service.java#save',
+                'state': '候选',
+                'source_tool': 'search_symbol',
+                'source_type': 'code',
+                'conclusion': '源码中存在保存入口候选',
+                'evidence': 'repo-a:src/Service.java#save',
+                'boundary': '尚未核验方法体，不能证明目标规则已经实现。',
+            })
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('state=已证实 源码 finding' in error for error in result['errors']))
+
+            plan['kb']['findings'][-1]['state'] = '已证实'
+            self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
+            plan['kb']['findings'][-1]['source_type'] = 'database'
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('源码 MCP finding' in error for error in result['errors']))
+
+    def test_current_findings_require_human_evidence_fields_and_separate_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_current_analysis_plan(
+                directory, ['existing-ui-simple'])
+            plan['kb']['findings'][0].pop('conclusion')
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('conclusion 必须为非空字符串' in error
+                                for error in result['errors']))
+
+            plan['kb']['findings'][0]['conclusion'] = '已定位现有测试入口'
+            plan['kb']['findings'][0]['source_tool'] = 'get_work_item'
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('必须改写到 tfs_requirements.findings' in error
+                                for error in result['errors']))
+
+    def test_unresolved_route_forbids_cross_product_mcp_evidence(self):
+        run_id = 'run_12345678'
+        plan = {
+            'version': 2, 'run_id': run_id, 'skill': 'auto-req-analysis',
+            'work_item_id': 1, 'expected_rev': 5, 'expected_state': '活动',
+            'verdict': 'NEED-REVIEW', 'tags': ['PM-AI-QC-NEED-REVIEW'],
+            'state_to': None, 'rules_source': {'qc': 'pre-qc-v1'},
+            'confirmation_policy': pipeline.SINGLE_CONFIRMATION_POLICY,
+            'knowledge_route': {'status': 'AREA_UNMAPPED', 'area': 'UNKNOWN', 'servers': {}},
+            'kb': {'ready': False, 'source_ready': False, 'source_required': False,
+                   'database_ready': False, 'tools_used': ['query'],
+                   'findings': [{'entity': 'other-product', 'state': '候选',
+                                 'source_tool': 'query', 'source_type': 'code',
+                                 'conclusion': '其它产品存在候选实现',
+                                 'evidence': 'other-product',
+                                 'boundary': '不得作为当前产品证据'}]},
+            'checklist': {
+                'work_item': '1 测试需求', 'verdict': 'NEED-REVIEW',
+                'tag': 'PM-AI-QC-NEED-REVIEW', 'responsible': '产品',
+                'generated_at_utc': '2026-08-10T00:00:00Z', 'next': '补充后重跑',
+                'items': [{'id': 'q-scope', 'question': '产品范围是什么？',
+                           'options': ['当前产品'], 'allow_other': True}],
+            },
+            'artifacts': [{'kind': 'qc-followup',
+                           'filename': f'待补充信息_1_{run_id}.json'}],
+        }
+        result = pipeline.validate_plan(plan, os.path.join(tempfile.gettempdir(), 'plan.json'))
+        self.assertFalse(result['ok'])
+        self.assertTrue(any('不得声明就绪、调用工具或携带 finding' in error
+                            for error in result['errors']))
 
     def test_plan_rejects_unsafe_artifact_and_duplicate_tags(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1866,6 +2223,45 @@ class PipelinePlanTests(unittest.TestCase):
             })
             self.assertFalse(pipeline.validate_plan(plan, plan_path)['ok'])
 
+    def test_single_confirmation_policy_rejects_analysis_business_gaps(self):
+        gap = {
+            'id': 'gap-amount-scope', 'topic': '金额范围', 'missing': '两类金额的取值范围',
+            'impact': '无法确定校验边界', 'question': '两类金额是否均限定当前结算范围？',
+            'options': ['均限定当前结算范围'], 'allow_other': True,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_current_analysis_plan(
+                directory, ['existing-ui-simple'])
+            plan.update({
+                'verdict': 'MANUAL-REVIEW',
+                'tags': ['PM-AI-MANUAL-REVIEW'],
+                'state_to': None,
+                'analysis_gaps': [gap],
+            })
+            plan.pop('auto_scopes')
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('单次集中确认策略要求分析计划 analysis_gaps=[]' in error
+                                for error in result['errors']))
+
+            plan['analysis_gaps'] = []
+            self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
+            plan['kb'].pop('database_ready')
+            plan['kb']['findings'][0].pop('source_type')
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('kb.database_ready' in error for error in result['errors']))
+            self.assertTrue(any('source_type 必须为 code 或 database' in error
+                                for error in result['errors']))
+            plan['kb']['database_ready'] = False
+            plan['kb']['findings'][0]['source_type'] = 'code'
+
+            plan['confirmation_policy'] = 'unknown-policy'
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('confirmation_policy 仅允许' in error for error in result['errors']))
+
     def test_apply_manual_stop_without_gaps_keeps_automatic_tag_flow(self):
         with tempfile.TemporaryDirectory() as directory:
             plan, plan_path = self.make_manual_plan(directory, [])
@@ -2062,17 +2458,19 @@ class PipelinePlanTests(unittest.TestCase):
         content = '\n'.join([
             '# 变更方案',
             '## 三、分析者描述',
+            '- **菜单路径**：费用管理 > 费用录入',
             '### existing-ui-simple（既有功能简单界面优化）',
             '- **界面优化方案**：费用录入页保存后显示“A <script>alert(1)</script>”，不改变数据写入。',
             '## 四、范围—方案—验收追踪',
         ])
         rendered = pipeline.render_analysis_description_html(content, 'concise-v3')
+        self.assertIn('<strong>菜单路径：</strong>费用管理 &gt; 费用录入', rendered)
         self.assertIn('<strong>界面优化方案：</strong>', rendered)
         self.assertIn('&lt;script&gt;alert(1)&lt;/script&gt;', rendered)
         self.assertNotIn('existing-ui-simple', rendered)
         self.assertNotIn('既有功能简单界面优化', rendered)
         self.assertNotIn('需求类别', rendered)
-        self.assertNotIn('路径：', rendered)
+        self.assertNotIn('操作路径', rendered)
         self.assertNotIn('决策结论', rendered)
 
         invalid = content.replace(
@@ -2598,17 +2996,42 @@ class RedisClientTests(unittest.TestCase):
             'work_item_id': 1, 'run_id': 'run_auto_1234', 'verdict': 'AUTO-ANA',
             'tags': ['PM-AI-AUTO-ANA'], 'state_to': '已分析',
             'generated_at_utc': '2026-08-04T00:00:00Z',
-            'kb': {'ready': True, 'tools_used': ['query', 'context'], 'dedup_ran': True,
+            'knowledge_route': resolved_knowledge_route(),
+            'kb': {'ready': True, 'source_ready': True, 'source_required': True,
+                   'database_ready': True,
+                   'tools_used': ['query', 'context', 'search_symbol', 'get_table_knowledge'],
+                   'dedup_ran': True,
                    'findings': [{'entity': '初核=医嘱校对 adviceProofread', 'state': '已证实',
-                                 'source_tool': 'query+context', 'note': '冗长备注应丢弃'}],
+                                 'source_tool': 'query+context', 'source_type': 'code',
+                                 'conclusion': '已定位医嘱校对的现有实现入口',
+                                 'evidence': '初核=医嘱校对 adviceProofread 调用链',
+                                 'boundary': '只证明代码图谱关系，不代表现场已部署。',
+                                 'note': '冗长备注应丢弃'},
+                                {'entity': 'batwce:Service.java#save', 'state': '已证实',
+                                 'source_tool': 'search_symbol', 'source_type': 'code',
+                                 'conclusion': '源码中存在医嘱保存入口',
+                                 'evidence': 'batwce:Service.java#save',
+                                 'boundary': '只证明受控仓库源码，不代表现场部署版本。'},
+                                {'entity': 'HIS.dbo.ZY_ADVICE.ADVICE_TYPE', 'state': '已证实',
+                                 'source_tool': 'get_table_knowledge',
+                                 'source_type': 'database',
+                                 'conclusion': '医嘱类型由 ADVICE_TYPE 字段承载',
+                                 'evidence': 'HIS.dbo.ZY_ADVICE.ADVICE_TYPE',
+                                 'boundary': '只证明知识图谱命中的字段结构。'}],
                    'note': '代码图谱就绪'},
             'wiki': {'ready': True, 'modules_matched': ['住院护士站'],
                      'findings': [{'entity': '初核业务规则', 'state': 'wiki-确认',
-                                   'source': 'wiki/topics/住院.md'}]},
+                                   'source': 'wiki/topics/住院.md',
+                                   'conclusion': '初核属于住院医嘱校对业务',
+                                   'evidence': 'wiki/topics/住院.md 初核业务规则',
+                                   'boundary': 'Wiki 说明业务语义，不替代实现核验。'}]},
             'tfs_requirements': {'ready': True, 'coverage': {'collection': 'x'},
                                  'findings': [{'work_item_id': 260001, 'fact': '既有出院带药提示',
                                                'state': '已证实', 'maturity': '已落地',
-                                               'source_tool': 'get_work_item'}]},
+                                               'source_tool': 'get_work_item',
+                                               'conclusion': '历史需求曾建设出院带药提示',
+                                               'evidence': 'TFS 260001 完整正文与验收记录',
+                                               'boundary': '只证明历史记录，不代表当前版本仍已部署。'}]},
         }
         html = '<div><br></div><div>核心改造点：xxx</div><div><br></div>'
         with mock.patch.object(redis_client, '_Connection', return_value=Connection()), \
@@ -2622,22 +3045,23 @@ class RedisClientTests(unittest.TestCase):
         self.assertEqual(fields['work_item'], '1 医嘱校对-出院带药强提示')
         # 分析者描述：与写入 TFS 的 HTML 同源同值
         self.assertEqual(fields['analysis_description'], html)
-        # knowledge：三类来源精简投影，仅留定位 + 作用字段
+        # knowledge：只保留人读总览、来源状态与佐证清单；机器明细留在计划/审计
         knowledge = json.loads(fields['knowledge'])
-        self.assertEqual(set(knowledge), {'code_graph', 'wiki', 'history'})
-        self.assertEqual(knowledge['code_graph']['tools'], ['query', 'context'])
-        self.assertEqual(knowledge['code_graph']['findings'], [
-            {'entity': '初核=医嘱校对 adviceProofread', 'state': '已证实',
-             'source_tool': 'query+context'}])
-        self.assertNotIn('note', knowledge['code_graph'])
-        self.assertNotIn('dedup_ran', knowledge['code_graph'])
-        self.assertEqual(knowledge['wiki']['modules'], ['住院护士站'])
-        self.assertEqual(knowledge['wiki']['findings'], [
-            {'entity': '初核业务规则', 'state': 'wiki-确认', 'source': 'wiki/topics/住院.md'}])
-        self.assertEqual(knowledge['history']['findings'], [
-            {'work_item_id': 260001, 'fact': '既有出院带药提示',
-             'state': '已证实', 'maturity': '已落地'}])
-        self.assertNotIn('coverage', knowledge['history'])
+        self.assertEqual(set(knowledge), {'summary', 'source_status', 'evidence_list'})
+        self.assertEqual(knowledge['summary'], {'text': '云HIS 5.6：5 条已确认'})
+        self.assertEqual(knowledge['source_status'], {
+            '历史需求': '已命中（1 条）',
+            '产品 Wiki': '已命中（1 条）',
+            '代码图谱': '已命中（1 条）',
+            '源码': '已命中（1 条）',
+            '数据库知识': '已命中（1 条）',
+        })
+        self.assertEqual(knowledge['evidence_list'][0], {
+            'source': '代码图谱', 'status': '已证实',
+            'conclusion': '已定位医嘱校对的现有实现入口',
+            'evidence': '初核=医嘱校对 adviceProofread 调用链',
+            'boundary': '只证明代码图谱关系，不代表现场已部署。'})
+        self.assertEqual(knowledge['evidence_list'][-1]['maturity'], '已落地')
         # 原计划对象未被原地修改
         self.assertIn('note', plan['kb'])
 
@@ -2659,36 +3083,128 @@ class RedisClientTests(unittest.TestCase):
         self.assertNotIn('analysis_description', qc_fields)
 
     def test_knowledge_summary_helper(self):
-        # 三类来源缺失或为空 dict → {}
+        # 四类来源缺失或为空 dict → {}
         self.assertEqual(redis_client._knowledge_summary({}), {})
         self.assertEqual(redis_client._knowledge_summary({'kb': {}, 'wiki': {}, 'tfs_requirements': {}}), {})
+        self.assertEqual(redis_client._human_source_status(True, [], used=True),
+                         '已查询，无可展示佐证')
+        self.assertEqual(redis_client._human_source_status(False, [], required=True),
+                         '需核验但未就绪')
         plan = {
-            'kb': {'ready': True, 'tools_used': ['query'], 'dedup_ran': True,
+            'knowledge_route': resolved_knowledge_route(),
+            'kb': {'ready': True, 'source_ready': True, 'source_required': True,
+                   'database_ready': False,
+                   'tools_used': ['query', 'search_symbol', 'search_knowledge'], 'dedup_ran': True,
                    'findings': [{'entity': 'e1', 'state': '已证实', 'source_tool': 'query',
-                                 'note': 'drop'}], 'note': 'drop'},
+                                 'source_type': 'code',
+                                 'conclusion': '已定位保存入口',
+                                 'evidence': '代码图谱调用链 e1',
+                                 'boundary': '仅证明代码图谱关系。', 'note': 'drop'},
+                                {'entity': 'repo:src/A.java#save', 'state': '候选',
+                                 'source_tool': 'search_symbol', 'source_type': 'code'},
+                                {'entity': 'table_a.column_b', 'state': '未确认',
+                                 'source_tool': 'search_knowledge',
+                                 'source_type': 'database'}], 'note': 'drop'},
             'wiki': {'ready': False, 'modules_matched': ['m1'],
                      'findings': [{'entity': 'e2', 'state': 'wiki-冲突', 'source': 'p.md'}]},
             'tfs_requirements': {'ready': True, 'coverage': {'collection': 'x'},
                                  'findings': [{'work_item_id': 9, 'fact': 'f', 'state': '候选',
                                                'maturity': '', 'source_tool': 'search_requirements'}]},
+            'evidence_acquisition': {
+                'gitnexus': {'coverage_status': 'PARTIAL', 'query_status': 'HIT'},
+                'db_knowledge': {'availability': 'READY', 'coverage_status': 'UNKNOWN',
+                                 'query_status': 'HIT'},
+            },
         }
         summary = redis_client._knowledge_summary(plan)
-        self.assertEqual(set(summary), {'code_graph', 'wiki', 'history'})
-        self.assertEqual(summary['code_graph']['tools'], ['query'])
-        self.assertEqual(summary['code_graph']['findings'], [
-            {'entity': 'e1', 'state': '已证实', 'source_tool': 'query'}])
-        self.assertNotIn('dedup_ran', summary['code_graph'])
-        self.assertNotIn('note', summary['code_graph'])
-        self.assertEqual(summary['wiki']['modules'], ['m1'])
-        self.assertEqual(summary['wiki']['findings'], [
-            {'entity': 'e2', 'state': 'wiki-冲突', 'source': 'p.md'}])
-        self.assertNotIn('coverage', summary['history'])
-        self.assertEqual(summary['history']['findings'], [
-            {'work_item_id': 9, 'fact': 'f', 'state': '候选', 'maturity': ''}])
-        # 存在但 findings 为空：仍报来源键（ready/tools 有用），findings=[]
+        self.assertEqual(set(summary), {'summary', 'source_status', 'evidence_list'})
+        self.assertEqual(summary['summary']['text'], '云HIS 5.6：1 条已确认，4 条待核实')
+        self.assertEqual(summary['summary']['coverage'], [
+            '数据库知识：未就绪，本轮无完整数据库佐证。',
+            '产品 Wiki：未就绪或未覆盖，本轮 Wiki 佐证受限。',
+        ])
+        self.assertEqual(summary['source_status'], {
+            '历史需求': '已命中（1 条）',
+            '产品 Wiki': '已命中（1 条），但来源未就绪',
+            '代码图谱': '已命中（1 条）',
+            '源码': '已命中（1 条）',
+            '数据库知识': '已命中（1 条），但来源未就绪',
+        })
+        self.assertEqual(summary['evidence_list'][0]['conclusion'], '已定位保存入口')
+        self.assertNotIn('id', summary['evidence_list'][0])
+        # 核心代码图谱未就绪时，只保留简短覆盖提示。
         self.assertEqual(
             redis_client._knowledge_summary({'kb': {'ready': False, 'tools_used': [], 'findings': []}}),
-            {'code_graph': {'ready': False, 'tools': [], 'findings': []}})
+            {'summary': {'text': '当前需求：暂无可展示佐证',
+                         'coverage': ['代码图谱：未就绪，本轮无完整代码图谱佐证。']},
+             'source_status': {
+                 '历史需求': '本轮未使用',
+                 '产品 Wiki': '本轮未使用',
+                 '代码图谱': '未就绪',
+                 '源码': '本轮未使用',
+                 '数据库知识': '本轮未使用',
+             },
+             'evidence_list': []})
+
+        # 历史计划没有 source_type 时，仍按数据库工具名自动拆分。
+        legacy = redis_client._knowledge_summary({
+            'kb': {'ready': True, 'tools_used': ['context', 'get_table_knowledge'],
+                   'findings': [
+                       {'entity': 'Service.save', 'state': '已证实', 'source_tool': 'context'},
+                       {'entity': 'TABLE_A.COL_B', 'state': '候选',
+                        'source_tool': 'get_table_knowledge'},
+                   ]}
+        })
+        self.assertEqual([f['conclusion'] for f in legacy['evidence_list']],
+                         ['Service.save', 'TABLE_A.COL_B'])
+        self.assertEqual([f['source'] for f in legacy['evidence_list']],
+                         ['代码图谱', '数据库知识'])
+
+        # 历史需求工具即使误写在旧 kb 中，也不能显示为代码图谱佐证。
+        mixed_legacy = redis_client._knowledge_summary({
+            'kb': {'ready': True, 'tools_used': ['query', 'get_work_item'],
+                   'findings': [
+                       {'entity': 'Service.query', 'state': '已证实', 'source_tool': 'query'},
+                       {'entity': '需求97743-住院病人卡片费用信息', 'state': '已证实',
+                        'source_tool': 'get_work_item'},
+                   ]}
+        })
+        self.assertEqual(mixed_legacy['evidence_list'][0]['conclusion'], 'Service.query')
+        self.assertEqual(mixed_legacy['evidence_list'][1]['source'], '历史需求')
+
+        # 仅声明可选来源未就绪、但本轮未查询/未依赖时，不制造覆盖提示。
+        optional_sources = redis_client._knowledge_summary({
+            'knowledge_route': resolved_knowledge_route(),
+            'kb': {'ready': True, 'source_ready': True, 'source_required': False,
+                   'database_ready': False, 'tools_used': ['query', 'context'],
+                   'findings': [
+                       {'entity': 'YpqlServiceImpl.getQllsDtoList', 'state': '已证实',
+                        'source_tool': 'context', 'source_type': 'code'},
+                       {'entity': 'YpbsServiceImpl.getWmBsmxList', 'state': '已证实',
+                        'source_tool': 'context', 'source_type': 'code'},
+                       {'entity': 'YpbyServiceImpl.getWmBymxList', 'state': '已证实',
+                        'source_tool': 'context', 'source_type': 'code'},
+                       {'entity': 'ReportMapper.xml', 'state': '候选',
+                        'source_tool': 'query', 'source_type': 'code'},
+                   ]},
+            'wiki': {'ready': False, 'modules_matched': [], 'findings': []},
+            'tfs_requirements': {'ready': True, 'findings': []},
+        })
+        self.assertEqual(optional_sources['summary'],
+                         {'text': '云HIS 5.6：3 条已确认，1 条待核实'})
+        self.assertNotIn('coverage', optional_sources['summary'])
+        self.assertEqual(set(optional_sources), {'summary', 'source_status', 'evidence_list'})
+        self.assertEqual(optional_sources['source_status'], {
+            '历史需求': '本轮未使用',
+            '产品 Wiki': '未就绪',
+            '代码图谱': '已命中（4 条）',
+            '源码': '本轮未使用',
+            '数据库知识': '未就绪',
+        })
+        self.assertEqual(len(optional_sources['evidence_list']), 4)
+        self.assertTrue(all(set(finding) == {
+            'source', 'status', 'conclusion', 'evidence', 'boundary'}
+                            for finding in optional_sources['evidence_list']))
 
     def test_publish_skip_analysis_exposes_reason_and_removes_question_fields(self):
         commands = []
@@ -2849,7 +3365,7 @@ class RedisClientTests(unittest.TestCase):
             self.assertIn('PM-AI-AUTO-ANA', data['tags'])
             self.assertEqual(data['work_item'], f'{wid} 医嘱校对-出院带药强提示（测试）')
             self.assertEqual(data['analysis_description'], html)
-            # 新字段：knowledge 三类来源「定位 + 作用」精简投影
+            # knowledge 按实际存在的来源投影；本用例没有数据库发现，所以不出现 database。
             knowledge = json.loads(data['knowledge'])
             self.assertEqual(set(knowledge), {'code_graph', 'wiki', 'history'})
             self.assertEqual(knowledge['code_graph']['tools'], ['query', 'context'])

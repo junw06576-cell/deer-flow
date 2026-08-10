@@ -108,6 +108,24 @@
           "数据模型"
         ]
       }
+    },
+    "cloudhis-source": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.192:4752/mcp",
+      "headers": {},
+      "description": "CloudHIS源码 — 源码搜索、类/方法/控制器路由/MyBatis映射符号定位",
+      "routing": {
+        "mode": "prefer",
+        "priority": 65,
+        "keywords": [
+          "源码",
+          "代码定位",
+          "方法实现",
+          "控制器",
+          "MyBatis映射"
+        ]
+      }
     }
   },
   "skills": {}

@@ -1,6 +1,6 @@
 # 需求分析待确认项模板
 
-> 仅在 `analysis_gaps` 非空时生成。文件名必须为 `待确认清单_<id>_<run_id>.md`，并作为执行计划中的 `manual-followup` artifact。
+> **仅用于历史计划回放兼容。** 新计划固定 `confirmation_policy=qc-single-batch-v1`，PM 可回答的业务缺口全部在 QC checklist 一次性确认，分析计划 `analysis_gaps=[]`，不得生成本附件。历史 `analysis_gaps` 非空计划仍按本模板校验。
 
 ```markdown
 # 需求分析待确认项 · TFS <id> <标题>
