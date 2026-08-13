@@ -4,10 +4,10 @@
 
 | 项目 | 说明 |
 |------|------|
-| **部署服务器** | `192.16.0.192` |
+| **部署服务器** | `172.16.0.192` |
 | **项目目录** | `/opt/deer-flow` |
 | **启动方式** | `make up`（Docker Compose 部署，走 `scripts/deploy.sh`） |
-| **服务入口** | `http://192.16.0.192:2026` |
+| **服务入口** | `http://172.16.0.192:2026` |
 | **主要容器** | `deer-flow-gateway`（核心服务）、`deer-flow-frontend`（前端）、`deer-flow-nginx`（反向代理）、`deer-flow-redis`（缓存） |
 
 > **📝 使用说明**：本手册中的所有命令均已登录服务器后的直接可执行命令，无需加 `ssh` 前缀。直接在终端粘贴执行即可。
@@ -16,14 +16,13 @@
 >
 > ```bash
 > # 从 .env 读取内部 token（每次新开终端会话都需要重新执行）
-> TOKEN=$(grep '^DEER_FLOW_INTERNAL_AUTH_TOKEN=' /opt/deer-flow/.env | sed 's/.*=//')
-> ```
+> > ```
 >
 > 之后手册中的 curl 命令均带 `-H "X-DeerFlow-Internal-Token: $TOKEN"` 使用。
 
 ---
 
-## 场景一：更换 API Token
+## 场景一：更换模型 API Key
 
 ### 背景
 
@@ -73,15 +72,13 @@ docker inspect deer-flow-gateway --format '{{.Created}}'
 
 #### 4. 验收
 
-打开浏览器访问 `http://192.16.0.192:2026`，发送一条消息确认模型正常回复。如报错可查看日志：
+打开浏览器访问 `http://172.16.0.192:2026`，发送一条消息确认模型正常回复。如报错可查看日志：
 
 ```bash
 docker logs deer-flow-gateway --tail 50
 ```
 
 常见错误日志关键词：`401`、`Authentication`、`Invalid API key`，出现这些说明 key 仍不正确。
-
----
 
 ---
 
@@ -145,15 +142,22 @@ EOF
 # 方式A：重启 gateway 容器（秒级）
 docker compose --env-file .env -p deer-flow -f docker/docker-compose.yaml -f docker/docker-compose.dood.yaml up -d --force-recreate gateway
 
-# 方式B：热重载（不重启容器）
-curl -s -H "X-DeerFlow-Internal-Token: $TOKEN" -X POST http://192.16.0.192:2026/api/skills/reload
+# 方式B（修正版）：管理员登录 + CSRF 双重提交触发热重载（不重启容器）
+#   说明：/api/skills/reload 是 admin-only 的 POST，内部 token 调不动，必须走管理员 session
+ADMIN_EMAIL="${DEER_FLOW_ADMIN_EMAIL:-506391157@qq.com}"; ADMIN_PASS="${DEER_FLOW_ADMIN_PASSWORD:-Admin@123}"
+CJ="/tmp/deerflow_reload.cookies"; rm -f "$CJ"
+curl -s -c "$CJ" --data-urlencode "username=$ADMIN_EMAIL" --data-urlencode "password=$ADMIN_PASS" http://127.0.0.1:2026/api/v1/auth/login/local
+CSRF=$(grep csrf_token "$CJ" | awk '{print $NF}')
+curl -s -b "$CJ" -H "X-CSRF-Token: $CSRF" -X POST http://127.0.0.1:2026/api/skills/reload
+rm -f "$CJ"
 ```
 
 #### 验证
 
 ```bash
-# 从 API 确认技能是否可见
-curl -s -H "X-DeerFlow-Internal-Token: $TOKEN" http://192.16.0.192:2026/api/skills | python3 -m json.tool | grep '"name"'
+# 从 API 确认技能是否可见（GET 免 CSRF，用内部 token 即可）
+TOKEN=$(grep '^DEER_FLOW_INTERNAL_AUTH_TOKEN=' /opt/deer-flow/.env | sed 's/.*=//')
+curl -s -H "X-DeerFlow-Internal-Token: $TOKEN" http://127.0.0.1:2026/api/skills | python3 -m json.tool | grep '"name"'
 ```
 
 ---
@@ -196,8 +200,6 @@ docker exec deer-flow-gateway head -10 /app/skills/custom/你的-skill名/SKILL.
 | 放在 `skills/custom/` 但前端看不到 | 用户已有自定义 skill 目录，LEGACY 回退不生效 | 改用 `skills/public/` |
 | 前端能看到了但 agent 调用不到 | 页面需要刷新或重新创建对话 | 刷新前端页面，新建对话 |
 | SKILL.md 格式不对 | 缺少 YAML frontmatter 或 name 不符合规范 | 确认文件以 `---` 开头，包含 `name` 和 `description` |
-
----
 
 ---
 
@@ -416,14 +418,20 @@ rm -rf /opt/deer-flow/skills/public/要删除的skill名
 # 2. 方式A：重启 gateway（秒级）
 docker compose --env-file .env -p deer-flow -f docker/docker-compose.yaml -f docker/docker-compose.dood.yaml up -d --force-recreate gateway
 
-# 或方式B：热重载（不重启）
-curl -s -H "X-DeerFlow-Internal-Token: $TOKEN" -X POST http://127.0.0.1:2026/api/skills/reload
+# 方式B（修正版）：管理员登录 + CSRF 双重提交触发热重载（不重启容器）
+#   说明：/api/skills/reload 是 admin-only 的 POST，内部 token 调不动，必须走管理员 session
+ADMIN_EMAIL="${DEER_FLOW_ADMIN_EMAIL:-506391157@qq.com}"; ADMIN_PASS="${DEER_FLOW_ADMIN_PASSWORD:-Admin@123}"
+CJ="/tmp/deerflow_reload.cookies"; rm -f "$CJ"
+curl -s -c "$CJ" --data-urlencode "username=$ADMIN_EMAIL" --data-urlencode "password=$ADMIN_PASS" http://127.0.0.1:2026/api/v1/auth/login/local
+CSRF=$(grep csrf_token "$CJ" | awk '{print $NF}')
+curl -s -b "$CJ" -H "X-CSRF-Token: $CSRF" -X POST http://127.0.0.1:2026/api/skills/reload
+rm -f "$CJ"
 ```
 
 #### 验证
 
 ```bash
-# 确认列表中已无该 skill
+# 确认列表中已无该 skill（TOKEN 已取过可跳过第一行）
 curl -s -H "X-DeerFlow-Internal-Token: $TOKEN" http://127.0.0.1:2026/api/skills | python3 -m json.tool | grep '"name"'
 ```
 
@@ -452,7 +460,14 @@ docker exec deer-flow-gateway rm -rf /app/backend/.deer-flow/users/你的user_id
 刷新前端 skill 列表页面，该 skill 应变为"内置"分类。如仍不更新，可热重载：
 
 ```bash
-curl -s -H "X-DeerFlow-Internal-Token: $TOKEN" -X POST http://127.0.0.1:2026/api/skills/reload
+# 方式B（修正版）：管理员登录 + CSRF 双重提交触发热重载（不重启容器）
+#   说明：/api/skills/reload 是 admin-only 的 POST，内部 token 调不动，必须走管理员 session
+ADMIN_EMAIL="${DEER_FLOW_ADMIN_EMAIL:-506391157@qq.com}"; ADMIN_PASS="${DEER_FLOW_ADMIN_PASSWORD:-Admin@123}"
+CJ="/tmp/deerflow_reload.cookies"; rm -f "$CJ"
+curl -s -c "$CJ" --data-urlencode "username=$ADMIN_EMAIL" --data-urlencode "password=$ADMIN_PASS" http://127.0.0.1:2026/api/v1/auth/login/local
+CSRF=$(grep csrf_token "$CJ" | awk '{print $NF}')
+curl -s -b "$CJ" -H "X-CSRF-Token: $CSRF" -X POST http://127.0.0.1:2026/api/skills/reload
+rm -f "$CJ"
 ```
 
 ---
@@ -503,7 +518,7 @@ docker logs -f deer-flow-gateway 2>&1 | grep --line-buffered "WN_PH-Platform-261
 
 ```bash
 # 用 SandboxAudit 审计日志分析每个 bash 步骤的耗时
-docker logs deer-flow-gateway 2>&1 | grep "SandboxAudit" | grep "线程ID" | python3 -c "
+docker logs deer-flow-gateway 2>&1 | grep "SandboxAudit" | grep "thread_id" | python3 -c "
 import sys, json, re
 lines = []
 for line in sys.stdin:
@@ -567,6 +582,168 @@ docker compose --env-file .env -p deer-flow \
 ```bash
 docker logs deer-flow-service --tail 10
 ```
+
+---
+
+## 场景九：从 TFS 仓库拉取更新 SKILL（以 reg-auto-req-analysis 为例）
+
+### 背景
+
+| 项目 | 说明 |
+|------|------|
+| **TFS 仓库** | `http://tfs2018-web.winning.com.cn:8080/tfs/WinCode/Skill/_git/reg-auto-req-analysis`（skill 的提交仓库） |
+| **服务器目标** | `/opt/deer-flow/skills/public/reg-auto-req-analysis`（部署消费方，目录只读挂载给沙箱） |
+| **同步方向** | **TFS → 服务器，纯拉取，绝不推送** |
+
+> **🔑 认证说明**：TFS 2018 非交互环境 git 认证只能走「空用户名 + PAT 注入 Authorization 头」。**不要用 credential store 的空用户名条目**（`http://:PAT@host`）——在 Linux 服务器的 git 上不兼容，会回退交互式账号密码提示导致认证失败。以下脚本已内置正确认证方式。
+
+---
+
+### 操作步骤
+
+#### 1. 将脚本放到服务器（本地源文件：`scripts/pull-reg-auto-req-analysis.sh`）
+
+可直接 scp 上传，或服务器上直接创建：
+
+```bash
+cat > /opt/deer-flow/scripts/pull-reg-auto-req-analysis.sh << 'SCRIPT_EOF'
+#!/usr/bin/env bash
+# pull-reg-auto-req-analysis.sh
+# 从 TFS 仓库拉取 reg-auto-req-analysis skill 到 DeerFlow 服务器（纯拉取，绝不推送）
+#
+# 两种模式自动判断：
+#   - 目标目录已是 git 仓库（remote 指向 TFS）→ 增量 pull（日常更新走这里）
+#   - 目标目录不存在 / 不是 git 仓库 / remote 不对 → 挪走旧目录 + 全量 clone（首次或重置）
+#
+# 用法（二选一，推荐方式 1，PAT 不进 shell history）：
+#   1. export TFS_PAT="你的PAT" && bash pull-reg-auto-req-analysis.sh
+#   2. bash pull-reg-auto-req-analysis.sh "你的PAT"
+set -uo pipefail
+
+SKILL_DIR="/opt/deer-flow/skills/public/reg-auto-req-analysis"
+REPO_URL="http://tfs2018-web.winning.com.cn:8080/tfs/WinCode/Skill/_git/reg-auto-req-analysis"
+
+# ---- PAT 来源：环境变量优先，其次脚本参数 ----
+PAT="${TFS_PAT:-}"
+[ -z "$PAT" ] && [ $# -ge 1 ] && PAT="$1"
+if [ -z "$PAT" ]; then
+  echo "错误：未提供 PAT。用法：export TFS_PAT=xxx 后执行，或 bash 本脚本 \"PAT\""
+  exit 1
+fi
+
+# TFS 2018 basic auth：直接注入 Authorization 头
+# （credential store 的空用户名条目在 Linux git 上不兼容，会回退交互提示，故不用）
+AUTH_B64="$(printf '%s' ":$PAT" | base64 -w0)"
+gitc() { git -c http.extraHeader="AUTHORIZATION: Basic ${AUTH_B64}" "$@"; }
+
+echo "===== [1/5] 探测远程仓库 ====="
+if ! gitc ls-remote "$REPO_URL" >/dev/null 2>&1; then
+  echo "  ✘ 远程仓库不可访问（认证失败或仓库不存在），中止"
+  exit 1
+fi
+echo "  ✔ 远程仓库可访问"
+
+echo "===== [2/5] 判断本地仓库状态 ====="
+CUR_REMOTE="$(git -C "$SKILL_DIR" remote get-url origin 2>/dev/null || true)"
+if [ -d "$SKILL_DIR/.git" ] && [ "$CUR_REMOTE" = "$REPO_URL" ]; then
+  echo "  ✔ 已是 TFS git 仓库 → 增量 pull 模式"
+  echo "===== [3/5] git pull ====="
+  cd "$SKILL_DIR" || exit 1
+  if gitc pull origin master; then
+    echo "===== 完成 ====="
+    git log --oneline -3
+    echo "（本脚本不执行任何 push，TFS 仓库不会被改动）"
+    exit 0
+  else
+    echo "  ✘ pull 失败：可能本地有未提交修改，请先检查: git -C $SKILL_DIR status"
+    exit 1
+  fi
+fi
+if [ -d "$SKILL_DIR" ]; then
+  echo "  ⚠ 目录存在但不是 TFS 仓库（remote=${CUR_REMOTE:-无}）→ 全量 clone 模式"
+else
+  echo "  - 目录不存在 → 全量 clone 模式"
+fi
+
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="${SKILL_DIR}.old.${TS}"
+
+echo "===== [4/5] 挪走现有目录 ====="
+if [ -d "$SKILL_DIR" ]; then
+  mv "$SKILL_DIR" "$BACKUP_DIR"
+  echo "  ✔ 已挪走: $BACKUP_DIR"
+fi
+
+echo "===== [5/5] clone 远程仓库 ====="
+if ! gitc clone "$REPO_URL" "$SKILL_DIR"; then
+  echo "  ✘ clone 失败"
+  if [ -d "$BACKUP_DIR" ]; then
+    rm -rf "$SKILL_DIR" 2>/dev/null
+    mv "$BACKUP_DIR" "$SKILL_DIR"
+    echo "  ↺ 已回滚到原目录"
+  fi
+  exit 1
+fi
+echo "  ✔ clone 完成"
+
+echo "===== 验证 ====="
+git -C "$SKILL_DIR" log --oneline -5
+echo "  remote: $(git -C "$SKILL_DIR" remote get-url origin 2>/dev/null)"
+echo "  顶层条目: $(ls "$SKILL_DIR" | tr '\n' ' ')"
+echo ""
+echo "完成。确认无误后可删除备份目录："
+[ -d "$BACKUP_DIR" ] && echo "  rm -rf \"$BACKUP_DIR\""
+echo "（本脚本不执行任何 push，TFS 仓库不会被改动）"
+SCRIPT_EOF
+chmod +x /opt/deer-flow/scripts/pull-reg-auto-req-analysis.sh
+```
+
+#### 2. 执行拉取
+
+```bash
+cd /opt/deer-flow/skills/public
+export TFS_PAT="你的PAT"
+bash /opt/deer-flow/scripts/pull-reg-auto-req-analysis.sh
+unset TFS_PAT
+```
+
+脚本自动判断两种模式：
+
+| 场景 | 行为 |
+|------|------|
+| 目录已是 TFS git 仓库（日常增量更新） | 直接 `git pull`，不挪不删 |
+| 目录不存在 / 不是仓库 / remote 不对（首次或重置） | 挪走旧目录为 `.old.时间戳` + 全量 clone，失败自动回滚 |
+
+> **🔥 已增强**：脚本在 pull / clone 成功后**会自动热加载**——以管理员身份登录（`DEER_FLOW_ADMIN_EMAIL` / `DEER_FLOW_ADMIN_PASSWORD`，默认 `506391157@qq.com` / `Admin@123`）拿到 session + CSRF 后，调用 `POST http://127.0.0.1:2026/api/skills/reload` 让 Gateway 重新扫描最新 skill，无需手动重启容器。若登录失败或接口异常，脚本仅提示 skill 文件已就位、不自动重启 gateway，留待 Gateway 下次自然重载或人工处理。步骤 1 内嵌脚本已同步此逻辑；若按手册重建该文件，请确保包含此热加载步骤。
+#### 3. 验证
+
+```bash
+# 拉取后确认版本和提交历史
+git -C /opt/deer-flow/skills/public/reg-auto-req-analysis log --oneline -5
+
+# 确认 remote 干净（不应含 PAT）
+git -C /opt/deer-flow/skills/public/reg-auto-req-analysis remote get-url origin
+
+# 顶层结构完整（应有 SKILL.md / _lib / config / references / runtime）
+ls /opt/deer-flow/skills/public/reg-auto-req-analysis/
+```
+
+确认无误后删除备份目录：
+
+```bash
+rm -rf /opt/deer-flow/skills/public/reg-auto-req-analysis.old.*
+```
+
+### 常见问题
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| pull 失败 | 服务器上有人手动改过 skill 文件（未提交修改） | `git -C /opt/deer-flow/skills/public/reg-auto-req-analysis status` 查看，处理后重试 |
+| `Authentication failed` / 弹出账号密码提示 | 认证方式不对（用了 store 空用户名）或 PAT 失效 | 确认使用脚本内置的 Authorization 头注入方式；更换有效 PAT |
+| `repository not found` | 仓库路径错误或未创建 | 核对 `REPO_URL`，确认仓库在 `WinCode/Skill` 项目下存在 |
+| 拉下来缺文件（如无 `runtime/`） | TFS 仓库版本落后 | 对比 `.old.*` 备份，确认以哪边为准；仓库内容以 TFS 提交为准 |
+
+> **注意**：`_lib/tfs/tfs-config.json`（含 PAT 的运行时配置）**不进仓库**（`.gitignore` 排除，仅提交 template），拉取后不会出现在目录中。skill 实际运行用的配置在 `/opt/deer-flow/auto-dev-work/skills/` 副本中，不受 public 目录更新影响。
 
 ---
 

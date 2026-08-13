@@ -1,12 +1,14 @@
 import json
+import time
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 
 from config import AGENT_NAME, get_redis_client
 from middleware.auth import verify_api_key
 from models import AnalysisRequest, TaskStatusResponse, TaskSubmitResponse
-from services.deerflow_client import DeerFlowClient
+from services.deerflow_client import _RUN_POLL_TIMEOUT_SECONDS, DeerFlowClient
 from services.redis_qc_client import RedisQcClient, build_qc_plan_key
+from services.run_registry import run_registry
 from services.task_manager import TaskStatus, create_task_manager
 
 router = APIRouter(prefix="/api/v1/analysis", tags=["analysis"])
@@ -64,9 +66,9 @@ def get_analysis_result(task_id: str, _: None = Depends(verify_api_key)):
 def _run_analysis_task(task_id: str, req: AnalysisRequest):
     """Run DeerFlow agent in the background."""
     task_manager.update_task(task_id, TaskStatus.PROCESSING)
+    redis_key = build_qc_plan_key(req.collection_name, req.work_item_id)
 
     try:
-        redis_key = build_qc_plan_key(req.collection_name, req.work_item_id)
         request_payload = {
             "action": "auto_req_analysis",
             "collection_name": req.collection_name,
@@ -127,29 +129,36 @@ def _run_analysis_task(task_id: str, req: AnalysisRequest):
                 f"{json.dumps(request_payload, ensure_ascii=False)}"
             )
 
-        response_text = deerflow_client.run_agent(
+        run_id = deerflow_client.start_run(
             collection_name=req.collection_name,
             work_item_id=req.work_item_id,
             message=message,
             agent_name=AGENT_NAME,
         )
 
-        try:
-            skill_response = json.loads(response_text)
-        except (json.JSONDecodeError, TypeError):
-            skill_response = {}
-
-        task_manager.update_task(
-            task_id,
-            TaskStatus.COMPLETED,
-            result={
-                "redis_key": redis_key,
-                "skill_status": skill_response.get("status", "unknown"),
-            },
+        # 登记到调度注册表：由 run_poller 调度线程统一轮询并收尾（对账 Redis）。
+        # 本线程到此返回，不再占用后台线程等待。
+        run_registry.register(
+            task_id=task_id,
+            run_id=run_id,
+            tid=deerflow_client.thread_id(req.collection_name, req.work_item_id),
+            redis_key=redis_key,
+            deadline=time.time() + _RUN_POLL_TIMEOUT_SECONDS,  # epoch 秒，跨进程可比较
         )
 
     except Exception as exc:
-        task_manager.update_task(task_id, TaskStatus.FAILED, error=str(exc))
+        # 点火失败（如 POST /runs 异常）：对账 Redis，agent 可能已写盘，避免假失败。
+        if _read_result_from_redis(redis_key) is not None:
+            task_manager.update_task(
+                task_id,
+                TaskStatus.COMPLETED,
+                result={
+                    "redis_key": redis_key,
+                    "skill_status": "success(reconciled)",
+                },
+            )
+        else:
+            task_manager.update_task(task_id, TaskStatus.FAILED, error=str(exc))
 
 
 def _read_result_from_redis(redis_key: str):

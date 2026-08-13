@@ -25,7 +25,7 @@ deerflow-service (容器，内部端口 8003)
 ```
 
 **关键关系**：
-- deerflow-service 自己用 3 样东西：**Redis**（存任务+结果）、**DeerFlow Gateway**（跑 agent）、**API Key 认证**
+- deerflow-service 自己用 3 样东西：**Redis**（存任务状态 + QC 结果 + 活跃 run 注册表 `run:active`）、**DeerFlow Gateway**（跑 agent）、**API Key 认证**
 - 它只是个"调度员"——收请求，交给 DeerFlow agent 干活，结果写 Redis
 
 ---
@@ -112,7 +112,7 @@ docker logs --tail 50 deer-flow-service
 ```
 
 常见子原因：
-- `DeerFlowClient` 调用 Gateway 超时（代码写死了 600 秒）
+- run 在 Gateway 后台执行，状态由 `run_poller` 调度线程统一轮询（10s 间隔、总超时 1800s）；任务长期 `processing` → 检查 Gateway 容器与 run 状态
 - `DEERFLOW_BASE_URL=http://gateway:8001` 不通 → 检查 Gateway 容器是否活着
 
 ---

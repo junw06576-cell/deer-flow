@@ -36,6 +36,7 @@ tool_groups:
 - name: file:read
 - name: file:write
 - name: bash
+- name: ragflow
 tools:
 - name: web_search
   use: deerflow.community.ddg_search.tools:web_search_tool
@@ -72,6 +73,18 @@ tools:
 - name: bash
   use: deerflow.sandbox.tools:bash_tool
   group: bash
+
+# ragflow工具
+- name: ragflow_chat
+  use: ragflow_tools:ragflow_chat
+  group: ragflow
+- name: ragflow_list_datasets
+  use: ragflow_tools:ragflow_list_datasets
+  group: ragflow
+- name: ragflow_search
+  use: ragflow_tools:ragflow_search
+  group: ragflow
+  
 tool_search:
   enabled: false
 tool_output:

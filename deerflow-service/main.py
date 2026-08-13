@@ -1,13 +1,25 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from routers.analysis import router as analysis_router
+from services.run_poller import start_poller
 import os
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用启动：拉起常驻调度线程，统一轮询所有活跃 Run 并收尾。"""
+    start_poller()
+    yield
+
 
 app = FastAPI(
     title="DeerFlow Service",
     description="为 TFS-BUDDY 提供需求分析能力。当前场景：req-analysis（需求自动质控）。",
     version="2.0.0",
+    lifespan=lifespan,
 )
 
 # CORS：允许本地 file:// 和所有来源的测试请求
