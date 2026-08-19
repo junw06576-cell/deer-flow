@@ -130,14 +130,10 @@ sandbox:
   ls_output_max_chars: 20000
   bash_command_timeout: 600
   mounts:
-    # product-kb-qa：单文件索引 + wiki 原文目录（只读）
-    # 注意：不能再用 /opt/regional_wiki_kb 整目录挂 /mnt/knowledge——
-    # 只读父卷下建子挂载点会触发 runc "read-only file system" 错误
-    - host_path: /opt/regional_wiki_kb/wiki_index.md
-      container_path: /mnt/knowledge/wiki_index.md
-      read_only: true
-    - host_path: /opt/regional_wiki_kb/wiki
-      container_path: /mnt/knowledge/wiki
+    # reg-wiki-kb：同步程序发布的五目录 Markdown 快照和索引。
+    # 使用单一父目录挂载，避免只读父卷下创建子挂载点失败。
+    - host_path: /opt/regional_wiki_kb/reg-wiki-scope
+      container_path: /mnt/knowledge
       read_only: true
     # auto-req-analysis skill 的产物/审计目录（PROCESS_DIR=/mnt/skills/过程文件），
     # 用可写子挂载覆盖 /mnt/skills 只读父挂载；沙箱进程文件按工作项 ID 落盘

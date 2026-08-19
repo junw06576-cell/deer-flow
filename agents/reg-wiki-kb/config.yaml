@@ -1,5 +1,5 @@
 name: reg-wiki-kb
-description: 产品知识库专家 — 基于结构化 Wiki 页面的精确检索与问答
+description: 产品 Wiki 助手 — 基于受限 Wiki 原文进行可追溯问答和材料对比
 tool_groups:
   - file:read
   - file:write
