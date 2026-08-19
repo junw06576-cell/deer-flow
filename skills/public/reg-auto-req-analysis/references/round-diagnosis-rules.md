@@ -9,6 +9,7 @@
 - **零 TFS 写入、零 pipeline.py 改动**：诊断纯属 skill 侧判断，只追加到 `过程文件/skill-feedback.md` 这一份 markdown 副记录；不进计划 JSON、不进 `run_*.json` 审计白名单、不写 TFS、不生成附件。
 - **向后兼容**：首轮或重跑未带补充信息时该步骤直接跳过，不影响任何既有终局/契约。
 - **聚焦"上轮分析不好"**：只对上轮产出了分析产物（`verdict ∈ {AUTO-ANA, MANUAL-REVIEW, MANUAL-REVIEW-STOP}`）的轮次诊断；上轮为 `SKIP-ANALYSIS`/`NEED-*`（QC 挡回、无分析产物）在 v1 不诊断。
+- **测试日志独立留痕**：无论本诊断是否触发或为何跳过，调用入参中的 `human_feedback` / `additional_info` 都按 [`../_lib/testing-log.md`](../_lib/testing-log.md) 原文写入本轮“用户手动反馈”；本文件的 `skill-feedback.md` 只保存分类诊断，不能替代原始反馈留痕。
 
 ## 1. 补充信息入口契约
 
@@ -50,10 +51,10 @@
 ## 2. 重跑检测与上轮加载（步骤 1 尾部）
 
 1. 列 `过程文件/<id>/` 下除 `runs/` 外的子目录，按目录名时间戳排序。存在更早子目录 → 判定**重跑**。
-2. **上轮** = 紧邻本轮之前、且其 `执行计划_<id>_<prev_run>.json` 的 `verdict ∈ {AUTO-ANA, MANUAL-REVIEW, MANUAL-REVIEW-STOP}` 的那一轮（即产出了 `变更方案`/`分析者描述`）。找不到满足条件的上轮 → 跳过诊断。
+2. **上轮** = 紧邻本轮之前、且其 `执行计划_<id>_<prev_run>.json` 的 `verdict ∈ {AUTO-ANA, MANUAL-REVIEW, MANUAL-REVIEW-STOP}` 的那一轮（即产出了 `需求分析报告`/`分析者描述`；历史轮可能名为 `变更方案`）。找不到满足条件的上轮 → 跳过诊断。
 3. 加载上轮产物用于对照：
    - `执行计划_<id>_<prev_run>.json`：`verdict`、`analysis_description`、`analysis_gaps`、`evidence_refs`、`evidence_gaps`、`auto_scopes`、`existing_feature`；
-   - `变更方案_<id>_<prev_run>.md`：业务结论与方案行；
+   - `需求分析报告_<id>_<prev_run>.md`（兼容 `变更方案_<id>_<prev_run>.md`）：业务结论与方案行；
    - `待确认清单_<id>_<prev_run>.md`（若有）：上轮向 PM 提的问题（含 topic/问题文本，是 §1 文本兜底 A/B 分区的"尺子"；结构化形式自带 question，无需靠它查问题）。
 
 **门控（跳过诊断的条件，审计记 `round_diagnosis=skipped:<reason>`）**：
@@ -72,7 +73,7 @@
 
 | 类别 | 识别信号（用户补充 vs 上轮输出） | 改进指向（待改规则文件） |
 |---|---|---|
-| **信息判断错误** | 补充**纠正**了上轮变更方案的某个业务结论；或指出上轮照搬实施预设未质疑 / 臆造维度参数 / 高风险类别误判(边界泛化) / 查重误判(功能已存在 vs 新增) | [`analysis-description-writing-rules.md`](analysis-description-writing-rules.md) §一(批判审视)、[`../_lib/high-risk-categories.md`](../_lib/high-risk-categories.md)、[`../config/analysis-rules.md`](../config/analysis-rules.md)(查重/现有功能) |
+| **信息判断错误** | 补充**纠正**了上轮需求分析报告的某个业务结论；或指出上轮照搬实施预设未质疑 / 臆造维度参数 / 高风险类别误判(边界泛化) / 查重误判(功能已存在 vs 新增) | [`analysis-description-writing-rules.md`](analysis-description-writing-rules.md) §一(批判审视)、[`../_lib/high-risk-categories.md`](../_lib/high-risk-categories.md)、[`../config/analysis-rules.md`](../config/analysis-rules.md)(查重/现有功能) |
 | **输出质量不好** | 补充针对**产物本身**：分析者描述格式不满意 / 排版啰嗦重点不突出 / 维度凑数 / 待确认发散超纲 | [`change-plan-template.md`](change-plan-template.md)(排版规范)、[`analysis-description-writing-rules.md`](analysis-description-writing-rules.md)(维度)、[`manual-review-template.md`](manual-review-template.md)(收敛) |
 | **信息不足·合理gap** | 补充属于 **A**、**仅补全上轮 flagged 的缺失信息且未纠正其前提**，上轮挡回/挂 MANUAL 合理 → **非 skill 缺陷** | 无 skill 改动；记录"需求信息缺失" |
 | **准入错误** | 补充揭示本属联调/支持单/纯 BUG 却被纳入分析，或反之被误 `SKIP-ANALYSIS` | [`../config/qc-rules.md`](../config/qc-rules.md) §1b/1c、[`pre-qc-rules.md`](pre-qc-rules.md) |
@@ -109,7 +110,7 @@
 - 上轮 run_id / 本轮 run_id / 上轮终局
 - 诊断类别（可多选）：信息判断错误｜输出质量不好｜信息不足·合理gap｜准入错误｜规则/KB缺口｜其他
 - 证据：
-  - 上轮输出问题点：<引用 变更方案/分析者描述/待确认清单 具体片段>
+  - 上轮输出问题点：<引用 需求分析报告/分析者描述/待确认清单 具体片段>
   - 用户本轮补充要点：<来自编排器传入的补充信息，按 A（回答确认项）/ B（额外）标注来源>
 - 改进指向：<待改规则文件 + 章节>（"信息不足·合理gap" 写"非 skill 缺陷，需求信息缺失"）
 - 本轮是否已据此修正：是/否 + 简述
@@ -119,7 +120,7 @@
 - "本轮是否已据此修正"：在本轮分析已完成后填写；如本轮已针对该诊断规避/修正写"是 + 简述"，否则"否"。
 - 时间戳取北京时间；同一 `work_item_id + run_id` 只一条，重跑开新条目。
 
-**可沉淀类别的经验蒸馏（与 `经验记忆.md` 联动）**：当本次诊断命中可沉淀类别——`信息判断错误`/`输出质量不好`/`准入错误`/`规则·KB缺口` 之一时，除按上述模板写 `skill-feedback.md` 外，**另**按 [`../_lib/skill-memory.md`](../_lib/skill-memory.md) §3/§4 把"改进指向"蒸馏为一条祈使句经验条目，追加到 `过程文件/经验记忆.md`（RUNBOOK 步骤 11 执行）。`信息不足·合理gap`（非缺陷）与 `其他`（执行层/环境）**不沉淀**。此联动不改变本节上述任何字段或触发逻辑，仅追加一份平行产出；`round_diagnosis=pending` 门控与 `done` 置位仍由本节既有规则决定。
+**可沉淀类别的经验蒸馏（与 `经验记忆.md` 联动）**：当本次诊断命中可沉淀类别——`信息判断错误`/`输出质量不好`/`准入错误`/`规则·KB缺口` 之一时，除按上述模板写 `skill-feedback.md` 外，**另**按 [`../_lib/skill-memory.md`](../_lib/skill-memory.md) §3/§4 把"改进指向"蒸馏为一条祈使句候选，并交给官方 `skill_memory.py record` 校验、去重和追加（RUNBOOK 步骤 11 执行）。`信息不足·合理gap`（非缺陷）与 `其他`（执行层/环境）不提供候选，但仍须执行收尾命令取得 `NOT_APPLICABLE`。此联动不改变本节上述任何字段或触发逻辑；`round_diagnosis=pending` 门控与 `done` 置位仍由本节既有规则决定。
 
 ## 5. 与本轮分析的关系（轻量、非强制）
 

@@ -70,7 +70,7 @@ skill 在非 SKIP fetch 后**先解析产品，再探活该 profile 并固定覆
 - **源码 MCP** 缺失时记 `kb.source_ready=false`；若 `source_required=false` 不额外改变终局。若结论依赖源码细节则保持 `source_required=true`：质控不得用缺失源码闭合阻断，分析写 `SOURCE_MCP_UNAVAILABLE` / `SOURCE_SCOPE_PARTIAL` / `SOURCE_VERIFICATION_INCOMPLETE`，AUTO 候选降 MANUAL。GitNexus 不可用时，已有当前产品精确 repo + 技术锚点仍可有限核验，但不得把源码 MCP 当无锚点发现、跨层关系或查重替代。
 - **需求历史 MCP** 缺失、超时、范围外或快照过旧时，记 `tfs_requirements.ready=false` 与具体原因后继续；不得因此转 ERROR、改变 verdict 或否定当前工作项。与实时 fetch、当前附件、现场事实或代码事实冲突时并列记录冲突并形成缺口，不自行选择历史版本。
 - **产品 wiki**（业务语义层，见 `wiki-kb-recipe.md`）缺失或未覆盖该模块时，记 `wiki.ready=false` 或 `wiki.note=未覆盖`，回退 GitNexus、受控源码和菜单索引，**绝不因 wiki 缺失本身阻断或转 ERROR**。界面/布局类须从产品知识、运行观察、实现证据三类中至少取两类交叉证实；只有两类无法闭合时才记 `evidence_gap` 并将 AUTO-ANA 候选降为 MANUAL-REVIEW。GitNexus 不可用时 wiki 仍可供业务判断，但不替代代码关系与查重。
-- 探活失败要**显式记进审计**（`tfs_requirements.ready=false` / `kb_ready=false` / `wiki.ready=false` 或具体原因），不能静默。
+- 探活失败要**显式记进审计**（`tfs_requirements.ready=false` / `kb.ready=false` / `wiki.ready=false` 或具体原因），不能静默。**KB 未就绪时的最小 `kb` 对象**（非 SKIP 计划仍须给出完整 `kb`，四个 bool 不可省，否则 `validate` 报错）：`{"ready": false, "source_ready": false, "source_required": <bool>, "database_ready": false, "note": "<原因>"}`。
 - **「不升级」原则仅适用 MANUAL 路径**：上述"绝不因此判 MANUAL"只对 `MANUAL-REVIEW` 生效。`AUTO-ANA` 是无人工兜底的自动放行路径，硬要求 `kb.ready=true` 且 `kb.dedup_ran=true`（相似实现查重实际执行）；优化类类别还须 `kb.findings` 至少一条 `state=已证实` 锚定被改现有模块/入口。缺失则降 `MANUAL-REVIEW`（不加 `STOP-AUTO`，属信息缺口而非高风险）。由 `pipeline.py` 强制校验。
 
 ---
@@ -82,24 +82,23 @@ skill 在非 SKIP fetch 后**先解析产品，再探活该 profile 并固定覆
 - **查重质量四要求（权威定义·两阶段共用）**：查“同类历史方案/相似已实现”时必须同时满足：①**多组关键词**——`search_requirements` 至少 2 组正交维度（业务对象+动作 / 菜单+字段 / 现象+条件 / 规则名），不得 1 组泛化词命中即停，每组 query 与命中数记入 `tfs_requirements.note`；②**限定终态**——历史相似需求查重**只考虑 `state`∈{已验证,已关闭}** 的工作项；其它状态（已建议/活动/已解决等未达终态）不作为相似需求查重依据，最多作背景线索；③**get_work_item 核验**——`search` 命中必须经 `get_work_item` 读完整正文，核对工作项状态/开发者描述/变更原因后才判 `maturity`（定义见 §六），只看搜索摘要不得判；④**时间倒序复查（防锚定老公版，不替换相关性）**——`search_requirements` 按**相关度**返回，相关度高 ≠ 最新；命中集合须再按 `changed_date`（缺失时取 `created_date`）**倒序复查一遍**，确保最新条目（尤其近一年/当年）不被相关度排序埋没。**最终锚点仍选“最直接覆盖本次诉求”的已落地候选**（覆盖度/相关性是选择主标准）：仅当最新候选与本次诉求**更直接相关**时才优先它（公版能力随版本演进，旧需求可能已被近期需求替代或升级）；**不得为“新”而牵强匹配**——若最新条目不覆盖本次诉求、仅有较旧命中覆盖，仍选较旧那个。每个候选（无论新旧）均须经 ③`get_work_item` 核验 maturity。操作步骤见 `../references/qc-kb-recipe.md` Step R。
 - **需求历史只证明工作项事实**：已证实 finding 表示“某历史工作项/关系/验收或变更记录确实如此”，不表示需求已上线、仍生效或当前实现如此。历史事实可补充业务背景、问题目标、范围与验收来源；当前字段仍以实时 `fetch` 为准，当前业务规则需 KB/wiki/现场闭合，当前实现需 GitNexus/受控源码闭合。**`state=已证实` 只表示工作项事实已核实，不等同于方案已落地——是否已落地另由 `maturity` 字段判定（见 §六）；不得用 `maturity=设想` 的 finding 支持"已实现/已存在方案"结论。**
 - **一套公版假设（强制）**：当前不按项目/客户/版本拆分查重——同一产品线视为一套公版能力，落地能力视为当前环境普遍具备。命中 `state=已证实` 且 `maturity=已落地` 的历史方案时，须进一步判断其能力是否**覆盖/可满足本次需求诉求**：覆盖 → "功能已存在" → 分析终局 MANUAL-REVIEW（见 §六"功能已存在判定"与 `references/confidence-heuristic.md` 第 4 项反向条款，pipeline 硬闸 `existing_feature.satisfied=true ∧ verdict=AUTO-ANA` 强制）；仅相似但本次是**新的增量改动**（如列已存在、本次调其顺序/文案/默认值，既有能力未完整覆盖本次诉求）则不构成"功能已存在"，仍走 AUTO 第 4 项正向条件。
-- **菜单索引先按区域收敛（辅助候选）**：若 `skills/reg-auto-req-analysis/_lib/menu-business-index.json` 存在，先取工作项 `area`（优先 `System.AreaPath` 首级；缺失时才用 `teamProject`）精确匹配索引的 `tfs_area_values`——用 `build_menu_business_index.py lookup --area <area>`（见 `_lib/COMMANDS.md`）一步查候选产品，**不要手写 jq/grep 读索引 JSON**。唯一命中时拿到产品级候选；代码定位锚点走 wiki 子系统名/仓库名 + GitNexus `query`→`context`，不再依赖菜单级 `repo`/`module_url`/`apis`。区域未配置、索引不存在或范围不唯一时，记录“菜单索引范围未确认”，继续原有 GitNexus 检索，绝不猜测产品。
+- **菜单索引先按区域收敛（辅助候选）**：若 `skills/reg-auto-req-analysis/_lib/menu-business-index.json` 存在，先取工作项 `area`（优先 `System.AreaPath` 首级；缺失时才用 `teamProject`）精确匹配索引的 `tfs_area_values`——用 `build_menu_business_index.py lookup --area <area>`（见 `_lib/COMMANDS.md`）一步查候选产品，**不要手写 jq/grep 读索引 JSON**。唯一命中时拿到产品级候选；代码定位锚点走 wiki 子系统名/仓库名 + GitNexus `query`→`context`，不再依赖菜单级 `repo`/`module_url`/`apis`。区域未配置、索引不存在或范围不唯一时，**等同于 `resolve-route` 未解析**（与 §四开头的路由规则、§三降级一致）：记录 `PRODUCT_ROUTE_UNRESOLVED`，`servers={}`，**不得调用任何产品 MCP**（不做“继续原有 GitNexus 检索”这类跨产品回退），按 §三 降级——AUTO 候选降 MANUAL；QC/MANUAL 仅靠当前工作项与附件既有证据继续，绝不猜测产品。
 - **产品 wiki 按需取业务语义**：区域收敛后，仅在命中业务概念/高风险或确需业务规则、流程、口径、验收与布局语义时，完整读 `wiki/index.md`，按业务域定位文章并解析相对链接；用于 QC 放行、高风险或 AUTO 关键证据的事实再沿文章 `Raw` 链接按需复核。子系统名/仓库名可作技术候选锚点，但不替代 GitNexus 关系证据；wiki 与已核验代码冲突时，实现事实以代码为准，只有影响业务规则、范围或验收正确性时才进入 QC spec 闸（详见 `wiki-kb-recipe.md`）。
 - **先定 repo，再检索**：不得省略仓库范围直接全局搜索，也不得将第一次命中的文件当结论。
 - **两轮收敛**：先分别查询业务对象、业务动作、技术锚点；从前端页面/API 或候选符号提取 API 路径、Controller、DTO、表名等精确锚点后，再做第二轮查询。`embeddings: 0`（当前全部仓库实测为 0）时**优先精确术语、路径和符号名，并以 [`business-keyword-dictionary.md`](business-keyword-dictionary.md) 的同义词/拼音缩写/英文领域名扩查询词**，不能依赖纯中文语义召回。
 - **覆盖度回环（强制·修复"一次性采集"漏召回）**：每个被触发的知识源至少跑 **2 组正交查询角度**（业务对象 / 业务动作 / 技术锚点 / 菜单+字段 / 规则名），每组记 query+命中数+是否截断（落 `evidence_acquisition.<源>.queries`，见 §六）。停止条件：(a) ≥1 已证实 finding 闭合核心问题，**或** (b) ≥2 角度空 **且**已试过下条回退链。**首轮有窄命中不得直接停手**——窄命中可能是错目标，仍须第二角度交叉验证。
 - **首轮空回退链（强制）**：代码 `query` 首轮全空时**不得记缺口了事**，依次试 ①字典同义词/拼音缩写 ②`cypher` 结构查（按表/类/关系） ③`impact` 反向找调用方 ④`traverse_graph` ⑤换 repo（按菜单/wiki 候选）。仍空才记"代码图谱覆盖缺口"。db 侧已有"中文无命中不能停止"（见下），代码侧同等强制。
 - **证据链优先**：按 `query → context → route_map（有精确 API 路径时）→ context` 追踪入口与调用/导入关系。`processes` 或 `route_map` 为空不代表业务不存在；继续对命中的 Controller、Service、Mapper 使用 `context` 验证调用边。
-- **受控源码只作精确锚点后核验**：当质控阻断或分析结论依赖条件分支、字段赋值、配置常量、SQL、模板绑定或方法体细节时，置 `kb.source_required=true`。先取得当前产品“精确 repo + API/路径/符号/技术字面量”锚点；锚点优先来自 GitNexus，也可来自已解析附件、工作项明确技术信息、菜单索引或 wiki。已知类/方法/符号优先 `search_symbol`；`search_source` 只使用允许路径、精确字面量或技术锚点。每轮最多核验入口、编排、落库等 3–5 个关键文件。调用和发现写入 `kb.tools_used/findings`，源码 finding 使用 `source_tool=search_source|search_symbol, source_type=code`。
+- **受控源码只作精确锚点后核验**：当质控阻断或分析结论依赖条件分支、字段赋值、API 契约、配置常量、SQL、模板绑定、数据读写或方法体细节时，置 `kb.source_required=true`。该触发由 `implementation_impacts` 决定，独立于最终 AUTO/MANUAL/STOP 终局；不得因高风险已锁定终局而跳过。先取得当前产品“精确 repo + API/路径/符号/技术字面量”锚点；锚点优先来自 GitNexus，也可来自已解析附件、工作项明确技术信息、菜单索引或 wiki。已知类/方法/符号优先 `search_symbol`；`search_source` 只使用允许路径、精确字面量或技术锚点。每轮最多核验入口、编排、落库等 3–5 个关键文件。调用和发现写入 `kb.tools_used/findings`，源码 finding 使用 `source_tool=search_source|search_symbol, source_type=code`。
 - **源码负面推断禁令**：无命中、截断、白名单外或路径拒绝只代表本次覆盖不足，不等于仓库/产品不存在实现。源码结果只证明被检索仓库路径在该时点的内容，不证明部署版本、现场行为或已上线。GitNexus 与源码结果冲突时记录索引时间/路径/符号差异并形成缺口，不静默选择一方。
-- **按需联查数据库**：只有新增/修改字段、数据迁移、统计口径、数据权限、性能优化或数据库脚本等数据需求，才从已证实的表名、字段名、Mapper、方法名或 SQL 片段开始 `search_knowledge`（限定 `Table` / `Column` / `CodeSymbol` / `SQLStatement`，较小 `limit`）并仅对确认候选调用 `get_table_knowledge`。没有已建立的代码 SQL/契约关系时，不能把代码和同名/近名表写成同一流程。
+- **按需联查数据库**：新增/修改字段、数据读取/保存/清空、数据迁移、统计口径、数据权限、性能优化或数据库脚本等数据需求，置 `kb.database_required=true`，再从已证实的表名、字段名、Mapper、方法名或 SQL 片段开始 `search_knowledge`（限定 `Table` / `Column` / `CodeSymbol` / `SQLStatement`，较小 `limit`）并仅对确认候选调用 `get_table_knowledge`。该触发同样独立于终局；数据库服务就绪时必须实际查询并留下 database finding，不就绪或覆盖不足时记录明确 gap。没有已建立的代码 SQL/契约关系时，不能把代码和同名/近名表写成同一流程。
 - **字段反向定位闭环**：字段类需求按“业务词及同义词 → 页面绑定字段/提交参数 → DTO/Mapper/SQL → 正式表列 → 目标查询是否已返回”逐层取证。中文业务词无命中时，必须扩展产品同义词、代码注释用语、缩写和命名转换；只有页面或载荷语义与数据库 `Column`、在用 `READS`/`WRITES` 或 SQL 同时闭环，才把字段记为已证实。缺任一层时只能记候选或未确认。
 - **正式表筛选**：同名表、日期后缀表、备份表和测试表仅作候选；必须用在用仓库的代码读写关系、SQL 来源和业务键确认正式表。不得因列名相同，把 `_bak`、`_test`、日期后缀或其他近似表写成当前业务表。
 - **覆盖缺口停止条件**：精确代码锚点无命中后，再以业务缩写、同义词或数据库命名转换查询 `Table`/`Column`，并按返回的 `database_alias` 查表；仍无结果才记录“数据库图谱覆盖缺口”，把真实表/字段待 Mapper SQL 映射列为未确认。定位到字段后仍须反查目标查询；字段存在但目标 SQL 未读取时，应记录“目标数据链缺字段”，不能误判为需求已实现。
 - **DB 负面推断禁令（强制）**：数据库图谱覆盖率未知（实测外键关系稀疏），`search_knowledge` 无命中**只代表"图谱未覆盖/未命中"，不等同于"库不存在该表/字段"**。覆盖不全时只能记 `evidence_acquisition.db_knowledge.coverage_status=PARTIAL/UNKNOWN` + 缺口（`DB_SCHEMA_PARTIAL`/`DB_RELATION_PARTIAL`），**严禁**写成"数据库无此表/字段"的负面结论；只有 `coverage_status=COMPLETE ∧ exhausted ∧ 未截断` 的无命中才允许下负面判断。
-- **证据三态标注（强制）**：每条来自 KB 的结论必须标注来源——
-  - **图谱事实**：有明确节点/关系支撑（引用实体名）。
-  - **推断**：基于图谱事实 + 推理得出。
-  - **未确认**：图谱无依据 → **写"未确认"，不猜测、不编造**。
+- **证据标注（强制）**：每条来自 KB 的结论必须区分**核实态**（写进 `state` 字段）与**证据性质**（写进 `conclusion`/`evidence` 自由文本）：
+  - **核实态（`state` 字段取值，pipeline 强依赖）**：`已证实`（有明确节点/关系/源码支撑，引用实体名）/ `候选`（基于图谱事实+推理得出，待核）/ `未确认`（图谱无依据 → 写"未确认"，不猜测、不编造）。AUTO-ANA 的优化类与源码锚点硬要求 `state=已证实`（见 §六、`pipeline.py`），故 `state` 字段**不得**写成"图谱事实/推断"。
+  - **证据性质（`conclusion`/`evidence` 文本）**：`图谱事实` / `推断` / `未确认`，描述单条证据怎么得来；与 `module-location-recipe.md` §5 一致，**不进 `state` 字段**。
 
 菜单索引由 `python3 skills/reg-auto-req-analysis/_lib/build_menu_business_index.py` 根据 `menu-sources.json` 构建。每个菜单源必须显式声明 `product_id`、`product_name`、`tfs_area_values` 和原始文件路径；一个区域只能归属一个产品。它是可迁移的产品入口索引，不是 GitNexus 图谱事实，也不允许替代 `query → context → route_map/context` 的证据链。
 
@@ -120,9 +119,9 @@ skill 在非 SKIP fetch 后**先解析产品，再探活该 profile 并固定覆
 ### 阶段二分析 —— 内部佐证·PM 视角产物
 
 - **需求历史是业务追溯佐证**：经 `get_work_item` 或明确关系确认的 finding 可用 `req:<索引>` 引用到 v2 `evidence_refs`，用于历史背景、问题目标、范围或验收来源。它不进入 PM 正文的技术定位，不替代 `kb:`，也不能满足 `kb.ready`、`kb.dedup_ran` 或 AUTO 的现有实现锚点。
-- **代码图谱发现 + 受控源码核验均为内部佐证，不进变更方案正文**。变更方案/分析者描述是 **PM/业务视角**（业务场景/规则/验收/范围；见 `change-plan-template.md`）；`concise-v3` 单列的“菜单路径”只写业务菜单入口，操作步骤写入对应方案行。GitNexus 定位主模块/调用链，源码 MCP 只在 `source_required=true` 时核验精确实现；结果统一落 `kb.findings`，用于印证 AUTO/MANUAL、查重与高风险定性，不把仓库、类、方法、接口、Mapper 或表字段写入正文。
+- **代码图谱发现 + 受控源码核验均为内部佐证，不进需求分析报告正文**。需求分析报告/分析者描述是 **PM/业务视角**（业务场景/规则/验收/范围；见 `change-plan-template.md`）；`concise-v3` 单列的“菜单路径”只写业务菜单入口，操作步骤写入对应方案行。GitNexus 定位主模块/调用链，源码 MCP 只在 `source_required=true` 时核验精确实现；结果统一落 `kb.findings`，用于印证 AUTO/MANUAL、查重与高风险定性，不把仓库、类、方法、接口、Mapper 或表字段写入正文。
 - 相似已实现需求命中：由代码图谱支撑 `confidence-heuristic.md` 第 4 项。
-- **wiki 作业务内部佐证**：wiki 的业务规则/流程/数据口径同样落 `wiki.findings`，只作内部佐证、**不进变更方案正文**；其子系统名/仓库名仅供 GitNexus 锚定，可写进 testing-log 的"知识图谱作用"区。见 `wiki-kb-recipe.md` §4。
+- **wiki 作业务内部佐证**：wiki 的业务规则/流程/数据口径同样落 `wiki.findings`，只作内部佐证、**不进需求分析报告正文**；其子系统名/仓库名仅供 GitNexus 锚定，可写进 testing-log 的"知识图谱作用"区。见 `wiki-kb-recipe.md` §4。
 - KB 未就绪 → 走启发式（第 4 项跳过），定位写"待 dev-design 确认"落 `kb.findings`（非产物待确认）。**AUTO-ANA 路径**仍要求 KB 就绪 + 查重执行 +（优化类）已证实锚点（见 §三），缺失则降 `MANUAL-REVIEW`；MANUAL 路径不因此升级。
 
 ---
@@ -190,6 +189,7 @@ skill 在非 SKIP fetch 后**先解析产品，再探活该 profile 并固定覆
   "source_ready": true,
   "source_required": true,
   "database_ready": true,
+  "database_required": true,
   "dedup_ran": true,
   "tools_used": ["list_repos", "query", "context", "search_symbol", "search_knowledge", "get_table_knowledge"],
   "findings": [
@@ -201,7 +201,7 @@ skill 在非 SKIP fetch 后**先解析产品，再探活该 profile 并固定覆
 }
 ```
 
-代码图谱、源码 MCP、数据库图谱状态分别写 `ready`、`source_ready`、`database_ready`；`source_required` 明确本轮是否需要源码级核验。`source_required=true ∧ source_ready=true` 时必须实际调用源码工具并留下 finding；AUTO 还要求至少一条源码 finding `state=已证实`，否则降 MANUAL。新计划的每条 finding 必须用 `source_type=code|database` 明确归属，并补齐 `conclusion/evidence/boundary`；需求历史工具只能写入 `tfs_requirements.findings`。历史计划缺少新增字段时兼容读取。Redis `knowledge` 只投影 `summary/source_status/evidence_list` 人读佐证；`source_status` 固定保留五类来源的精简状态，完整 ready、route、tools、原始 finding 与覆盖状态从计划/审计读取。其余 finding、正文与 AUTO 锚点边界沿用原规则。
+代码图谱、源码 MCP、数据库图谱状态分别写 `ready`、`source_ready`、`database_ready`；`source_required` 与 `database_required` 分别明确本轮是否需要源码级、数据库级核验。新分析计划用 `implementation_impacts` 推导这两个 required 字段，避免把“服务可用”误当成“本轮已取证”。`required=true ∧ ready=true` 时必须实际调用对应工具并留下 finding；服务不可用或覆盖不足时必须写对应 `evidence_gap`。AUTO 仍要求源码 finding `state=已证实`，否则降 MANUAL；MANUAL/STOP 不豁免已触发的取证，只允许以明确 gap 结束。新计划的每条 finding 必须用 `source_type=code|database` 明确归属，并补齐 `conclusion/evidence/boundary`；需求历史工具只能写入 `tfs_requirements.findings`。历史计划缺少新增字段时兼容读取。Redis `knowledge` 只投影 `summary/source_status/evidence_list` 人读佐证；`source_status` 固定保留五类来源的精简状态，完整 ready、route、tools、原始 finding 与覆盖状态从计划/审计读取。其余 finding、正文与 AUTO 锚点边界沿用原规则。
 
 **产品 wiki 的审计用并列的可选 `wiki` 对象**（语义与图谱不同，故独立字段；同样不在 `validate` 的 required 内、由 `pipeline.py` 透传）：
 
@@ -218,7 +218,7 @@ skill 在非 SKIP fetch 后**先解析产品，再探活该 profile 并固定覆
 
 `state` 取 `wiki-确认` / `wiki-冲突` / `wiki-未覆盖`；`source` 为 wiki 页面相对路径。wiki 未就绪/未覆盖时 `"ready": false` 并在 `note` 写原因。字段定义详见 `wiki-kb-recipe.md` §6。
 
-**v2 采集状态契约（`evidence_acquisition`，选用 `analysis=evidence-loop-v2` 时必填）**：上述 `kb`/`wiki`/`tfs_requirements` 记"发现了什么"，`evidence_acquisition` 额外记"**怎么查的、查全没有**"——按四源 `tfs_requirements`/`wiki`/`gitnexus`/`db_knowledge` 各填 `{availability, coverage_status, query_status, queries:[{terms, truncated, returned, total, verified_ids}], stop_reason}`，把每组查询词、命中数、是否截断、停止原因结构化留下，使"图谱无数据"与"没查/没查全"可区分。只有 `coverage_status=COMPLETE ∧ stop_reason=exhausted ∧ 未截断` 的 `query_status=NO_HIT` 才支撑负面结论；截断/未覆盖/未查只能 `PARTIAL/UNKNOWN`。校验器硬约束与字段结构详见 [`tfs/EXECUTION_CONTRACT.md`](tfs/EXECUTION_CONTRACT.md)「evidence-loop-v2」节。
+**v2 采集状态契约（`evidence_acquisition`，新分析固定 `analysis=evidence-loop-v2`）**：上述 `kb`/`wiki`/`tfs_requirements` 记"发现了什么"，`evidence_acquisition` 额外记"**怎么查的、查全没有**"——按四源 `tfs_requirements`/`wiki`/`gitnexus`/`db_knowledge` 各填 `{availability, coverage_status, query_status, queries:[{terms, truncated, returned, total, verified_ids}], stop_reason}`，把每组查询词、命中数、是否截断、停止原因结构化留下，使"图谱无数据"与"没查/没查全"可区分。只有 `coverage_status=COMPLETE ∧ stop_reason=exhausted ∧ 未截断` 的 `query_status=NO_HIT` 才支撑负面结论；截断/未覆盖/未查只能 `PARTIAL/UNKNOWN`。`implementation_impacts` 已触发源码或数据库时，对应源不得填 `SKIPPED:not_applicable`，即使终局已确定为 MANUAL/STOP。校验器硬约束与字段结构详见 [`tfs/EXECUTION_CONTRACT.md`](tfs/EXECUTION_CONTRACT.md)「evidence-loop-v2」节。
 
 ---
 
@@ -227,7 +227,7 @@ skill 在非 SKIP fetch 后**先解析产品，再探活该 profile 并固定覆
 精准定位并按需核验“需求对应的后端模块/符号”的完整方法见 [`module-location-recipe.md`](module-location-recipe.md)（与本文同目录，两阶段共读）：
 
 - **口诀**：先搜业务语义，后看流程分组，再沿调用链验证；文件名只作线索，不作结论。
-- **质控**跑其**佐证子集**；只有现有实现细节可能直接闭合阻断时才在精确锚点后查源码。**分析**跑完整方法，并在 `source_required=true` 时用源码 MCP 核验最多 3–5 个关键文件——结果落 `kb.findings`、不进 PM 视角变更方案正文。
+- **质控**跑其**佐证子集**；只有现有实现细节可能直接闭合阻断时才在精确锚点后查源码。**分析**跑完整方法，并在 `source_required=true` 时用源码 MCP 核验最多 3–5 个关键文件——结果落 `kb.findings`、不进 PM 视角需求分析报告正文。
 
 本文件规定"**怎么接 KB**"（探活/三态/降级/审计），`module-location-recipe.md` 规定"**怎么定位模块**"——两者互补。
 

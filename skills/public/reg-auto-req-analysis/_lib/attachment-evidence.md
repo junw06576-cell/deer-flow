@@ -51,5 +51,5 @@ python3 skills/reg-auto-req-analysis/_lib/tfs/tfs_client.py download-attachments
 - `ready=true` 仅表示所有已下载附件均已解析或没有附件；任一未解析、跳过或下载错误即为 `false`。
 - 每个下载文件必须且只能进入 `parsed`、`skipped` 或 `errors` 一个终态。新运行产生的 `parsed` 必须使用允许列表转换链；`skipped/errors` 必须写 `blocking: true|false`。正文明确引用该文件承载范围、规则或验收时才是 blocking。
 - 质控：把附件中已证实的验收、范围、接口、数据对象写入现有核对结论；缺少且附件无法读取时，按既有完整性规则决定是否 `NEED-INFO`，不新增附件专属终局。
-- 分析：把已证实的业务规则、接口契约、流程和验收条件融入变更方案；未解析附件作为 §七假设/限制或人工复核依据，不编造技术细节。
+- 分析：把已证实的业务规则、接口契约、流程和验收条件融入需求分析报告；未解析附件作为 §七假设/限制或人工复核依据，不编造技术细节。
 - 计划的 `attachments` 由执行器透传至 `过程文件/<id>/runs/` 审计；不触发状态流转、标签变更或额外 TFS 写入。

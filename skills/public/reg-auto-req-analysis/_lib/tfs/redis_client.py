@@ -522,6 +522,55 @@ def publish_plan(plan, run_mode, collection, config_path=None, timeout=DEFAULT_T
         return {'ok': False, 'reason': f'{type(exc).__name__}: {exc}'[:300]}
 
 
+def publish_failure(plan, error, run_mode, collection, config_path=None, timeout=DEFAULT_TIMEOUT):
+    """失败路径也写一条最小终局摘要(状态完整性)：verdict=ERROR + 错误摘要 + 清理上一轮成功字段。
+
+    与 publish_plan 同键同索引，覆盖式写最新一轮(成功或失败)结果；**永不抛异常**。
+    返回 {ok, key, fields} 或 {ok:false, reason}。
+    """
+    try:
+        wid = str(plan.get('work_item_id', ''))
+        if not wid:
+            return {'ok': False, 'reason': 'plan 缺 work_item_id'}
+        if not isinstance(collection, str) or not collection:
+            return {'ok': False, 'reason': '缺少 TFS collection'}
+        cfg = load_redis_config(config_path)
+        key = plan_key(collection, wid)
+        checklist = plan.get('checklist') or {}
+        generated_at = checklist.get('generated_at_utc', '') if isinstance(checklist, dict) else ''
+        if not generated_at:
+            generated_at = plan.get('generated_at_utc', '')
+        mapping = {
+            'run_id': plan.get('run_id', ''),
+            'verdict': 'ERROR',
+            'error': str(error)[:300],
+            'tags': '',
+            'state_to': '',
+            'generated_at_utc': generated_at,
+            'run_mode': run_mode,
+        }
+        # 失败轮也带工作项标签(跨轮稳定、成功失败都用得到)；无标签则由下方 HDEL 清理。
+        work_item_label = checklist.get('work_item', '') if isinstance(checklist, dict) else ''
+        if work_item_label:
+            mapping['work_item'] = work_item_label
+        flat = []
+        for k, v in mapping.items():
+            flat.extend([k, v])
+        with _Connection(cfg, timeout) as c:
+            c.execute('HSET', key, *flat)
+            # 清掉上一轮成功残留动作字段，使失败状态自洽完整(ERROR 不混 analysis_description/knowledge)。
+            for stale in ('checklist', 'work_item', 'next', 'skip_reason',
+                          'analysis_description', 'knowledge'):
+                if stale not in mapping:
+                    c.execute('HDEL', key, stale)
+            c.execute('SADD', ids_key(collection), wid)
+            if cfg.get('ttl_seconds'):
+                c.execute('EXPIRE', key, cfg['ttl_seconds'])
+        return {'ok': True, 'key': key, 'fields': len(mapping)}
+    except Exception as exc:
+        return {'ok': False, 'reason': f'{type(exc).__name__}: {exc}'[:300]}
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser(description='Redis 结果存储客户端（仅标准库）')

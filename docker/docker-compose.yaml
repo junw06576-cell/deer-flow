@@ -124,6 +124,7 @@ services:
     working_dir: /app
     environment:
       - CI=true
+      - TZ=Asia/Shanghai
       - DEER_FLOW_PROJECT_ROOT=/app
       - DEER_FLOW_HOME=/app/backend/.deer-flow
       - DEER_FLOW_CONFIG_PATH=/app/backend/config.yaml

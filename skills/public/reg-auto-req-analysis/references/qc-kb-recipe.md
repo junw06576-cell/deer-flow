@@ -4,7 +4,7 @@
 
 ## 何时跑
 
-需求命中高风险早筛（①②⑤⑥），**或**描述/标题/验收**触及 [`../_lib/business-keyword-dictionary.md`](../_lib/business-keyword-dictionary.md) 中任一业务概念**（标准名/同义词/旧称/拼音缩写任一）时运行——**不再限于"结算/费用/医保/上传/校验/报表/接口/明细/账单"9 词枚举**（该枚举漏掉对账/转科/处方/发药/库存/床位/退药等大量同义词需求，是 0 命中的主因）；**初判 `NEED-REVIEW` 且疑义可能由既有业务规则、数据语义或路径证实消除时也运行**。仅纯联调准入跳过、`NEED-INFO`、范围排除、PIMIS/时效和 §6a 根因方向等硬终局锁定后跳过整个发现链（见 `../config/qc-rules.md` 与 SKILL.md 步骤 3）。判"纯文字、无业务实体且非高风险"而跳过时，**必须写明"对照字典检查了哪些概念、为何判定未命中"**（记 `kb.note`），使"真无实体"与"没认出实体"可区分；这不是降级。
+需求命中高风险早筛（①②⑤⑥），**或**描述/标题/验收**触及 [`../_lib/business-keyword-dictionary.md`](../_lib/business-keyword-dictionary.md) 中任一业务概念**（标准名/同义词/旧称/拼音缩写任一）时运行——**不再限于"结算/费用/医保/上传/校验/报表/接口/明细/账单"9 词枚举**（该枚举漏掉对账/转科/处方/发药/库存/床位/退药等大量同义词需求，是 0 命中的主因）；**初判 `NEED-REVIEW` 且疑义可能由既有业务规则、数据语义或路径证实消除时也运行**。纯联调准入、`NEED-INFO`、范围排除、PIMIS/时效和 §6a 根因方向等质控硬终局可跳过尚未进入的分析发现链；一旦 QC PASS 进入分析，则按 `implementation_impacts` 触发的源码/数据库取证必须执行，不能因预计为 MANUAL/STOP 而跳过。判"纯文字、无业务实体且非高风险"而跳过时，**必须写明"对照字典检查了哪些概念、为何判定未命中"**（记 `kb.note`），使"真无实体"与"没认出实体"可区分；这不是降级。
 
 ## 发现链（单需求约 ≤10 次调用，信号够即停）
 
@@ -12,7 +12,7 @@
 
 ### Step R：按需补充需求历史
 
-> **分析阶段默认执行**：进入分析阶段后，相似实现/历史方案查重**默认执行**（`AUTO-ANA` 硬要求 `kb.dedup_ran=true`；选用 `evidence-loop-v2` 时还须把查询记进 `evidence_acquisition.tfs_requirements.queries`，且 `AUTO-ANA` 须 `coverage_status∈{COMPLETE,OUT_OF_SCOPE}`）。只有纯联调、硬终局锁定或确不涉及历史背景时才 `SKIPPED` 并写明原因——**不得仅靠 `dedup_ran=true` 布尔声明而留空查询记录**（v2 由 `pipeline.py` 强制：查询为空则校验失败）。
+> **分析阶段默认执行**：进入分析阶段后，相似实现/历史方案查重**默认执行**（`AUTO-ANA` 硬要求 `kb.dedup_ran=true`；新分析固定使用 `evidence-loop-v2`，还须把查询记进 `evidence_acquisition.tfs_requirements.queries`，且 `AUTO-ANA` 须 `coverage_status∈{COMPLETE,OUT_OF_SCOPE}`）。只有确不涉及历史背景时才 `SKIPPED` 并写明原因；终局预计为 MANUAL/STOP 本身不是跳过理由——**不得仅靠 `dedup_ran=true` 布尔声明而留空查询记录**（v2 由 `pipeline.py` 强制：查询为空则校验失败）。
 
 1. 需要历史背景、显式关系、既有验收或相似需求线索时，先调 `get_requirements_summary` 固定覆盖范围；范围外或快照过旧记 `tfs_requirements.ready=false`/限制后继续。
 2. 当前项关系用 `get_related_work_items`；同类历史用 `search_requirements` 检索。搜索摘要只记候选，必须再用 `get_work_item` 读取完整正文、验收和按需历史后才可记已证实。

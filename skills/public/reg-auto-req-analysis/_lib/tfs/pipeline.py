@@ -3,16 +3,21 @@
 """验证并执行 auto-req-qc / auto-req-analysis 的受约束 TFS 计划。
 
 默认只 dry-run；只有显式传入 --execute 才会写 TFS。计划中的自然语言判断
-（质控结论、变更方案）由 skill 生成，本脚本只负责校验计划和可恢复地执行写入。
+业务结论由 skill 写入结构化快照；本脚本生成确定性报告，并负责校验、并发保护与可恢复执行。
 """
 import argparse
+import copy
+import hashlib
 import html
 import json
 import os
 import re
+import secrets
 import sys
 import tempfile
+import time
 import uuid
+from datetime import datetime, timezone
 
 import tfs_client as tfs
 import redis_client
@@ -20,12 +25,18 @@ import redis_client
 
 PLAN_VERSION = 2
 SUPPORTED_PLAN_VERSIONS = {1, PLAN_VERSION}
+ANALYSIS_REF_PROFILE = 'analysis-ref-v1'
+RUN_BOUND_PROFILE = 'run-bound-v1'
+RUN_RECEIPT_SCHEMA = 'run-receipt-v1'
+ANALYSIS_RESULT_SCHEMA = 'analysis-result-v1'
+RUN_STATUS_SCHEMA = 'run-status-v1'
 RUN_ID_RE = re.compile(r'^[A-Za-z0-9_-]{8,80}$')
 ANALYSIS_GAP_ID_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_-]{0,63}$')
 EVIDENCE_REF_RE = re.compile(r'^(?:work-item|kb:[0-9]+|wiki:[0-9]+|req:[0-9]+)$')
 QC_TAGS = {'PM-AI-QC-NEED-INFO', 'PM-AI-QC-NEED-REVIEW'}
 ANALYSIS_TAGS = {'PM-AI-AUTO-ANA', 'PM-AI-MANUAL-REVIEW', 'PM-AI-STOP-AUTO'}
-DOWNSTREAM_TERMINAL_TAGS = {'PM-AI-MANUAL-PASSED'}
+# 下游人工确认通过标签。不再作硬挡（允许覆盖重跑）；非 SKIP 重跑时在清旧标签阶段作废。
+DOWNSTREAM_PASSED_TAGS = {'PM-AI-MANUAL-PASSED'}
 AUTO_SCOPES = {'field-ui-copy', 'unit-test-completion', 'config-enum-adjustment'}
 # 优化类类别（既有功能优化为主）：AUTO-ANA 时须在 kb.findings 含至少一条 state=已证实 的现有实现锚点。
 OPTIMIZATION_CATEGORIES = {
@@ -122,7 +133,7 @@ EVIDENCE_GAP_TYPES = {
     'GITNEXUS_REPO_MISSING', 'GITNEXUS_EMBEDDINGS_DISABLED', 'DB_SCHEMA_PARTIAL',
     'DB_RELATION_PARTIAL', 'EXISTING_IMPL_LOCATION', 'SIMILAR_IMPL_DEDUP',
     'PRODUCT_ROUTE_UNRESOLVED', 'SOURCE_MCP_UNAVAILABLE', 'SOURCE_SCOPE_PARTIAL',
-    'SOURCE_VERIFICATION_INCOMPLETE',
+    'SOURCE_VERIFICATION_INCOMPLETE', 'DATABASE_MCP_UNAVAILABLE',
 }
 QC_EVIDENCE_RESOLUTION_FIELDS = ('id', 'initial_gap', 'resolution', 'evidence_refs')
 TFS_REQUIREMENTS_FINDING_FIELDS = ('work_item_id', 'fact', 'state', 'source_tool')
@@ -153,6 +164,35 @@ KNOWLEDGE_ROUTE_STATUSES = {
 }
 KNOWLEDGE_ROUTE_ROLES = ('requirements_history', 'code_graph', 'source_code', 'database')
 SOURCE_CODE_TOOLS = {'search_source', 'search_symbol'}
+DATABASE_KNOWLEDGE_TOOLS = {
+    'search_knowledge', 'get_table_knowledge', 'traverse_graph', 'inspect_node',
+}
+IMPLEMENTATION_IMPACTS = {
+    'none', 'ui-presentation', 'field-assignment', 'api-contract', 'business-logic',
+    'data-read-write', 'database-schema', 'data-migration', 'reporting-statistics',
+    'data-permission', 'database-performance', 'database-script',
+}
+SOURCE_REQUIRED_IMPACTS = IMPLEMENTATION_IMPACTS - {'none', 'ui-presentation'}
+DATABASE_REQUIRED_IMPACTS = {
+    'data-read-write', 'database-schema', 'data-migration', 'reporting-statistics',
+    'data-permission', 'database-performance', 'database-script',
+}
+BUSINESS_RULE_COVERAGE_DIMENSIONS = {
+    'presentation', 'empty_value', 'maintenance_granularity', 'historical_data',
+}
+BUSINESS_RULE_COVERAGE_STATUSES = {'CONFIRMED', 'DEFAULTED', 'NOT_APPLICABLE'}
+TRACEABLE_CONFIRMATION_SOURCES = {
+    'work-item', 'attachment', 'inherited-pm-answer', 'confirmed-product-rule',
+}
+BUSINESS_RULE_COVERAGE_SOURCES = {
+    *TRACEABLE_CONFIRMATION_SOURCES, 'presentation-default', 'not-applicable',
+}
+GENERAL_RULE_COVERAGE_DIMENSIONS = {
+    'scope', 'workflow', 'business_semantics', 'business_rules',
+    'permissions', 'exceptions', 'acceptance',
+}
+GENERAL_RULE_COVERAGE_STATUSES = {'CONFIRMED', 'NOT_APPLICABLE'}
+GENERAL_ALWAYS_REQUIRED_DIMENSIONS = {'scope', 'business_semantics', 'acceptance'}
 UI_BASELINE_SOURCE_FAMILIES = {
     'wiki': 'product-knowledge',
     'runtime-observation': 'runtime',
@@ -171,11 +211,11 @@ LEGACY_RULE_SOURCES = {'pre-qc-v1', 'fallback'}
 
 
 def extract_analysis_description_markdown(content):
-    """提取变更方案中唯一的“分析者描述”二级章节。"""
+    """提取需求分析报告中唯一的“分析者描述”二级章节。"""
     headings = list(re.finditer(r'^##\s+(.+?)\s*$', content, re.MULTILINE))
     matches = [heading for heading in headings if heading.group(1) == '三、分析者描述']
     if len(matches) != 1:
-        raise ValueError('变更方案必须且只能包含一个“## 三、分析者描述”章节')
+        raise ValueError('需求分析报告必须且只能包含一个“## 三、分析者描述”章节')
     start = matches[0].end()
     following = next((heading.start() for heading in headings if heading.start() > start), len(content))
     return content[start:following]
@@ -187,9 +227,15 @@ def _plain_analysis_text(value):
     return html.escape(plain, quote=True)
 
 
-def render_analysis_description_html(content, analysis_profile=None):
+def render_analysis_description_html(content, analysis_profile=None, run_id=None):
     """将受控分析者描述 Markdown 转成 TFS 编辑器可读的基础 HTML。"""
     section = re.sub(r'<!--.*?-->', '', extract_analysis_description_markdown(content), flags=re.DOTALL)
+    if analysis_profile == 'concise-v3':
+        numbered_lines = re.findall(r'^\s*([1-9][0-9]*)\.\s+(\S.*?)\s*$', section, re.MULTILINE)
+        numbers = [int(number) for number, _ in numbered_lines]
+        if numbers and (len(numbers) < 2 or len(numbers) > 8
+                        or numbers != list(range(1, len(numbers) + 1))):
+            raise ValueError('concise-v3 多条变更内容必须使用从 1 开始连续的 2–8 项有序编号')
     rendered = []
     for raw_line in section.splitlines():
         line = raw_line.strip()
@@ -213,14 +259,25 @@ def render_analysis_description_html(content, analysis_profile=None):
             else:
                 rendered.append(f'<div>{label}：{value}</div>')
             continue
+        structured_numbered = re.fullmatch(
+            r'([1-9][0-9]*)\.\s+\*\*(.+?)\*\*：\s*(\S.*?)\s*', line)
+        if structured_numbered and analysis_profile == 'concise-v3':
+            number = structured_numbered.group(1)
+            label = _plain_analysis_text(structured_numbered.group(2))
+            value = _plain_analysis_text(structured_numbered.group(3))
+            rendered.append(f'<div>&nbsp;&nbsp;&nbsp;&nbsp;{number}、<strong>{label}：</strong>{value}</div>')
+            continue
         numbered = re.fullmatch(r'([1-9][0-9]*)\.\s+(\S.*?)\s*', line)
         if numbered:
+            if analysis_profile == 'concise-v3':
+                raise ValueError('concise-v3 编号变更项必须按“1. **改动点**：内容”填写')
             rendered.append(f'<div>{numbered.group(1)}. {_plain_analysis_text(numbered.group(2))}</div>')
             continue
         raise ValueError(f'分析者描述含不支持的 Markdown 行：{line}')
     if not rendered:
         raise ValueError('分析者描述不能为空')
-    return '<div><br></div>' + ''.join(rendered) + '<div><br></div>'
+    marker = f'<!-- auto-req-run:{html.escape(run_id, quote=True)} -->' if run_id else ''
+    return marker + '<div><br></div>' + ''.join(rendered) + '<div><br></div>'
 
 
 def legacy_analysis_body(content):
@@ -278,6 +335,596 @@ def read_plan(path):
     return data
 
 
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as source:
+        for chunk in iter(lambda: source.read(65536), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_json_exclusive(path, payload):
+    with open(path, 'x', encoding='utf-8') as output:
+        json.dump(payload, output, ensure_ascii=False, indent=2, sort_keys=True)
+        output.write('\n')
+
+
+def _write_json_atomic(path, payload):
+    directory = os.path.dirname(path)
+    fd, temporary = tempfile.mkstemp(prefix='.run-state-', dir=directory)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as output:
+            json.dump(payload, output, ensure_ascii=False, indent=2, sort_keys=True)
+            output.write('\n')
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def _plan_name(work_item_id, run_id):
+    return f'执行计划_{work_item_id}_{run_id}.json'
+
+
+def _status_name(work_item_id, run_id):
+    return f'运行状态_{work_item_id}_{run_id}.json'
+
+
+def _canonical_run_dir(work_item_id, run_id, process_root=None):
+    root = os.path.abspath(process_root or os.path.join(os.getcwd(), '过程文件'))
+    return os.path.join(root, str(work_item_id), run_id)
+
+
+def _run_status_payload(work_item_id, run_id, status, **details):
+    updated_at = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+    return {
+        'schema': RUN_STATUS_SCHEMA,
+        'work_item_id': work_item_id,
+        'run_id': run_id,
+        'session_id': run_id,
+        'thread_id': run_id,
+        'status': status,
+        'updated_at_utc': updated_at,
+        'history': [{'status': status, 'at_utc': updated_at}],
+        **details,
+    }
+
+
+def _set_run_status(work_item_id, run_id, status, process_root=None, **details):
+    run_dir = _canonical_run_dir(work_item_id, run_id, process_root)
+    status_path = os.path.join(run_dir, _status_name(work_item_id, run_id))
+    payload = _run_status_payload(work_item_id, run_id, status, **details)
+    if os.path.isfile(status_path) and not os.path.islink(status_path):
+        errors = []
+        current = _read_json_object(status_path, 'run_status', errors)
+        if (not errors and current.get('work_item_id') == work_item_id
+                and current.get('run_id') == run_id):
+            payload['history'] = list(current.get('history') or []) + payload['history']
+    _write_json_atomic(status_path, payload)
+    return status_path
+
+
+def _set_meta_run_status(meta, plan, status, **details):
+    payload = _run_status_payload(plan['work_item_id'], plan['run_id'], status, **details)
+    path = os.path.join(
+        meta['run_dir'], _status_name(plan['work_item_id'], plan['run_id']))
+    if os.path.isfile(path) and not os.path.islink(path):
+        errors = []
+        current = _read_json_object(path, 'run_status', errors)
+        if (not errors and current.get('work_item_id') == plan['work_item_id']
+                and current.get('run_id') == plan['run_id']):
+            payload['history'] = list(current.get('history') or []) + payload['history']
+    _write_json_atomic(path, payload)
+    return path
+
+
+def get_run_status(work_item_id, run_id, process_root=None):
+    """只按 run_id 读取规范状态；禁止按工作项回退到其它运行。"""
+    if (not isinstance(work_item_id, int) or work_item_id <= 0
+            or not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id)):
+        return result(False, error_code='RUN_ID_CONTEXT_MISMATCH',
+                      error='work_item_id 或 run_id 格式无效')
+    run_dir = _canonical_run_dir(work_item_id, run_id, process_root)
+    status_path = os.path.join(run_dir, _status_name(work_item_id, run_id))
+    if not os.path.isfile(status_path) or os.path.islink(status_path):
+        return result(False, error_code='RUN_NOT_FOUND', error='未知 run_id')
+    errors = []
+    status = _read_json_object(status_path, 'run_status', errors)
+    if (errors or status.get('schema') != RUN_STATUS_SCHEMA
+            or status.get('work_item_id') != work_item_id
+            or status.get('run_id') != run_id
+            or status.get('session_id') != run_id
+            or status.get('thread_id') != run_id):
+        return result(False, error_code='RUN_ID_CONTEXT_MISMATCH',
+                      error='运行状态身份与请求不一致')
+    return result(True, **status)
+
+
+def redis_status_projection_for_run(run_id, fields):
+    """FastAPI /status 的 Redis 辅助镜像闸：只接受同一 run_id。"""
+    if not isinstance(fields, dict):
+        return None
+    redis_run_id = fields.get('run_id')
+    if isinstance(redis_run_id, bytes):
+        redis_run_id = redis_run_id.decode('utf-8', errors='replace')
+    return fields if redis_run_id == run_id else None
+
+
+def init_run(work_item_id, process_root=None):
+    """原子创建一次分析运行；run_id 只能由执行器生成。"""
+    if not isinstance(work_item_id, int) or work_item_id <= 0:
+        raise ValueError('work_item_id 必须是正整数')
+    root = os.path.abspath(process_root or os.path.join(os.getcwd(), '过程文件'))
+    item_dir = os.path.join(root, str(work_item_id))
+    os.makedirs(item_dir, exist_ok=True)
+    for _ in range(128):
+        run_id = (f'run_{tfs.beijing_timestamp("%Y%m%d_%H%M%S")}_'
+                  f'{work_item_id}_{secrets.token_hex(4)}')
+        run_dir = os.path.join(item_dir, run_id)
+        try:
+            os.mkdir(run_dir)
+        except FileExistsError:
+            continue
+        receipt_name = f'运行回执_{work_item_id}_{run_id}.json'
+        receipt_path = os.path.join(run_dir, receipt_name)
+        status_path = os.path.join(run_dir, _status_name(work_item_id, run_id))
+        receipt = {
+            'schema': RUN_RECEIPT_SCHEMA,
+            'work_item_id': work_item_id,
+            'run_id': run_id,
+            'run_dir': os.path.realpath(run_dir),
+            'created_at_utc': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+        }
+        try:
+            _write_json_exclusive(receipt_path, receipt)
+            _write_json_exclusive(
+                status_path, _run_status_payload(work_item_id, run_id, 'INITIALIZED'))
+        except Exception:
+            try:
+                if os.path.exists(receipt_path):
+                    os.unlink(receipt_path)
+                if os.path.exists(status_path):
+                    os.unlink(status_path)
+                os.rmdir(run_dir)
+            except OSError:
+                pass
+            raise
+        return result(True, work_item_id=work_item_id, run_id=run_id,
+                      session_id=run_id, thread_id=run_id,
+                      status_url=f'/api/v1/session/{run_id}/status',
+                      status='INITIALIZED', run_dir=run_dir, run_receipt={
+                          'path': receipt_name,
+                          'sha256': sha256_file(receipt_path),
+                      })
+    raise RuntimeError('RUN_ID_COLLISION_EXHAUSTED：连续碰撞次数过多，未能创建运行目录')
+
+
+def _analysis_ref_name(work_item_id, run_id):
+    return f'分析结果_{work_item_id}_{run_id}.json'
+
+
+def _receipt_name(work_item_id, run_id):
+    return f'运行回执_{work_item_id}_{run_id}.json'
+
+
+def _validate_ref_object(value, field, expected_name, errors):
+    if not isinstance(value, dict) or set(value) != {'path', 'sha256'}:
+        errors.append(f'{field} 必须精确包含 path、sha256')
+        return None
+    if not is_local_artifact_name(value.get('path')) or value.get('path') != expected_name:
+        errors.append(f'{field}.path 必须为 {expected_name}')
+    digest = value.get('sha256')
+    if not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest):
+        errors.append(f'{field}.sha256 必须为 64 位小写十六进制摘要')
+    return value
+
+
+def _validate_bound_run(plan, plan_path, expected_profile, errors):
+    """校验新运行的规范目录、计划文件名与不可复制回执身份。"""
+    wid = plan.get('work_item_id')
+    run_id = plan.get('run_id')
+    if not isinstance(wid, int) or wid <= 0:
+        errors.append('work_item_id 必须是正整数')
+    if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
+        errors.append('run_id 必须为 8-80 位字母、数字、- 或 _')
+    if (not isinstance(wid, int) or wid <= 0
+            or not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id)):
+        return None
+    run_dir = os.path.dirname(os.path.abspath(plan_path))
+    if (os.path.basename(run_dir) != run_id
+            or os.path.basename(os.path.dirname(run_dir)) != str(wid)):
+        errors.append('RUN_ID_CONTEXT_MISMATCH/SOURCE_RUN_DIRECTORY_MISMATCH：计划必须位于 过程文件/<id>/<run_id>/')
+    if os.path.basename(plan_path) != _plan_name(wid, run_id):
+        errors.append(f'RUN_ID_CONTEXT_MISMATCH：计划文件名必须为 {_plan_name(wid, run_id)}')
+    receipt_ref = (_validate_ref_object(
+        plan.get('run_receipt'), 'run_receipt', _receipt_name(wid, run_id), errors)
+                   if 'run_receipt' in plan else None)
+    if plan.get('plan_profile') != expected_profile:
+        errors.append(f'plan_profile 必须为 {expected_profile}')
+    if receipt_ref is None:
+        return None
+    receipt_path_value = receipt_ref.get('path')
+    receipt_digest = receipt_ref.get('sha256')
+    if (receipt_path_value != _receipt_name(wid, run_id)
+            or not isinstance(receipt_digest, str)
+            or not re.fullmatch(r'[0-9a-f]{64}', receipt_digest)):
+        return None
+    receipt_path = os.path.join(run_dir, receipt_path_value)
+    receipt = None
+    if not os.path.isfile(receipt_path):
+        errors.append(f'run_receipt 文件不存在：{receipt_path}')
+    elif os.path.islink(receipt_path):
+        errors.append('run_receipt 不得为符号链接')
+    elif sha256_file(receipt_path) != receipt_digest:
+        errors.append('run_receipt 摘要不一致')
+    else:
+        receipt = _read_json_object(receipt_path, 'run_receipt', errors)
+    if receipt is not None:
+        if (receipt.get('schema') != RUN_RECEIPT_SCHEMA
+                or receipt.get('work_item_id') != wid
+                or receipt.get('run_id') != run_id):
+            errors.append('RUN_ID_CONTEXT_MISMATCH：run_receipt 身份与计划不一致')
+        if (not isinstance(receipt.get('created_at_utc'), str)
+                or not receipt['created_at_utc'].endswith('Z')):
+            errors.append('run_receipt.created_at_utc 必须为非空 UTC 时间')
+        if receipt.get('run_dir') != os.path.realpath(run_dir):
+            errors.append('RUN_ID_CONTEXT_MISMATCH/SOURCE_RUN_DIRECTORY_MISMATCH：运行回执未绑定当前规范目录')
+    if errors:
+        return None
+    return {
+        'run_dir': run_dir,
+        'receipt_path': receipt_path,
+        'plan_path': os.path.abspath(plan_path),
+        'plan_sha256': sha256_file(plan_path),
+    }
+
+
+def materialize_run_bound(plan, plan_path):
+    """校验 SKIP/QC 终局的运行回执绑定，返回现有完整计划结构。"""
+    errors = []
+    required = ('version', 'plan_profile', 'work_item_id', 'run_id', 'run_receipt',
+                'skill', 'expected_rev', 'expected_state', 'verdict', 'rules_source', 'artifacts')
+    for field in required:
+        if field not in plan:
+            errors.append(f'缺少字段 {field}')
+    if plan.get('version') != PLAN_VERSION:
+        errors.append(f'{RUN_BOUND_PROFILE} 仅允许 version={PLAN_VERSION}')
+    if plan.get('verdict') not in ROUTING_VERDICTS | QC_VERDICTS:
+        errors.append(f'{RUN_BOUND_PROFILE} 仅允许 SKIP-ANALYSIS、NEED-INFO、NEED-REVIEW')
+    meta = _validate_bound_run(plan, plan_path, RUN_BOUND_PROFILE, errors)
+    if errors:
+        return None, None, errors
+    expanded = copy.deepcopy(plan)
+    expanded.pop('plan_profile', None)
+    expanded.pop('run_receipt', None)
+    meta['snapshot_sha256'] = meta['plan_sha256']
+    return expanded, meta, []
+
+
+def _render_report(snapshot):
+    """从结构化分析快照确定性渲染需求分析报告。"""
+    report = snapshot.get('report')
+    errors = []
+    if not isinstance(report, dict):
+        return '', ['analysis_result.report 必须为对象']
+    closure = report.get('closure')
+    description = report.get('analysis_description')
+    traceability = report.get('traceability')
+    if not isinstance(closure, dict) or set(closure) != set(ITERATION_ANALYSIS_CLOSURE_REQUIREMENTS):
+        errors.append('analysis_result.report.closure 必须精确覆盖五个迭代分析闭环章节')
+    if not isinstance(description, dict):
+        errors.append('analysis_result.report.analysis_description 必须为对象')
+        description = {}
+    menu_path = description.get('menu_path')
+    categories = description.get('categories')
+    if not isinstance(menu_path, str) or not menu_path.strip():
+        errors.append('analysis_result.report.analysis_description.menu_path 必须为非空字符串')
+    if not isinstance(categories, list) or not categories:
+        errors.append('analysis_result.report.analysis_description.categories 必须为非空数组')
+        categories = []
+    category_names = []
+    for index, category in enumerate(categories, start=1):
+        if not isinstance(category, dict):
+            errors.append(f'analysis_description.categories[{index}] 必须为对象')
+            continue
+        name = category.get('category')
+        items = category.get('items')
+        if not isinstance(name, str) or name not in ANALYSIS_DESCRIPTION_REQUIREMENTS:
+            errors.append(f'analysis_description.categories[{index}].category 不合法')
+        else:
+            category_names.append(name)
+        if (not isinstance(items, list) or not items
+                or not all(isinstance(item, dict)
+                           and isinstance(item.get('label'), str) and item['label'].strip()
+                           and isinstance(item.get('content'), str) and item['content'].strip()
+                           for item in items)):
+            errors.append(f'analysis_description.categories[{index}].items 必须为非空的 label/content 对象数组')
+    if len(category_names) != len(set(category_names)):
+        errors.append('analysis_description.categories.category 不可重复')
+    if not isinstance(traceability, list) or not traceability:
+        errors.append('analysis_result.report.traceability 必须为非空数组')
+        traceability = []
+    trace_fields = ('id', 'scope', 'behavior', 'acceptance', 'status', 'basis')
+    for index, row in enumerate(traceability, start=1):
+        if (not isinstance(row, dict) or set(row) != set(trace_fields)
+                or not all(isinstance(row.get(field), str) and row[field].strip()
+                           and '|' not in row[field] and '\n' not in row[field]
+                           for field in trace_fields)):
+            errors.append(f'analysis_result.report.traceability[{index}] 必须精确包含 6 个非空且不含表格分隔符的字段')
+    if errors:
+        return '', errors
+
+    lines = [
+        '# 需求分析报告',
+        f'<!-- auto-req-run:{snapshot["run_id"]} -->',
+        '',
+        '## 一、分析结论',
+        f'- **终局**：{snapshot.get("verdict", "")}',
+        '',
+        '## 二、迭代分析闭环',
+    ]
+    for heading, labels in ITERATION_ANALYSIS_CLOSURE_REQUIREMENTS.items():
+        section = closure.get(heading)
+        if not isinstance(section, dict) or set(section) != set(labels):
+            errors.append(f'analysis_result.report.closure.{heading} 必须精确包含：{list(labels)}')
+            continue
+        lines.append(f'### {heading}')
+        for label in labels:
+            value = section.get(label)
+            if not isinstance(value, str) or not value.strip():
+                errors.append(f'analysis_result.report.closure.{heading}.{label} 必须为非空字符串')
+            else:
+                lines.append(f'- **{label}**：{value.strip()}')
+    lines.extend(['', '## 三、分析者描述', f'- **菜单路径**：{menu_path.strip()}'])
+    for category in categories:
+        if not isinstance(category, dict):
+            continue
+        lines.append(f'### {category.get("category", "")}（业务分析）')
+        for item in category.get('items') or []:
+            if isinstance(item, dict):
+                lines.append(f'- **{item.get("label", "")}**：{item.get("content", "").strip()}')
+    lines.extend([
+        '', f'## {TRACEABILITY_HEADING}',
+        '| ' + ' | '.join(TRACEABILITY_HEADERS) + ' |',
+        '| ' + ' | '.join('---' for _ in TRACEABILITY_HEADERS) + ' |',
+    ])
+    for row in traceability:
+        lines.append('| ' + ' | '.join(row[field].strip() for field in trace_fields) + ' |')
+    return '\n'.join(lines) + '\n', errors
+
+
+def _read_json_object(path, field, errors):
+    try:
+        with open(path, 'r', encoding='utf-8') as source:
+            value = json.load(source)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        errors.append(f'{field} 无法读取：{exc}')
+        return None
+    if not isinstance(value, dict):
+        errors.append(f'{field} 根节点必须为 JSON object')
+        return None
+    return value
+
+
+def materialize_analysis_ref(plan, plan_path):
+    """校验回执/快照引用，并生成兼容现有验证器的完整 v2 计划。"""
+    errors = []
+    required = ('version', 'plan_profile', 'work_item_id', 'run_id',
+                'expected_rev', 'expected_state', 'run_receipt', 'analysis_result')
+    for field in required:
+        if field not in plan:
+            errors.append(f'缺少字段 {field}')
+    if plan.get('version') != PLAN_VERSION:
+        errors.append(f'{ANALYSIS_REF_PROFILE} 仅允许 version={PLAN_VERSION}')
+    if plan.get('plan_profile') != ANALYSIS_REF_PROFILE:
+        errors.append(f'plan_profile 必须为 {ANALYSIS_REF_PROFILE}')
+    wid = plan.get('work_item_id')
+    run_id = plan.get('run_id')
+    if not isinstance(wid, int) or wid <= 0:
+        errors.append('work_item_id 必须是正整数')
+    if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
+        errors.append('run_id 必须为 8-80 位字母、数字、- 或 _')
+    if not isinstance(plan.get('expected_rev'), int) or plan.get('expected_rev', 0) < 1:
+        errors.append('expected_rev 必须是正整数')
+    if not isinstance(plan.get('expected_state'), str) or not plan.get('expected_state', '').strip():
+        errors.append('expected_state 必须是非空字符串')
+    if not isinstance(wid, int) or wid <= 0 or not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id):
+        return None, None, errors
+    run_dir = os.path.dirname(os.path.abspath(plan_path))
+    if os.path.basename(run_dir) != run_id or os.path.basename(os.path.dirname(run_dir)) != str(wid):
+        errors.append('RUN_ID_CONTEXT_MISMATCH/SOURCE_RUN_DIRECTORY_MISMATCH：瘦计划必须位于 过程文件/<id>/<run_id>/')
+    if os.path.basename(plan_path) != _plan_name(wid, run_id):
+        errors.append(f'RUN_ID_CONTEXT_MISMATCH：计划文件名必须为 {_plan_name(wid, run_id)}')
+    receipt_ref = (_validate_ref_object(
+        plan.get('run_receipt'), 'run_receipt', _receipt_name(wid, run_id), errors)
+                   if 'run_receipt' in plan else None)
+    analysis_ref = (_validate_ref_object(
+        plan.get('analysis_result'), 'analysis_result', _analysis_ref_name(wid, run_id), errors)
+                    if 'analysis_result' in plan else None)
+    if receipt_ref is None or analysis_ref is None:
+        return None, None, errors
+    expected_refs = (
+        ('run_receipt', receipt_ref, _receipt_name(wid, run_id)),
+        ('analysis_result', analysis_ref, _analysis_ref_name(wid, run_id)),
+    )
+    if any(
+            ref.get('path') != expected_name
+            or not isinstance(ref.get('sha256'), str)
+            or not re.fullmatch(r'[0-9a-f]{64}', ref.get('sha256'))
+            for _, ref, expected_name in expected_refs):
+        return None, None, errors
+    receipt_path = os.path.join(run_dir, receipt_ref['path'])
+    snapshot_path = os.path.join(run_dir, analysis_ref['path'])
+    readable = {}
+    for field, path, expected_digest in (
+            ('run_receipt', receipt_path, receipt_ref['sha256']),
+            ('analysis_result', snapshot_path, analysis_ref['sha256'])):
+        if not os.path.isfile(path):
+            errors.append(f'{field} 文件不存在：{path}')
+        elif os.path.islink(path):
+            errors.append(f'{field} 不得为符号链接')
+        elif sha256_file(path) != expected_digest:
+            errors.append(f'{field} 摘要不一致')
+        else:
+            readable[field] = path
+    receipt = (_read_json_object(readable['run_receipt'], 'run_receipt', errors)
+               if 'run_receipt' in readable else None)
+    snapshot = (_read_json_object(readable['analysis_result'], 'analysis_result', errors)
+                if 'analysis_result' in readable else None)
+    if receipt is not None:
+        expected_identity = {'work_item_id': wid, 'run_id': run_id}
+        if (receipt.get('schema') != RUN_RECEIPT_SCHEMA
+                or any(receipt.get(key) != value for key, value in expected_identity.items())):
+            errors.append('run_receipt 身份与瘦计划不一致')
+        if (not isinstance(receipt.get('created_at_utc'), str)
+                or not receipt['created_at_utc'].endswith('Z')):
+            errors.append('run_receipt.created_at_utc 必须为非空 UTC 时间')
+        if receipt.get('run_dir') != os.path.realpath(run_dir):
+            errors.append('RUN_ID_CONTEXT_MISMATCH/SOURCE_RUN_DIRECTORY_MISMATCH：运行回执未绑定当前规范目录')
+    if snapshot is None:
+        return None, None, errors
+    expected_identity = {'work_item_id': wid, 'run_id': run_id}
+    if (snapshot.get('schema') != ANALYSIS_RESULT_SCHEMA
+            or any(snapshot.get(key) != value for key, value in expected_identity.items())):
+        errors.append('analysis_result 身份与瘦计划不一致')
+    if (not isinstance(snapshot.get('generated_at_utc'), str)
+            or not snapshot['generated_at_utc'].endswith('Z')):
+        errors.append('analysis_result.generated_at_utc 必须为非空 UTC 时间')
+    forbidden = {'version', 'skill', 'expected_rev', 'expected_state', 'tags', 'state_to',
+                 'rules_source', 'artifacts', 'analysis_description',
+                 'plan_profile', 'run_receipt', 'analysis_result'}
+    present = sorted(forbidden & set(snapshot))
+    if present:
+        errors.append(f'analysis_result 不得包含执行字段：{present}')
+    verdict = snapshot.get('verdict')
+    if verdict not in ANALYSIS_VERDICTS:
+        errors.append(f'analysis_result.verdict 必须为 {sorted(ANALYSIS_VERDICTS)} 之一')
+    if snapshot.get('confirmation_policy') != SINGLE_CONFIRMATION_POLICY:
+        errors.append(
+            f'analysis_result.confirmation_policy 必须为 {SINGLE_CONFIRMATION_POLICY!r}，'
+            'PM 可回答的方案或验收歧义必须回退 QC NEED-REVIEW')
+    report_content, report_errors = _render_report(snapshot)
+    errors.extend(report_errors)
+    if errors:
+        return None, None, errors
+    semantic = {
+        key: copy.deepcopy(value) for key, value in snapshot.items()
+        if key not in {'schema', 'work_item_id', 'run_id', 'created_at_utc', 'generated_at_utc',
+                       'verdict', 'report'}
+    }
+    categories = [entry['category'] for entry in snapshot['report']['analysis_description']['categories']]
+    expanded = {
+        **semantic,
+        'version': PLAN_VERSION,
+        'run_id': run_id,
+        'skill': 'auto-req-analysis',
+        'work_item_id': wid,
+        'expected_rev': plan.get('expected_rev'),
+        'expected_state': plan.get('expected_state'),
+        'verdict': verdict,
+        'rules_source': {'qc': QC_RULE_SOURCE, 'analysis': 'evidence-loop-v2'},
+        'analysis_description': {'categories': categories},
+        'generated_at_utc': snapshot.get('generated_at_utc', snapshot.get('created_at_utc', '')),
+    }
+    tags, state_to, _ = expected_for(expanded)
+    expanded['tags'] = sorted(tags)
+    expanded['state_to'] = state_to
+    report_name = f'需求分析报告_{wid}_{run_id}.md'
+    expanded['artifacts'] = [{'kind': 'change-plan', 'path': report_name}]
+    meta = {
+        'run_dir': run_dir,
+        'receipt_path': receipt_path,
+        'snapshot_path': snapshot_path,
+        'snapshot_sha256': analysis_ref['sha256'],
+        'report_path': os.path.join(run_dir, report_name),
+        'report_content': report_content,
+        'plan_path': os.path.abspath(plan_path),
+        'plan_sha256': sha256_file(plan_path),
+    }
+    return expanded, meta, []
+
+
+def _validate_materialized_plan(expanded, meta, check_files=True):
+    if not check_files:
+        return validate_plan(expanded, os.path.join(meta['run_dir'], 'plan.json'), check_files=False)
+    with tempfile.TemporaryDirectory(prefix='analysis-ref-validate-') as directory:
+        report_name = expanded['artifacts'][0]['path']
+        report_path = os.path.join(directory, report_name)
+        with open(report_path, 'w', encoding='utf-8') as output:
+            output.write(meta['report_content'])
+        return validate_plan(expanded, os.path.join(directory, 'plan.json'), check_files=True)
+
+
+def _classify_ref_errors(errors):
+    source_tokens = ('run_receipt', 'RUN_ID_CONTEXT_MISMATCH', '工作项', 'expected_rev', 'expected_state')
+    source_errors = [error for error in errors if any(token in error for token in source_tokens)]
+    analysis_errors = [error for error in errors if error not in source_errors]
+    return {'analysis': analysis_errors, 'source': source_errors, 'execution': []}
+
+
+def _ensure_frozen_analysis(meta, plan):
+    """冻结快照与报告；同 run 的不同摘要永久拒绝。"""
+    if sha256_file(meta['snapshot_path']) != meta['snapshot_sha256']:
+        raise ValueError('analysis_result 摘要在冻结前发生变化')
+    freeze_path = os.path.join(
+        meta['run_dir'], f'分析冻结_{plan["work_item_id"]}_{plan["run_id"]}.json')
+    freeze = {
+        'schema': 'analysis-finalization-v1',
+        'work_item_id': plan['work_item_id'],
+        'run_id': plan['run_id'],
+        'analysis_result_sha256': meta['snapshot_sha256'],
+        'report_sha256': hashlib.sha256(meta['report_content'].encode('utf-8')).hexdigest(),
+    }
+    if os.path.exists(freeze_path):
+        existing = _read_json_object(freeze_path, 'analysis_finalization', [])
+        if existing != freeze:
+            raise ValueError('RUN_ID_ALREADY_FINALIZED：同一 run_id 已冻结为不同分析摘要')
+    else:
+        try:
+            _write_json_exclusive(freeze_path, freeze)
+        except FileExistsError:
+            return _ensure_frozen_analysis(meta, plan)
+    if os.path.exists(meta['report_path']):
+        with open(meta['report_path'], 'r', encoding='utf-8') as source:
+            if source.read() != meta['report_content']:
+                raise ValueError('RUN_ID_ALREADY_FINALIZED：同一 run_id 的报告内容与冻结快照不一致')
+    else:
+        try:
+            with open(meta['report_path'], 'x', encoding='utf-8') as output:
+                output.write(meta['report_content'])
+        except FileExistsError:
+            return _ensure_frozen_analysis(meta, plan)
+    return freeze_path
+
+
+def _ensure_frozen_plan(meta, plan):
+    """冻结本 run 的计划文件摘要；任何 profile 都不能改写同一 run 的终局。"""
+    if sha256_file(meta['plan_path']) != meta['plan_sha256']:
+        raise ValueError('RUN_ID_ALREADY_FINALIZED：计划在校验后发生变化')
+    freeze_path = os.path.join(
+        meta['run_dir'], f'计划冻结_{plan["work_item_id"]}_{plan["run_id"]}.json')
+    freeze = {
+        'schema': 'run-plan-finalization-v1',
+        'work_item_id': plan['work_item_id'],
+        'run_id': plan['run_id'],
+        'plan_sha256': meta['plan_sha256'],
+    }
+    if os.path.exists(freeze_path):
+        errors = []
+        existing = _read_json_object(freeze_path, 'plan_finalization', errors)
+        if errors or existing != freeze:
+            raise ValueError('RUN_ID_ALREADY_FINALIZED：同一 run_id 已冻结为不同计划摘要')
+    else:
+        try:
+            _write_json_exclusive(freeze_path, freeze)
+        except FileExistsError:
+            return _ensure_frozen_plan(meta, plan)
+    return freeze_path
+
+
 def artifact_path(plan_path, artifact):
     return os.path.join(os.path.dirname(os.path.abspath(plan_path)), artifact['path'])
 
@@ -291,12 +938,32 @@ def is_local_artifact_name(value):
 def expected_artifact_filename(plan, kind):
     wid = plan['work_item_id']
     run_id = plan['run_id']
+    analysis_source = plan.get('rules_source')
+    if isinstance(analysis_source, dict):
+        analysis_source = analysis_source.get('analysis')
+    analysis_filename = (
+        f'需求分析报告_{wid}_{run_id}.md'
+        if analysis_source == 'evidence-loop-v2'
+        else f'变更方案_{wid}_{run_id}.md'
+    )
     names = {
         'qc-followup': f'待补充信息_{wid}_{run_id}.json',
-        'change-plan': f'变更方案_{wid}_{run_id}.md',
+        # change-plan 是稳定的机器契约；evidence-loop-v2 起仅更新用户可见文件名。
+        'change-plan': analysis_filename,
         'manual-followup': f'待确认清单_{wid}_{run_id}.md',
     }
     return names.get(kind)
+
+
+def allowed_artifact_filenames(plan, kind):
+    """返回可回放文件名；新报告名优先，旧“变更方案”仅作历史兼容。"""
+    preferred = expected_artifact_filename(plan, kind)
+    if preferred is None:
+        return set()
+    allowed = {preferred}
+    if kind == 'change-plan' and preferred.startswith('需求分析报告_'):
+        allowed.add(f'变更方案_{plan["work_item_id"]}_{plan["run_id"]}.md')
+    return allowed
 
 
 def validate_rules_source(plan, errors):
@@ -410,6 +1077,11 @@ def validate_confirmation_policy(plan, errors):
             errors.append('新策略的 kb.source_required 必须明确本轮是否需要源码核验')
         if not isinstance(kb.get('database_ready'), bool):
             errors.append('新策略的 kb.database_ready 必须明确数据库图谱是否就绪')
+        rules_source = plan.get('rules_source')
+        if (isinstance(rules_source, dict)
+                and rules_source.get('analysis') == 'evidence-loop-v2'
+                and not isinstance(kb.get('database_required'), bool)):
+            errors.append('evidence-loop-v2 的 kb.database_required 必须明确本轮是否需要数据库图谱核验')
         for index, finding in enumerate(kb.get('findings') or [], start=1):
             if (not isinstance(finding, dict)
                     or finding.get('source_type') not in ('code', 'database')):
@@ -465,6 +1137,165 @@ def validate_confirmation_policy(plan, errors):
                     errors.append(
                         f'新策略的 {source}.findings[{index}].{field} 必须为非空字符串，'
                         '供 Redis 佐证清单直接展示')
+
+
+def validate_general_rule_coverage(plan, errors):
+    """evidence-loop-v2 的通用七面必须逐面确认或明确不适用。"""
+    rules_source = plan.get('rules_source')
+    if (not isinstance(rules_source, dict)
+            or rules_source.get('analysis') != 'evidence-loop-v2'):
+        return
+
+    coverage = plan.get('general_rule_coverage')
+    if not isinstance(coverage, dict):
+        errors.append('evidence-loop-v2 分析计划必须含 general_rule_coverage 对象')
+        return
+    if set(coverage) != GENERAL_RULE_COVERAGE_DIMENSIONS:
+        errors.append(
+            'general_rule_coverage 必须精确覆盖 scope、workflow、business_semantics、'
+            'business_rules、permissions、exceptions、acceptance')
+    for dimension in sorted(GENERAL_RULE_COVERAGE_DIMENSIONS):
+        decision = coverage.get(dimension)
+        if not isinstance(decision, dict):
+            errors.append(f'general_rule_coverage.{dimension} 必须为对象')
+            continue
+        status = decision.get('status')
+        source = decision.get('source')
+        if status not in GENERAL_RULE_COVERAGE_STATUSES:
+            errors.append(
+                f'general_rule_coverage.{dimension}.status 必须为 '
+                f'{sorted(GENERAL_RULE_COVERAGE_STATUSES)} 之一；通用七面不得使用默认值')
+        if not isinstance(decision.get('basis'), str) or not decision['basis'].strip():
+            errors.append(f'general_rule_coverage.{dimension}.basis 必须为非空字符串')
+        if status == 'CONFIRMED' and source not in TRACEABLE_CONFIRMATION_SOURCES:
+            errors.append(f'general_rule_coverage.{dimension}=CONFIRMED 必须声明可追溯确认来源')
+        elif status == 'NOT_APPLICABLE' and source != 'not-applicable':
+            errors.append(f'general_rule_coverage.{dimension}=NOT_APPLICABLE 必须声明 not-applicable')
+        if dimension in GENERAL_ALWAYS_REQUIRED_DIMENSIONS and status != 'CONFIRMED':
+            errors.append(f'general_rule_coverage.{dimension} 不允许 NOT_APPLICABLE，必须有明确依据')
+
+
+def validate_implementation_evidence(plan, errors):
+    """evidence-loop-v2 将实现影响、专项四面与源码/数据库取证绑定。"""
+    rules_source = plan.get('rules_source')
+    if (not isinstance(rules_source, dict)
+            or rules_source.get('analysis') != 'evidence-loop-v2'):
+        return
+
+    impacts = plan.get('implementation_impacts')
+    if (not isinstance(impacts, list) or not impacts
+            or not all(isinstance(item, str) and item in IMPLEMENTATION_IMPACTS
+                       for item in impacts)
+            or len(impacts) != len(set(impacts))):
+        errors.append(
+            'evidence-loop-v2 的 implementation_impacts 必须为非空、不重复的实现影响白名单子集')
+        impacts = []
+    elif 'none' in impacts and len(impacts) != 1:
+        errors.append('implementation_impacts=none 时不得同时声明其它实现影响')
+
+    coverage = plan.get('business_rule_coverage')
+    if not isinstance(coverage, dict):
+        errors.append('evidence-loop-v2 分析计划必须含 business_rule_coverage 对象')
+        coverage = {}
+    elif set(coverage) != BUSINESS_RULE_COVERAGE_DIMENSIONS:
+        errors.append(
+            'business_rule_coverage 必须精确覆盖 presentation、empty_value、'
+            'maintenance_granularity、historical_data')
+    for dimension in BUSINESS_RULE_COVERAGE_DIMENSIONS:
+        decision = coverage.get(dimension)
+        if not isinstance(decision, dict):
+            if coverage:
+                errors.append(f'business_rule_coverage.{dimension} 必须为对象')
+            continue
+        status = decision.get('status')
+        source = decision.get('source')
+        if status not in BUSINESS_RULE_COVERAGE_STATUSES:
+            errors.append(
+                f'business_rule_coverage.{dimension}.status 必须为 '
+                f'{sorted(BUSINESS_RULE_COVERAGE_STATUSES)} 之一')
+        if not isinstance(decision.get('basis'), str) or not decision['basis'].strip():
+            errors.append(f'business_rule_coverage.{dimension}.basis 必须为非空字符串')
+        if source not in BUSINESS_RULE_COVERAGE_SOURCES:
+            errors.append(
+                f'business_rule_coverage.{dimension}.source 必须为 '
+                f'{sorted(BUSINESS_RULE_COVERAGE_SOURCES)} 之一')
+        elif status == 'CONFIRMED' and source not in TRACEABLE_CONFIRMATION_SOURCES:
+            errors.append(f'business_rule_coverage.{dimension}=CONFIRMED 必须声明可追溯确认来源')
+        elif status == 'DEFAULTED' and source != 'presentation-default':
+            errors.append(f'business_rule_coverage.{dimension}=DEFAULTED 仅允许 presentation-default')
+        elif status == 'NOT_APPLICABLE' and source != 'not-applicable':
+            errors.append(f'business_rule_coverage.{dimension}=NOT_APPLICABLE 必须声明 not-applicable')
+
+    impacts_set = set(impacts)
+    if impacts_set & DATABASE_REQUIRED_IMPACTS:
+        for dimension in ('empty_value', 'maintenance_granularity', 'historical_data'):
+            decision = coverage.get(dimension)
+            if isinstance(decision, dict) and decision.get('status') == 'DEFAULTED':
+                errors.append(
+                    f'数据读写/数据库影响需求不得默认 business_rule_coverage.{dimension}；'
+                    '须由工作项、附件、已继承 PM 答案或已证实产品规则确认，'
+                    '否则回退 QC NEED-REVIEW')
+
+    kb = plan.get('kb')
+    if not isinstance(kb, dict):
+        return
+    source_required = bool(impacts_set & SOURCE_REQUIRED_IMPACTS)
+    database_required = bool(impacts_set & DATABASE_REQUIRED_IMPACTS)
+    if kb.get('source_required') is not source_required:
+        errors.append(
+            f'implementation_impacts={sorted(impacts_set)} 要求 '
+            f'kb.source_required={str(source_required).lower()}')
+    if kb.get('database_required') is not database_required:
+        errors.append(
+            f'implementation_impacts={sorted(impacts_set)} 要求 '
+            f'kb.database_required={str(database_required).lower()}')
+
+    tools_used = kb.get('tools_used') or []
+    tools_set = set(tools_used) if isinstance(tools_used, list) else set()
+    database_tools_used = DATABASE_KNOWLEDGE_TOOLS & tools_set
+    database_findings = [
+        finding for finding in (kb.get('findings') or [])
+        if isinstance(finding, dict) and finding.get('source_type') == 'database'
+    ]
+    for index, finding in enumerate(database_findings, start=1):
+        if finding.get('source_tool') not in DATABASE_KNOWLEDGE_TOOLS:
+            errors.append(
+                f'evidence-loop-v2 的数据库 finding[{index}].source_tool 必须为 '
+                f'{sorted(DATABASE_KNOWLEDGE_TOOLS)} 之一')
+        elif finding.get('source_tool') not in tools_set:
+            errors.append(
+                f'evidence-loop-v2 的数据库 finding[{index}].source_tool 必须出现在 tools_used')
+    if database_tools_used and kb.get('database_required') is not True:
+        errors.append('调用数据库图谱工具时 kb.database_required 必须为 true')
+    if database_findings and kb.get('database_required') is not True:
+        errors.append('携带数据库 finding 时 kb.database_required 必须为 true')
+    if kb.get('database_required') is True and kb.get('database_ready') is True:
+        if not database_tools_used:
+            errors.append('kb.database_required=true 且数据库图谱就绪时必须实际调用数据库图谱工具')
+        if not database_findings:
+            errors.append('kb.database_required=true 且数据库图谱就绪时必须留下数据库 finding')
+
+    gaps = plan.get('evidence_gaps') or []
+    gap_types = {
+        gap.get('type') for gap in gaps if isinstance(gap, dict) and isinstance(gap.get('type'), str)
+    }
+    if (kb.get('source_required') is True and kb.get('source_ready') is False
+            and not gap_types & {'SOURCE_MCP_UNAVAILABLE', 'SOURCE_SCOPE_PARTIAL',
+                                 'SOURCE_VERIFICATION_INCOMPLETE'}):
+        errors.append('源码核验必需但不可用时，evidence_gaps 必须记录源码不可用或覆盖缺口')
+    if (kb.get('database_required') is True and kb.get('database_ready') is False
+            and not gap_types & {'DATABASE_MCP_UNAVAILABLE', 'DB_SCHEMA_PARTIAL',
+                                 'DB_RELATION_PARTIAL'}):
+        errors.append('数据库核验必需但不可用时，evidence_gaps 必须记录数据库不可用或覆盖缺口')
+
+    acquisition = plan.get('evidence_acquisition')
+    if isinstance(acquisition, dict):
+        database = acquisition.get('db_knowledge')
+        if (database_required and isinstance(database, dict)
+                and database.get('query_status') == 'SKIPPED'):
+            errors.append(
+                '数据库核验必需时 evidence_acquisition.db_knowledge 不得为 SKIPPED；'
+                '须实际查询，或如实记录来源不可用/覆盖缺口')
 
 
 def validate_ui_baseline(plan, errors):
@@ -949,11 +1780,14 @@ def validate_attachments(plan, errors):
         if item.get('status') != 'parsed':
             errors.append(f'attachments.parsed[{index}].status 必须为 parsed')
         chain = item.get('converter_chain', item.get('converter'))
-        if chain is not None and chain not in ATTACHMENT_CONVERTERS:
+        if chain is not None and (not isinstance(chain, str)
+                                  or chain not in ATTACHMENT_CONVERTERS):
             errors.append(
                 f'attachments.parsed[{index}] 的转换链必须为 {sorted(ATTACHMENT_CONVERTERS)} 之一')
         if enriched:
-            if item.get('converter_chain') not in ATTACHMENT_CONVERTERS:
+            enriched_chain = item.get('converter_chain')
+            if (not isinstance(enriched_chain, str)
+                    or enriched_chain not in ATTACHMENT_CONVERTERS):
                 errors.append(f'attachments.parsed[{index}].converter_chain 缺失或不合法')
             if item.get('runtime_mode') not in ATTACHMENT_RUNTIME_MODES:
                 errors.append(f'attachments.parsed[{index}].runtime_mode 缺失或不合法')
@@ -1157,19 +1991,20 @@ def validate_analysis_description(plan, plan_path, check_files, errors):
     path = artifact_path(plan_path, change)
     if not os.path.isfile(path):
         return
+    source = os.path.basename(path)
     with open(path, 'r', encoding='utf-8') as f:
         content = f.read()
     review_content = re.sub(r'<!--.*?-->', '', content, flags=re.DOTALL)
     validate_iteration_analysis_closure(plan, review_content, errors)
     if '## 三、分析者描述' not in review_content:
-        errors.append('变更方案缺少“## 三、分析者描述”区')
-        return
+        errors.append('需求分析报告缺少“## 三、分析者描述”区')
+        return source
     try:
         analysis_section = re.sub(
             r'<!--.*?-->', '', extract_analysis_description_markdown(content), flags=re.DOTALL)
     except ValueError as exc:
         errors.append(str(exc))
-        return
+        return source
     if plan['version'] == PLAN_VERSION and profile != 'concise-v3':
         for label in ANALYSIS_DECISION_SUMMARY_REQUIREMENTS:
             matches = re.findall(
@@ -1189,7 +2024,7 @@ def validate_analysis_description(plan, plan_path, check_files, errors):
     else:
         declared = set(re.findall(r'`([a-z-]+)`', declared_match.group('value'))) if declared_match else set()
         if declared != set(categories):
-            errors.append('变更方案“需求类别”必须与 analysis_description.categories 完全一致')
+            errors.append('需求分析报告“需求类别”必须与 analysis_description.categories 完全一致')
 
     path_values = re.findall(
         r'^\s*-\s*\*\*路径\*\*：\s*(\S.*?)\s*$', analysis_section, re.MULTILINE)
@@ -1200,6 +2035,16 @@ def validate_analysis_description(plan, plan_path, check_files, errors):
             errors.append('concise-v3 分析者描述不得包含固定“路径”行')
         if len(menu_path_values) != 1:
             errors.append('concise-v3 分析者描述必须且只能包含一个非空“菜单路径”')
+        numbered_lines = re.findall(
+            r'^\s*([1-9][0-9]*)\.\s+(\S.*?)\s*$', analysis_section, re.MULTILINE)
+        numbers = [int(number) for number, _ in numbered_lines]
+        if numbers and (len(numbers) < 2 or len(numbers) > 8
+                        or numbers != list(range(1, len(numbers) + 1))):
+            errors.append('concise-v3 多条变更内容必须使用从 1 开始连续的 2–8 项有序编号')
+        for number, value in numbered_lines:
+            if not re.fullmatch(r'\*\*(.+?)\*\*：\s*\S.*', value):
+                errors.append(
+                    f'concise-v3 编号变更项 {number} 必须按“{number}. **改动点**：内容”填写')
     elif len(path_values) != 1:
         errors.append('分析者描述必须且只能包含一个非空“路径”')
     elif not ANALYSIS_PATH_VALUE_RE.fullmatch(path_values[0]):
@@ -1215,11 +2060,13 @@ def validate_analysis_description(plan, plan_path, check_files, errors):
             r'^\s*-\s*\*\*(.+?)\*\*：', preamble, re.MULTILINE)
         if any(label != '菜单路径' for label in preamble_labels):
             errors.append('concise-v3 除“菜单路径”外的业务维度必须写在对应类别标题下')
+        if re.search(r'^\s*[1-9][0-9]*\.\s+', preamble, re.MULTILINE):
+            errors.append('concise-v3 编号变更项必须写在对应类别标题下')
     for index, header in enumerate(headers):
         end = headers[index + 1].start() if index + 1 < len(headers) else len(category_content)
         sections[header.group(1)] = category_content[header.end():end]
     if set(sections) != set(categories):
-        errors.append('变更方案三级标题类别必须与 analysis_description.categories 完全一致')
+        errors.append('需求分析报告三级标题类别必须与 analysis_description.categories 完全一致')
     for category in categories:
         section = sections.get(category, '')
         if profile == 'concise-v3':
@@ -1244,21 +2091,24 @@ def validate_analysis_description(plan, plan_path, check_files, errors):
                 errors.append(f'分析类别 {category} 必须且只能包含一个“{label}”维度')
 
     if re.search(r'<[^>\r\n]+>', review_content) or re.search(r'\bTODO\b', review_content, re.IGNORECASE):
-        errors.append('变更方案不得包含模板占位符或 TODO')
+        errors.append('需求分析报告不得包含模板占位符或 TODO')
     for phrase in ANALYSIS_BANNED_PHRASES:
         if phrase in review_content:
-            errors.append(f'变更方案包含空泛描述：{phrase}')
+            errors.append(f'需求分析报告包含空泛描述：{phrase}')
+
+    return source
 
 
 def validate_analysis_traceability(plan, content, errors):
     """校验 v2 业务范围、方案、验收和结论状态的一对一追踪。"""
     source = plan.get('rules_source')
-    if not isinstance(source, dict) or source.get('analysis') != 'evidence-loop-v1':
+    if (not isinstance(source, dict)
+            or source.get('analysis') not in {'evidence-loop-v1', 'evidence-loop-v2'}):
         return
 
     matches = list(re.finditer(rf'^##\s+{re.escape(TRACEABILITY_HEADING)}\s*$', content, re.MULTILINE))
     if len(matches) != 1:
-        errors.append(f'变更方案必须且只能包含一个“## {TRACEABILITY_HEADING}”区')
+        errors.append(f'需求分析报告必须且只能包含一个“## {TRACEABILITY_HEADING}”区')
         return
     start = matches[0].end()
     following = re.search(r'^##\s+', content[start:], re.MULTILINE)
@@ -1315,9 +2165,10 @@ def validate_analysis_traceability(plan, content, errors):
 
 
 def validate_iteration_analysis_closure(plan, content, errors):
-    """校验 evidence-loop-v1 变更方案的业务分析闭环。"""
+    """校验 evidence-loop 需求分析报告的业务分析闭环。"""
     source = plan.get('rules_source')
-    if not isinstance(source, dict) or source.get('analysis') != 'evidence-loop-v1':
+    if (not isinstance(source, dict)
+            or source.get('analysis') not in {'evidence-loop-v1', 'evidence-loop-v2'}):
         return
 
     for heading, labels in ITERATION_ANALYSIS_CLOSURE_REQUIREMENTS.items():
@@ -1335,7 +2186,7 @@ def validate_iteration_analysis_closure(plan, content, errors):
 
     closure_matches = list(re.finditer(r'^##\s+二、迭代分析闭环\s*$', content, re.MULTILINE))
     if len(closure_matches) != 1:
-        errors.append('变更方案必须且只能包含一个“## 二、迭代分析闭环”区')
+        errors.append('需求分析报告必须且只能包含一个“## 二、迭代分析闭环”区')
     closure_start = closure_matches[0] if closure_matches else None
     if not closure_start:
         return
@@ -1385,7 +2236,185 @@ def validate_manual_followup(plan, plan_path, gaps, check_files, errors):
                 errors.append(f'待确认清单 {gap.get("id", "")} 缺少非空字段“{label}”')
 
 
+def _validation_warning(code, field, message):
+    return {'code': code, 'field': field, 'message': message}
+
+
+def _normalize_plan_for_validation(plan):
+    """只归一化内存副本；原计划文件和冻结摘要保持不变。"""
+    normalized = copy.deepcopy(plan)
+    warnings = []
+    normalizations = []
+    if not isinstance(normalized, dict):
+        return normalized, warnings, normalizations
+    attachments = normalized.get('attachments')
+    parsed = attachments.get('parsed') if isinstance(attachments, dict) else None
+    if not isinstance(parsed, list):
+        return normalized, warnings, normalizations
+    sequence_map = {
+        ('libreoffice', 'markitdown'): 'libreoffice+markitdown',
+        ('libreoffice', 'builtin-fallback'): 'libreoffice+builtin-fallback',
+    }
+    for index, item in enumerate(parsed):
+        if not isinstance(item, dict):
+            continue
+        chain = item.get('converter_chain')
+        if not isinstance(chain, list):
+            continue
+        canonical = None
+        if len(chain) == 1 and chain[0] in ATTACHMENT_CONVERTERS:
+            canonical = chain[0]
+        elif tuple(chain) in sequence_map:
+            canonical = sequence_map[tuple(chain)]
+        if canonical is None:
+            continue
+        field = f'attachments.parsed[{index}].converter_chain'
+        item['converter_chain'] = canonical
+        source_shape = '单元素数组' if len(chain) == 1 else '组合数组'
+        warnings.append(_validation_warning(
+            'ATTACHMENT_CHAIN_NORMALIZED', field,
+            f'已从{source_shape}归一化为 {canonical}'))
+        normalizations.append({'field': field, 'before': chain, 'after': canonical})
+    return normalized, warnings, normalizations
+
+
+def _warning_for_nonblocking_error(plan, error):
+    verdict = plan.get('verdict') if isinstance(plan, dict) else None
+    if ('attachments.parsed[' in error
+            and ('转换链' in error or 'converter_chain' in error)):
+        match = re.search(r'attachments\.parsed\[([0-9]+)\]', error)
+        field = (f'attachments.parsed[{match.group(1)}].converter_chain'
+                 if match else 'attachments.parsed[].converter_chain')
+        return _validation_warning('ATTACHMENT_CHAIN_INVALID', field, error)
+    if (verdict != 'AUTO-ANA'
+            and error == 'kb.source_required=true 且源码 MCP 就绪时必须留下源码 finding'):
+        return _validation_warning(
+            'SOURCE_FINDING_MISSING', 'kb.findings',
+            '非自动放行终局缺少非决定性源码 finding；保留为证据审计告警')
+    if (verdict != 'AUTO-ANA'
+            and error == 'tfs_requirements.ready=true 时 tools_used 必须包含 get_requirements_summary'):
+        evidence = plan.get('tfs_requirements') if isinstance(plan, dict) else None
+        if isinstance(evidence, dict) and evidence.get('findings'):
+            return _validation_warning(
+                'REQUIREMENTS_PROBE_NOT_RECORDED', 'tfs_requirements.tools_used',
+                '需求历史已有 finding，但 tools_used 未记录探活工具；不伪造调用记录')
+    if verdict != 'AUTO-ANA' and re.fullmatch(
+            r'源码 MCP finding kb\.findings\[[0-9]+\]\.source_tool 必须出现在 tools_used',
+            error):
+        return _validation_warning(
+            'TOOL_USAGE_NOT_RECORDED', 'kb.tools_used',
+            '源码 finding 已存在，但 tools_used 未记录对应探活工具；不伪造调用记录')
+    if (verdict != 'AUTO-ANA'
+            and error == 'kb.source_required=true 且源码 MCP 就绪时必须实际调用 '
+                         'search_source 或 search_symbol'
+            and any(isinstance(finding, dict)
+                    and finding.get('source_tool') in SOURCE_CODE_TOOLS
+                    for finding in (plan.get('kb') or {}).get('findings') or [])):
+        return _validation_warning(
+            'TOOL_USAGE_NOT_RECORDED', 'kb.tools_used',
+            '源码 finding 已存在，但 tools_used 未记录对应探活工具；不伪造调用记录')
+    if verdict != 'AUTO-ANA' and re.fullmatch(
+            r'tfs_requirements\.findings\[[0-9]+\]\.source_tool 必须出现在 tools_used',
+            error):
+        return _validation_warning(
+            'TOOL_USAGE_NOT_RECORDED', 'tfs_requirements.tools_used',
+            '需求历史 finding 已存在，但 tools_used 未记录对应工具；不伪造调用记录')
+    return None
+
+
+def _finalize_validation(plan, raw, warnings=None, normalizations=None):
+    blocking = []
+    downgraded = list(warnings or [])
+    for error in raw.get('errors') or []:
+        warning = _warning_for_nonblocking_error(plan, error)
+        if warning:
+            downgraded.append(warning)
+        else:
+            blocking.append(error)
+    for warning in raw.get('warnings') or []:
+        if warning not in downgraded:
+            downgraded.append(warning)
+    unique_warnings = []
+    warning_keys = set()
+    for warning in downgraded:
+        key = (warning.get('code'), warning.get('field'))
+        if key in warning_keys:
+            continue
+        warning_keys.add(key)
+        unique_warnings.append(warning)
+    downgraded = unique_warnings
+    merged_normalizations = list(raw.get('normalizations') or [])
+    for normalization in normalizations or []:
+        if normalization not in merged_normalizations:
+            merged_normalizations.append(normalization)
+    classified = raw.get('errors_by_class') or {
+        'analysis': list(blocking), 'source': [], 'execution': []}
+    blocking_set = set(blocking)
+    blocking_by_class = {
+        category: [error for error in classified.get(category, []) if error in blocking_set]
+        for category in ('analysis', 'source', 'execution')
+    }
+    if blocking and not any(blocking_by_class.values()):
+        blocking_by_class['analysis'] = list(blocking)
+    validation = {
+        'decision': 'REJECT' if blocking else 'PASS',
+        'blocking_errors': blocking_by_class,
+        'warnings': downgraded,
+        'normalizations': merged_normalizations,
+    }
+    return {
+        **raw,
+        'ok': not blocking,
+        'errors': blocking,
+        'errors_by_class': blocking_by_class,
+        'warnings': downgraded,
+        'normalizations': merged_normalizations,
+        'validation': validation,
+    }
+
+
 def validate_plan(plan, plan_path, check_files=True):
+    normalized, warnings, normalizations = _normalize_plan_for_validation(plan)
+    raw = _validate_plan_core(normalized, plan_path, check_files)
+    return _finalize_validation(normalized, raw, warnings, normalizations)
+
+
+def _validate_plan_core(plan, plan_path, check_files=True):
+    if isinstance(plan, dict) and plan.get('plan_profile') == RUN_BOUND_PROFILE:
+        expanded, meta, ref_errors = materialize_run_bound(plan, plan_path)
+        if ref_errors:
+            return result(False, errors=ref_errors,
+                          errors_by_class=_classify_ref_errors(ref_errors))
+        validation = validate_plan(expanded, plan_path, check_files)
+        validation['plan_profile'] = RUN_BOUND_PROFILE
+        validation['validation_sources'] = {
+            **(validation.get('validation_sources') or {}),
+            'run_receipt': os.path.basename(meta['receipt_path']),
+        }
+        validation['errors_by_class'] = {
+            'analysis': list(validation.get('errors') or []),
+            'source': [],
+            'execution': [],
+        }
+        return validation
+    if isinstance(plan, dict) and plan.get('plan_profile') == ANALYSIS_REF_PROFILE:
+        expanded, meta, ref_errors = materialize_analysis_ref(plan, plan_path)
+        if ref_errors:
+            return result(False, errors=ref_errors,
+                          errors_by_class=_classify_ref_errors(ref_errors))
+        validation = _validate_materialized_plan(expanded, meta, check_files)
+        validation['plan_profile'] = ANALYSIS_REF_PROFILE
+        validation['validation_sources'] = {
+            **(validation.get('validation_sources') or {}),
+            'run_receipt': os.path.basename(meta['receipt_path']),
+            'analysis_result': os.path.basename(meta['snapshot_path']),
+        }
+        validation['errors_by_class'] = {
+            'analysis': list(validation.get('errors') or []),
+            'source': [],
+            'execution': [],
+        }
+        return validation
     errors = []
     required = ('version', 'run_id', 'skill', 'work_item_id', 'expected_rev', 'expected_state',
                 'verdict', 'rules_source', 'artifacts')
@@ -1443,7 +2472,10 @@ def validate_plan(plan, plan_path, check_files=True):
             errors.append('SKIP-ANALYSIS 计划必须含非空 skip_reason')
         for field in ('checklist', 'analysis_description', 'analysis_profile', 'analysis_gaps',
                       'evidence_refs', 'evidence_gaps', 'auto_scopes', 'assignee_to',
-                      'tfs_requirements', 'existing_feature', 'ui_baseline'):
+                      'tfs_requirements', 'existing_feature', 'ui_baseline',
+                      'implementation_impacts', 'general_rule_coverage',
+                      'business_rule_coverage',
+                      'evidence_acquisition'):
             if field in plan and plan[field] not in (None, [], {}):
                 errors.append(f'SKIP-ANALYSIS 计划不得声明 {field}')
 
@@ -1498,10 +2530,13 @@ def validate_plan(plan, plan_path, check_files=True):
     validate_existing_feature(plan, errors)
 
     analysis_gaps = []
+    analysis_source = None
     if plan['verdict'] in ANALYSIS_VERDICTS:
-        validate_analysis_description(plan, plan_path, check_files, errors)
+        analysis_source = validate_analysis_description(plan, plan_path, check_files, errors)
         analysis_gaps = validate_analysis_gaps(plan, errors)
         validate_evidence_gaps(plan, errors)
+        validate_general_rule_coverage(plan, errors)
+        validate_implementation_evidence(plan, errors)
         validate_evidence_refs(plan, errors)
         validate_ui_baseline(plan, errors)
         validate_qc_evidence_resolution(plan, errors)
@@ -1544,8 +2579,13 @@ def validate_plan(plan, plan_path, check_files=True):
             if not is_local_artifact_name(path_name):
                 errors.append(f'附件 path 必须是计划同目录文件名：{path_name}')
                 continue
-            if path_name != expected_filename:
-                errors.append(f'附件文件名必须为 {expected_filename}')
+            allowed_filenames = allowed_artifact_filenames(plan, kind)
+            if path_name not in allowed_filenames:
+                suffix = ''
+                if len(allowed_filenames) > 1:
+                    legacy_names = sorted(allowed_filenames - {expected_filename})
+                    suffix = f'；历史回放兼容 {"、".join(legacy_names)}'
+                errors.append(f'附件文件名必须为 {expected_filename}{suffix}')
                 continue
             if check_files:
                 path = artifact_path(plan_path, artifact)
@@ -1571,22 +2611,75 @@ def validate_plan(plan, plan_path, check_files=True):
         errors.append(f'附件类型必须精确为 {sorted(required_kinds)}，当前为 {sorted(kinds)}')
     if plan['verdict'] in ANALYSIS_VERDICTS:
         validate_manual_followup(plan, plan_path, analysis_gaps, check_files, errors)
-    return result(not errors, errors=errors, expected_tags=sorted(expected_tags), state_to=expected_state_to)
+    return result(not errors, errors=errors, expected_tags=sorted(expected_tags),
+                  state_to=expected_state_to,
+                  validation_sources={'analysis_description': analysis_source})
 
 
-def preflight(client, plan):
+def _load_execution_checkpoint(meta, plan):
+    if not meta:
+        return None
+    path = os.path.join(
+        meta['run_dir'], f'执行检查点_{plan["work_item_id"]}_{plan["run_id"]}.json')
+    if not os.path.isfile(path) or os.path.islink(path):
+        return None
+    errors = []
+    checkpoint = _read_json_object(path, 'execution_checkpoint', errors)
+    if (errors or checkpoint.get('schema') != 'execution-checkpoint-v1'
+            or checkpoint.get('work_item_id') != plan['work_item_id']
+            or checkpoint.get('run_id') != plan['run_id']
+            or checkpoint.get('analysis_result_sha256') != meta['snapshot_sha256']):
+        return None
+    return checkpoint
+
+
+def _update_execution_checkpoint(meta, plan, client, completed_actions, observed_item=None):
+    item = observed_item
+    if item is None:
+        raw = tfs.fetch_raw(client, plan['work_item_id'])
+        item = tfs.map_workitem(raw)
+    checkpoint = {
+        'schema': 'execution-checkpoint-v1',
+        'work_item_id': plan['work_item_id'],
+        'run_id': plan['run_id'],
+        'analysis_result_sha256': meta['snapshot_sha256'],
+        'last_rev': item['rev'],
+        'last_state': item['state'],
+        'completed_actions': list(completed_actions),
+    }
+    path = os.path.join(
+        meta['run_dir'], f'执行检查点_{plan["work_item_id"]}_{plan["run_id"]}.json')
+    fd, temporary = tempfile.mkstemp(prefix='.execution-checkpoint-', dir=meta['run_dir'])
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as output:
+            json.dump(checkpoint, output, ensure_ascii=False, indent=2, sort_keys=True)
+            output.write('\n')
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    return checkpoint
+
+
+def preflight(client, plan, resume_checkpoint=None):
     raw = tfs.fetch_raw(client, plan['work_item_id'])
     item = tfs.map_workitem(raw)
     if item['workItemType'] != '需求':
         return result(False, error=f"工作项类型必须为 '需求'，实际为 {item['workItemType']!r}")
+    same_run_checkpoint = bool(
+        isinstance(resume_checkpoint, dict)
+        and resume_checkpoint.get('last_rev') == item['rev']
+        and resume_checkpoint.get('last_state') == item['state'])
     if item['rev'] != plan['expected_rev']:
-        return result(False, error=f"工作项版本已变化：计划为 rev {plan['expected_rev']}，当前为 rev {item['rev']}；请重新生成计划")
+        if not same_run_checkpoint:
+            return result(False, error=f"工作项版本已变化：计划为 rev {plan['expected_rev']}，当前为 rev {item['rev']}；请重新生成计划")
     if item['state'] != plan['expected_state']:
-        return result(False, error=f"工作项状态已变化：计划为 {plan['expected_state']!r}，当前为 {item['state']!r}；请重新生成计划")
-    blocked = sorted(set(item['tags']) & DOWNSTREAM_TERMINAL_TAGS)
-    if blocked:
-        return result(False, error=f'工作项已有下游终局标签 {blocked}，禁止覆盖')
-    return result(True, raw=raw, work_item=item)
+        if not same_run_checkpoint:
+            return result(False, error=f"工作项状态已变化：计划为 {plan['expected_state']!r}，当前为 {item['state']!r}；请重新生成计划")
+    return result(True, raw=raw, work_item=item, resumed=same_run_checkpoint)
 
 
 def checked_call(action, fn, *args):
@@ -1596,7 +2689,8 @@ def checked_call(action, fn, *args):
     return {'action': action, 'result': response}
 
 
-def record_failure(plan, error, run_mode, state_from='', state_to='', actions=None, extra=None):
+def record_failure(plan, error, run_mode, state_from='', state_to='', actions=None, extra=None,
+                   audit_group='runs'):
     """尽量为已知工作项记录失败；审计自身失败不能掩盖原始错误。"""
     if (not isinstance(plan, dict) or not isinstance(plan.get('work_item_id'), int)
             or plan['work_item_id'] <= 0 or not isinstance(plan.get('run_id'), str)
@@ -1612,6 +2706,10 @@ def record_failure(plan, error, run_mode, state_from='', state_to='', actions=No
         'analysis_gaps': plan.get('analysis_gaps'),
         'evidence_refs': plan.get('evidence_refs'),
         'evidence_gaps': plan.get('evidence_gaps'),
+        'implementation_impacts': plan.get('implementation_impacts'),
+        'general_rule_coverage': plan.get('general_rule_coverage'),
+        'business_rule_coverage': plan.get('business_rule_coverage'),
+        'evidence_acquisition': plan.get('evidence_acquisition'),
         'ui_baseline': plan.get('ui_baseline'),
         'qc_evidence_resolution': plan.get('qc_evidence_resolution'),
         'qc_recheck': plan.get('qc_recheck'),
@@ -1624,17 +2722,35 @@ def record_failure(plan, error, run_mode, state_from='', state_to='', actions=No
     try:
         audit = tfs.record(plan.get('skill', 'auto-req-analysis'), plan['work_item_id'], 'ERROR',
                            plan.get('tags', []), state_from or plan.get('expected_state', ''), state_to,
-                           '', details, plan['run_id'])
+                           '', details, plan['run_id'], audit_group=audit_group)
         return audit.get('audit')
     except Exception:
         return None
 
 
-def failure_result(plan, error, run_mode, state_from='', state_to='', actions=None, extra=None, **kwargs):
+def _resolve_collection(config_path, collection_override=None):
+    """尽力解析 TFS collection 供失败路径发布 Redis(状态完整性)；任何异常返回 None，绝不掩盖原始错误。"""
+    try:
+        return tfs.load_config(config_path, None, collection_override, None).get('collection')
+    except Exception:
+        return None
+
+
+def failure_result(plan, error, run_mode, state_from='', state_to='', actions=None, extra=None,
+                   collection=None, config_path=None, command='apply', audit_group='runs', **kwargs):
     output = result(False, error=str(error), **kwargs)
     if actions is not None:
         output['actions'] = actions
-    audit = record_failure(plan, error, run_mode, state_from, state_to, actions, extra)
+    # redis 先于审计计算，使失败轮的 redis 结果（ok/reason/in_scope）一并落审计 extra。
+    redis_block = {'in_scope': bool(collection and config_path)}
+    if redis_block['in_scope']:
+        redis_block.update(redis_client.publish_failure(plan, error, run_mode, collection, config_path))
+    output['redis'] = redis_block
+    extra = dict(extra or {})
+    extra['command'] = command
+    extra['redis'] = redis_block
+    audit = record_failure(
+        plan, error, run_mode, state_from, state_to, actions, extra, audit_group=audit_group)
     if audit:
         output['audit'] = audit
     return output
@@ -1662,7 +2778,8 @@ def upload_inline_artifact(client, plan, artifact, dry_run):
             pass
 
 
-def apply_field_flow(client, wid, dry_run, fallback_assignee=None, assignee_override=None, run_id=''):
+def apply_field_flow(client, wid, dry_run, fallback_assignee=None, assignee_override=None,
+                     run_id='', before_action=None, on_action_error=None, on_action=None):
     """对工作项执行已验证的「字段流转」（2026-07-28 工作项 259681 实测通过）。
 
     自包含：执行时现读 TFS 取 expected_date / 当前 state / teamProject / Winning.Dev.Leader，
@@ -1684,6 +2801,24 @@ def apply_field_flow(client, wid, dry_run, fallback_assignee=None, assignee_over
     返回 list[dict]（每项 {'action','result'}），供 apply_plan extend 或 flow_item 独立审计。
     """
     actions = []
+
+    def append_action(entry):
+        actions.append(entry)
+        if on_action:
+            on_action(entry)
+
+    def execute_action(action, function, *args):
+        if before_action:
+            before_action(action)
+        try:
+            return checked_call(action, function, *args)
+        except Exception as exc:
+            if on_action_error:
+                on_action_error(exc)
+            raise
+        finally:
+            client.pop('_pipeline_source_guard', None)
+
     raw = tfs.fetch_raw(client, wid)
     item = tfs.map_workitem(raw)
     state = item['state']
@@ -1707,19 +2842,19 @@ def apply_field_flow(client, wid, dry_run, fallback_assignee=None, assignee_over
             pass  # 迭代查询失败 → 降级，继续状态流转
     today = tfs.beijing_date().isoformat()
     if iteration_path:
-        actions.append(checked_call('write-field:IterationPath', tfs.write_field,
-                                    client, wid, tfs.F_ITERATION, iteration_path, 'replace', dry_run))
-        actions.append(checked_call('write-field:StartDate', tfs.write_field,
-                                    client, wid, tfs.F_START_DATE, today, 'replace', dry_run))
+        append_action(execute_action('write-field:IterationPath', tfs.write_field,
+                                     client, wid, tfs.F_ITERATION, iteration_path, 'replace', dry_run))
+        append_action(execute_action('write-field:StartDate', tfs.write_field,
+                                     client, wid, tfs.F_START_DATE, today, 'replace', dry_run))
         if finish_date:
-            actions.append(checked_call('write-field:FinishDate', tfs.write_field,
-                                        client, wid, tfs.F_FINISH_DATE, finish_date, 'replace', dry_run))
+            append_action(execute_action('write-field:FinishDate', tfs.write_field,
+                                         client, wid, tfs.F_FINISH_DATE, finish_date, 'replace', dry_run))
 
     # 2) 两步状态机（入口已是「已分析」则跳过，避免倒退 PATCH 被 TFS 拒）
     if state != '已分析':
         if state != '活动':
-            actions.append(checked_call('set-state:活动', tfs.set_state, client, wid, '活动', dry_run))
-        actions.append(checked_call('set-state:已分析', tfs.set_state, client, wid, '已分析', dry_run))
+            append_action(execute_action('set-state:活动', tfs.set_state, client, wid, '活动', dry_run))
+        append_action(execute_action('set-state:已分析', tfs.set_state, client, wid, '已分析', dry_run))
 
     # 3) 指派（可降级段，最后一步；assignee_override > Dev.Leader > fallback）
     assignee = None
@@ -1729,30 +2864,201 @@ def apply_field_flow(client, wid, dry_run, fallback_assignee=None, assignee_over
         assignee = resolve_assignee_to_winning(item.get('devLeader', ''), fallback_assignee or '')
     if assignee:
         try:
-            actions.append(checked_call('set-assignee', tfs.set_assignee, client, wid, assignee, dry_run))
+            append_action(execute_action('set-assignee', tfs.set_assignee, client, wid, assignee, dry_run))
         except RuntimeError as exc:
             actions.append({'action': 'set-assignee', 'result': {'ok': False, 'error': str(exc)}})
     return actions
 
 
-def apply_plan(plan, plan_path, execute, config_path, pat_override=None, collection_override=None, project_override=None):
-    validation = validate_plan(plan, plan_path, check_files=True)
+def analysis_only_result(plan, meta, reason, collection, config_path,
+                         error_code='EXECUTION_NOT_READY', work_item='', validation=None):
+    """分析已完成但 TFS 执行资格不足：发布本轮分析，不发布 ERROR。"""
+    analysis_desc_html = ''
+    if meta.get('report_content'):
+        analysis_desc_html = render_analysis_description_html(
+            meta['report_content'], plan.get('analysis_profile'), plan.get('run_id'))
+    finalization_sha = meta.get('snapshot_sha256') or meta.get('plan_sha256')
+    validation_result = copy.deepcopy(validation or {
+        'decision': 'PASS',
+        'blocking_errors': {'analysis': [], 'source': [], 'execution': []},
+        'warnings': [], 'normalizations': [],
+    })
+    validation_result['decision'] = 'ANALYSIS_ONLY'
+    execution_blockers = {'analysis': [], 'source': [], 'execution': []}
+    blocker_class = ('source' if error_code in {'SOURCE_CHANGED', 'SOURCE_NOT_READY'}
+                     else 'execution')
+    execution_blockers[blocker_class].append(str(reason))
+    validation_result['blocking_errors'] = execution_blockers
+    redis_result = {'in_scope': bool(collection and config_path)}
+    if redis_result['in_scope']:
+        redis_result.update(redis_client.publish_plan(
+            plan, 'analysis-only', collection, config_path,
+            analysis_description_html=analysis_desc_html, work_item=work_item))
+    details = {
+        'run_mode': 'analysis-only',
+        'command': 'apply',
+        'applied': False,
+        'error_code': error_code,
+        'reason': str(reason),
+        'analysis_result_sha256': finalization_sha,
+        'redis': redis_result,
+        'actions': [],
+        'validation': validation_result,
+        'warning_count': len(validation_result.get('warnings') or []),
+    }
+    audit_path = None
+    try:
+        audit_path = tfs.record(
+            plan['skill'], plan['work_item_id'], plan['verdict'], plan.get('tags', []),
+            plan.get('expected_state', ''), '', '', details, plan['run_id']).get('audit')
+    except Exception:
+        pass
+    output = result(
+        True, applied=False, mode='analysis-only', run_mode='analysis-only', actions=[],
+        verdict=plan['verdict'], tags=plan.get('tags', []), state_to=plan.get('state_to'),
+        analysis_description=analysis_desc_html,
+        error_code=error_code, reason=str(reason), retryable=False,
+        redis=redis_result, analysis_result_sha256=finalization_sha,
+        validation=validation_result,
+        errors_by_class=execution_blockers)
+    if error_code == 'SOURCE_CHANGED':
+        output['requires_new_run'] = True
+    if audit_path:
+        output['audit'] = audit_path
+    return output
+
+
+def apply_plan(plan, plan_path, execute, config_path, pat_override=None, collection_override=None,
+               project_override=None, legacy_replay=False):
+    """受约束计划执行原语；无回执历史计划必须显式 legacy_replay=True。"""
+    profile = plan.get('plan_profile') if isinstance(plan, dict) else None
+    if legacy_replay is True and profile in {RUN_BOUND_PROFILE, ANALYSIS_REF_PROFILE}:
+        return result(False, error_code='LEGACY_REPLAY_NOT_ALLOWED',
+                      error='回执绑定的新运行不得通过 apply-legacy 执行')
+    if legacy_replay is False and profile not in {RUN_BOUND_PROFILE, ANALYSIS_REF_PROFILE}:
+        return result(False, error_code='LEGACY_PLAN_REQUIRES_EXPLICIT_REPLAY',
+                      error='无运行回执的历史计划仅允许 apply-legacy --plan 显式维护回放',
+                      applied=False, actions=[], redis={'in_scope': False})
+    failure_collection = (None if legacy_replay is True
+                          else _resolve_collection(config_path, collection_override))
+    audit_group = 'legacy-runs' if legacy_replay is True else 'runs'
+    ref_meta = None
+    analysis_ref = profile == ANALYSIS_REF_PROFILE
+    if analysis_ref:
+        expanded, ref_meta, ref_errors = materialize_analysis_ref(plan, plan_path)
+        if ref_errors:
+            classified = _classify_ref_errors(ref_errors)
+            rejected = _finalize_validation(
+                plan, result(False, errors=ref_errors, errors_by_class=classified))
+            return failure_result(
+                plan, '计划校验失败：' + '; '.join(ref_errors), 'validate',
+                extra={'validation_errors': ref_errors,
+                       'errors_by_class': classified,
+                       'validation': rejected['validation']},
+                errors=ref_errors,
+                errors_by_class=classified,
+                validation=rejected['validation'],
+                command='apply', audit_group=audit_group,
+                collection=failure_collection, config_path=config_path,
+                error_code=('RUN_ID_CONTEXT_MISMATCH'
+                            if any('RUN_ID_CONTEXT_MISMATCH' in error or 'run_receipt' in error
+                                   for error in ref_errors)
+                            else 'PLAN_VALIDATION_FAILED'))
+        plan = expanded
+        validation = _validate_materialized_plan(plan, ref_meta, check_files=True)
+    elif profile == RUN_BOUND_PROFILE:
+        expanded, ref_meta, ref_errors = materialize_run_bound(plan, plan_path)
+        if ref_errors:
+            classified = _classify_ref_errors(ref_errors)
+            rejected = _finalize_validation(
+                plan, result(False, errors=ref_errors, errors_by_class=classified))
+            return failure_result(
+                plan, '计划校验失败：' + '; '.join(ref_errors), 'validate',
+                extra={'validation_errors': ref_errors, 'errors_by_class': classified,
+                       'validation': rejected['validation']},
+                errors=ref_errors, errors_by_class=classified, command='apply',
+                validation=rejected['validation'],
+                audit_group=audit_group, error_code='RUN_ID_CONTEXT_MISMATCH',
+                collection=failure_collection, config_path=config_path)
+        plan = expanded
+        validation = validate_plan(plan, plan_path, check_files=True)
+    else:
+        validation = validate_plan(plan, plan_path, check_files=True)
     if not validation['ok']:
         return failure_result(plan, '计划校验失败：' + '; '.join(validation['errors']), 'validate',
-                              extra={'validation_errors': validation['errors']},
-                              errors=validation['errors'])
+                              extra={'validation_errors': validation['errors'],
+                                     'validation_sources': validation.get('validation_sources'),
+                                     'validation': validation['validation']},
+                              errors=validation['errors'],
+                              validation=validation['validation'],
+                              collection=failure_collection,
+                              config_path=config_path,
+                              audit_group=audit_group,
+                              errors_by_class={
+                                  'analysis': validation['errors'], 'source': [], 'execution': []})
 
-    run_mode = 'execute' if execute else 'dry-run'
+    if ref_meta:
+        try:
+            _ensure_frozen_plan(ref_meta, plan)
+            if analysis_ref:
+                _ensure_frozen_analysis(ref_meta, plan)
+            _set_meta_run_status(
+                ref_meta, plan, 'FROZEN',
+                warning_count=len(validation.get('warnings') or []))
+        except (OSError, ValueError) as exc:
+            error = str(exc)
+            rejected_validation = copy.deepcopy(validation['validation'])
+            rejected_validation['decision'] = 'REJECT'
+            rejected_validation['blocking_errors']['analysis'].append(error)
+            return failure_result(
+                plan, error, 'validate', errors=[error],
+                errors_by_class={'analysis': [error], 'source': [], 'execution': []},
+                validation=rejected_validation,
+                extra={'validation': rejected_validation},
+                collection=None, config_path=config_path, command='apply',
+                audit_group=audit_group,
+                error_code=('RUN_ID_ALREADY_FINALIZED'
+                            if 'RUN_ID_ALREADY_FINALIZED' in error else 'PLAN_VALIDATION_FAILED'))
+
+    run_mode = 'legacy-replay' if legacy_replay is True else ('execute' if execute else 'dry-run')
+    if ref_meta:
+        _set_meta_run_status(
+            ref_meta, plan, 'APPLYING', execute=bool(execute),
+            warning_count=len(validation.get('warnings') or []))
     try:
         client = tfs.load_config(config_path, pat_override, collection_override, project_override)
+        if legacy_replay is not True:
+            failure_collection = client.get('collection') or failure_collection
         readiness = tfs.precheck(client)
         if not readiness.get('ok'):
-            return failure_result(plan, f"TFS precheck 失败：{readiness.get('error', readiness)}", run_mode)
-        gate = preflight(client, plan)
+            if ref_meta:
+                return analysis_only_result(
+                    plan, ref_meta, f"TFS precheck 失败：{readiness.get('error', readiness)}",
+                    failure_collection, config_path, validation=validation['validation'])
+            return failure_result(plan, f"TFS precheck 失败：{readiness.get('error', readiness)}", run_mode,
+                                  collection=failure_collection, config_path=config_path,
+                                  audit_group=audit_group)
+        resume_checkpoint = _load_execution_checkpoint(ref_meta, plan)
+        gate = preflight(client, plan, resume_checkpoint=resume_checkpoint)
         if not gate['ok']:
-            return failure_result(plan, gate.get('error', gate), run_mode)
+            if ref_meta:
+                gate_error = gate.get('error', gate)
+                source_changed = ('版本已变化' in str(gate_error) or '状态已变化' in str(gate_error))
+                return analysis_only_result(
+                    plan, ref_meta, gate_error, failure_collection, config_path,
+                    error_code='SOURCE_CHANGED' if source_changed else 'SOURCE_NOT_READY',
+                    validation=validation['validation'])
+            return failure_result(plan, gate.get('error', gate), run_mode,
+                                  collection=failure_collection, config_path=config_path,
+                                  audit_group=audit_group)
     except Exception as exc:
-        return failure_result(plan, exc, run_mode)
+        if ref_meta:
+            return analysis_only_result(
+                plan, ref_meta, exc, failure_collection, config_path,
+                validation=validation['validation'])
+        return failure_result(plan, exc, run_mode,
+                              collection=failure_collection, config_path=config_path,
+                              audit_group=audit_group)
 
     dry_run = not execute
     expected_tags = set(validation['expected_tags'])
@@ -1764,48 +3070,183 @@ def apply_plan(plan, plan_path, execute, config_path, pat_override=None, collect
         # 路由跳过终局只记审计/Redis，不清理或新增任何 TFS 标签。
         owned_tags = set()
     actions = []
+    observed_write_entries = []
+    tfs_write_started = False
+    checkpoint_actions = list(
+        (resume_checkpoint or {}).get('completed_actions') or []) if ref_meta else []
+    owned_rev = gate['work_item'].get('rev')
+    owned_state = gate['work_item'].get('state')
+
+    def checkpoint_before_action(_action):
+        if not execute or not ref_meta:
+            return
+        current = tfs.map_workitem(tfs.fetch_raw(client, plan['work_item_id']))
+        if current['rev'] != owned_rev or current['state'] != owned_state:
+            raise RuntimeError(
+                f'SOURCE_CHANGED_DURING_EXECUTION：执行器上次观测 rev/state='
+                f'{owned_rev}/{owned_state}，当前={current["rev"]}/{current["state"]}')
+        client['_pipeline_source_guard'] = {
+            'work_item_id': plan['work_item_id'],
+            'rev': owned_rev, 'state': owned_state,
+        }
+
+    def checkpoint_after_action(entry):
+        nonlocal owned_rev, owned_state, tfs_write_started
+        if not execute or not ref_meta or entry['result'].get('noop') is True:
+            return
+        tfs_write_started = True
+        observed_write_entries.append(entry)
+        post_rev = entry['result'].get('post_rev')
+        post_state = entry['result'].get('post_state')
+        if isinstance(post_rev, int) and not isinstance(post_rev, bool):
+            if post_rev == owned_rev:
+                if post_state not in (None, owned_state):
+                    # rev 不变而 state 变化是不一致信号，不能当作等效 no-op 放行
+                    raise RuntimeError(
+                        f'POST_WRITE_CONFIRMATION_FAILED：动作 {entry["action"]} 写后 rev '
+                        f'未变（{owned_rev}）但 state 由 {owned_state} 变为 {post_state}')
+                # TFS 确认写后无 revision：内容已就位（如仅 run 标记注释差异，TFS 落库即剥）
+                # → 等效 no-op，不推进 owned rev/state，但计入检查点避免续跑重做。
+                checkpoint_actions.append(entry['action'])
+                _update_execution_checkpoint(
+                    ref_meta, plan, client, checkpoint_actions,
+                    observed_item={'rev': owned_rev, 'state': owned_state})
+                return
+            current = {'rev': post_rev, 'state': post_state or owned_state}
+        else:
+            current = None
+            # 兼容未返回 revision 的旧 TFS 响应；短暂等待服务端回读可见，
+            # 不再假设每个业务动作的 revision 必须恰好只增加 1。
+            for delay in (0, 0.1, 0.25):
+                if delay:
+                    time.sleep(delay)
+                candidate = tfs.map_workitem(tfs.fetch_raw(client, plan['work_item_id']))
+                if candidate['rev'] > owned_rev:
+                    current = candidate
+                    break
+        if current is None or current['rev'] < owned_rev:
+            raise RuntimeError(
+                f'POST_WRITE_CONFIRMATION_FAILED：动作 {entry["action"]} 已返回成功，'
+                f'但未取得写后 revision（写前 rev {owned_rev}）')
+        owned_rev, owned_state = current['rev'], current['state']
+        checkpoint_actions.append(entry['action'])
+        _update_execution_checkpoint(
+            ref_meta, plan, client, checkpoint_actions, observed_item=current)
+
+    def apply_action(action, function, *args):
+        nonlocal tfs_write_started
+        checkpoint_before_action(action)
+        try:
+            entry = checked_call(action, function, *args)
+        except Exception as exc:
+            if 'SOURCE_CHANGED_DURING_EXECUTION' not in str(exc):
+                tfs_write_started = tfs_write_started or bool(execute and ref_meta)
+            raise
+        finally:
+            client.pop('_pipeline_source_guard', None)
+        checkpoint_after_action(entry)
+        return entry
+
+    def field_flow_action_error(exc):
+        nonlocal tfs_write_started
+        if 'SOURCE_CHANGED_DURING_EXECUTION' not in str(exc):
+            tfs_write_started = tfs_write_started or bool(execute and ref_meta)
+
+    def field_flow_checkpoint(entry):
+        checkpoint_after_action(entry)
+
     analysis_desc_html = ''  # 分析终局下=写入 TFS 的分析者描述 HTML，供 Redis 镜像
+    # 重跑收敛：清掉 QC + 分析两阶段任一历史标签里不在本次 expected 的；
+    # SKIP-ANALYSIS 的 owned_tags 为空 → cleanup_scope 为空，跳过清理（零写入保持）
+    cleanup_scope = (QC_TAGS | ANALYSIS_TAGS) if owned_tags else set()
+    # 覆盖重跑：作废此前下游人工通过标签（SKIP 同上豁免）
+    invalidate_tags = sorted(set(gate['work_item']['tags']) & DOWNSTREAM_PASSED_TAGS) if owned_tags else []
     try:
-        for tag in sorted((set(gate['work_item']['tags']) & owned_tags) - expected_tags):
-            actions.append(checked_call(f'remove-tag:{tag}', tfs.remove_tag, client, plan['work_item_id'], tag, dry_run))
+        for tag in invalidate_tags:
+            actions.append(apply_action(f'invalidate-tag:{tag}', tfs.remove_tag, client, plan['work_item_id'], tag, dry_run))
+        for tag in sorted((set(gate['work_item']['tags']) & cleanup_scope) - expected_tags):
+            actions.append(apply_action(f'remove-tag:{tag}', tfs.remove_tag, client, plan['work_item_id'], tag, dry_run))
 
         if plan['verdict'] in ANALYSIS_VERDICTS:
             change = next(a for a in plan['artifacts'] if a['kind'] == 'change-plan')
             path = artifact_path(plan_path, change)
             rendered = render_analysis_description_html(
-                tfs.parse_value('@' + path), plan.get('analysis_profile'))
+                tfs.parse_value('@' + path), plan.get('analysis_profile'),
+                plan.get('run_id') if ref_meta else None)
             analysis_desc_html = rendered  # 同一份 HTML 写 TFS + Redis，保证三者同源一致
-            actions.append(checked_call('write-detail-analysis', tfs.replace_detail_analysis_section,
+            actions.append(apply_action('write-detail-analysis', tfs.replace_detail_analysis_section,
                                         client, plan['work_item_id'], rendered, dry_run))
 
         for artifact in plan['artifacts']:
             if isinstance(artifact.get('path'), str):
-                actions.append(checked_call(f"upload:{artifact['kind']}", tfs.upload_attachment, client,
+                actions.append(apply_action(f"upload:{artifact['kind']}", tfs.upload_attachment, client,
                                             plan['work_item_id'], artifact_path(plan_path, artifact), dry_run))
             else:
-                actions.append(checked_call(f"upload:{artifact['kind']}", upload_inline_artifact,
+                actions.append(apply_action(f"upload:{artifact['kind']}", upload_inline_artifact,
                                             client, plan, artifact, dry_run))
+        artifact_kinds = {artifact['kind'] for artifact in plan['artifacts']}
+        if (plan['verdict'] in ANALYSIS_VERDICTS
+                and single_confirmation_enabled(plan)
+                and artifact_kinds == {'change-plan'}):
+            cleanup_args = [client, plan['work_item_id'],
+                            os.path.basename(artifact_path(plan_path, change)), dry_run]
+            if ref_meta:
+                cleanup_args.append(artifact_path(plan_path, change))
+            actions.append(apply_action(
+                'cleanup:analysis-artifacts', tfs.cleanup_analysis_attachments,
+                *cleanup_args))
         for tag in sorted(expected_tags):
-            actions.append(checked_call(f'add-tag:{tag}', tfs.add_tag, client, plan['work_item_id'], tag, dry_run))
+            actions.append(apply_action(f'add-tag:{tag}', tfs.add_tag, client, plan['work_item_id'], tag, dry_run))
         # AUTO-ANA 跑完整字段流转（迭代/起止日期 → 活动 → 已分析 → 指派），与手工流程一致；
         # 替换旧的单步 set-state + 原样传 display name（必报「未知标识」）的不完整实现。
         # 仅 AUTO-ANA（expected_for 里只有它返回非 None state_to）；指派优先 Winning.Dev.Leader。
         if plan['verdict'] == 'AUTO-ANA':
             actions.extend(apply_field_flow(client, plan['work_item_id'], dry_run,
                                             fallback_assignee=plan.get('assignee_to'),
-                                            run_id=plan.get('run_id', '')))
+                                            run_id=plan.get('run_id', ''),
+                                            before_action=checkpoint_before_action if ref_meta else None,
+                                            on_action_error=field_flow_action_error if ref_meta else None,
+                                            on_action=field_flow_checkpoint if ref_meta else None))
     except Exception as exc:
+        if ref_meta and not tfs_write_started:
+            error_code = ('SOURCE_CHANGED' if 'SOURCE_CHANGED_DURING_EXECUTION' in str(exc)
+                          else 'EXECUTION_NOT_READY')
+            return analysis_only_result(
+                plan, ref_meta, exc, failure_collection, config_path,
+                error_code=error_code, validation=validation['validation'])
+        failure_actions = list(actions)
+        for entry in observed_write_entries:
+            if entry not in failure_actions:
+                failure_actions.append(entry)
+        execution_error_code = (
+            'POST_WRITE_CONFIRMATION_FAILED'
+            if 'POST_WRITE_CONFIRMATION_FAILED' in str(exc) else None)
         return failure_result(plan, exc, run_mode, plan['expected_state'],
-                              validation['state_to'] or '', actions)
+                              validation['state_to'] or '', failure_actions,
+                              extra={'errors_by_class': {
+                                  'analysis': [], 'source': [], 'execution': [str(exc)]},
+                                     'validation': validation['validation'],
+                                     'partial_write': bool(observed_write_entries)},
+                              errors_by_class={
+                                  'analysis': [], 'source': [], 'execution': [str(exc)]},
+                              validation=validation['validation'],
+                              collection=failure_collection, config_path=config_path,
+                              audit_group=audit_group,
+                              **({'error_code': execution_error_code}
+                                 if execution_error_code else {}))
 
     _wi = gate.get('work_item') or {}
     work_item_label = f"{_wi.get('id', '')} {_wi.get('title', '')}".strip()
-    redis_result = redis_client.publish_plan(plan, run_mode, client['collection'], config_path,
-                                             analysis_description_html=analysis_desc_html,
-                                             work_item=work_item_label)
+    if legacy_replay is True:
+        redis_result = {'in_scope': False, 'reason': 'legacy replay 不发布正常 Redis 结果'}
+    else:
+        redis_result = redis_client.publish_plan(
+            plan, run_mode, client['collection'], config_path,
+            analysis_description_html=analysis_desc_html, work_item=work_item_label)
+        redis_result['in_scope'] = True
     audit = tfs.record(plan['skill'], plan['work_item_id'], plan['verdict'], sorted(expected_tags),
                        plan['expected_state'], validation['state_to'] or '', '',
-                       {'run_mode': run_mode, 'rules_source': plan['rules_source'],
+                       {'run_mode': run_mode, 'command': 'apply', 'rules_source': plan['rules_source'],
                         'auto_scopes': plan.get('auto_scopes', []), 'kb': plan.get('kb'), 'wiki': plan.get('wiki'),
                         'tfs_requirements': plan.get('tfs_requirements'),
                         'iteration': plan.get('iteration'), 'attachments': plan.get('attachments'),
@@ -1814,20 +3255,164 @@ def apply_plan(plan, plan_path, execute, config_path, pat_override=None, collect
                         'analysis_gaps': plan.get('analysis_gaps'),
                         'evidence_refs': plan.get('evidence_refs'),
                         'evidence_gaps': plan.get('evidence_gaps'),
+                        'implementation_impacts': plan.get('implementation_impacts'),
+                        'general_rule_coverage': plan.get('general_rule_coverage'),
+                        'business_rule_coverage': plan.get('business_rule_coverage'),
+                        'evidence_acquisition': plan.get('evidence_acquisition'),
                         'ui_baseline': plan.get('ui_baseline'),
                         'qc_evidence_resolution': plan.get('qc_evidence_resolution'),
                         'assignee_to': plan.get('assignee_to'),
                         'qc_recheck': plan.get('qc_recheck'),
                         'confirmation_policy': plan.get('confirmation_policy'),
                         'skip_reason': plan.get('skip_reason'),
+                        'invalidated_passed_tags': invalidate_tags,
+                        'validation': validation['validation'],
+                        'warning_count': len(validation.get('warnings') or []),
                         'plan': os.path.abspath(plan_path),
                         'redis': redis_result,
-                        'actions': actions}, plan['run_id'])
+                        'actions': actions}, plan['run_id'], audit_group=audit_group)
     next_action = None
     if plan['verdict'] == 'PASS':
         next_action = {'kind': 'run-skill', 'skill': 'auto-req-analysis', 'work_item_id': plan['work_item_id']}
-    return result(True, mode=run_mode, actions=actions, audit=audit['audit'],
-                  next_action=next_action, redis=redis_result)
+    return result(True, applied=bool(execute), mode=run_mode, run_mode=run_mode,
+                  verdict=plan['verdict'], tags=sorted(expected_tags),
+                  state_to=validation['state_to'],
+                  analysis_description=analysis_desc_html or None,
+                  actions=actions, audit=audit['audit'],
+                  next_action=next_action, redis=redis_result,
+                  validation=validation['validation'])
+
+
+def _apply_run_once(work_item_id, run_id, execute, config_path, pat_override=None,
+                    collection_override=None, project_override=None, process_root=None):
+    """普通执行唯一入口：只加载服务端 run_id 对应规范目录中的唯一计划。"""
+    if (not isinstance(work_item_id, int) or work_item_id <= 0
+            or not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id)):
+        return result(False, error_code='RUN_ID_CONTEXT_MISMATCH',
+                      error='work_item_id 或 run_id 格式无效', applied=False,
+                      actions=[], redis={'in_scope': False})
+    run_dir = _canonical_run_dir(work_item_id, run_id, process_root)
+    known = get_run_status(work_item_id, run_id, process_root)
+    if not known.get('ok'):
+        return result(False, error_code='RUN_ID_CONTEXT_MISMATCH',
+                      error='run_id 不是 init-run 创建的已知规范运行',
+                      work_item_id=work_item_id, run_id=run_id,
+                      applied=False, actions=[], redis={'in_scope': False})
+    current_status = known.get('status')
+    if current_status in {'ANALYZING', 'APPLYING'}:
+        return result(False, error_code='RUN_ALREADY_IN_PROGRESS',
+                      error='同一 run_id 已在执行中，拒绝重复进入和重复生成审计',
+                      work_item_id=work_item_id, run_id=run_id,
+                      applied=False, actions=[], redis={'in_scope': False})
+    if current_status == 'FAILED':
+        return result(False, error_code='RUN_TERMINAL_REQUIRES_NEW_RUN',
+                      error='该 run_id 已失败终结；重新分析必须创建新 run_id',
+                      requires_new_run=True, work_item_id=work_item_id, run_id=run_id,
+                      applied=False, actions=[], redis={'in_scope': False})
+    if current_status == 'ANALYSIS_ONLY' and known.get('error_code') == 'SOURCE_CHANGED':
+        return result(False, error_code='RUN_TERMINAL_REQUIRES_NEW_RUN',
+                      error='该 run_id 因 SOURCE_CHANGED 已终结；重新分析必须创建新 run_id',
+                      requires_new_run=True, work_item_id=work_item_id, run_id=run_id,
+                      applied=False, actions=[], redis={'in_scope': False})
+    plan_path = os.path.join(run_dir, _plan_name(work_item_id, run_id))
+    if not os.path.isfile(plan_path):
+        return result(False, error_code='RUN_NOT_READY',
+                      error='规范运行目录中的执行计划尚未生成',
+                      work_item_id=work_item_id, run_id=run_id,
+                      applied=False, actions=[], redis={'in_scope': False})
+    if os.path.islink(plan_path):
+        return result(False, error_code='RUN_ID_CONTEXT_MISMATCH',
+                      error='规范执行计划不得为符号链接',
+                      work_item_id=work_item_id, run_id=run_id,
+                      applied=False, actions=[], redis={'in_scope': False})
+    try:
+        plan = read_plan(plan_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return result(False, error_code='RUN_ID_CONTEXT_MISMATCH', error=str(exc),
+                      work_item_id=work_item_id, run_id=run_id,
+                      applied=False, actions=[], redis={'in_scope': False})
+    if current_status == 'COMPLETED' and (known.get('applied') or not execute):
+        return result(True, mode='already-completed', run_mode='already-completed',
+                      verdict=known.get('verdict', plan.get('verdict')),
+                      tags=known.get('tags', plan.get('tags', [])),
+                      state_to=known.get('state_to'),
+                      applied=bool(known.get('applied')), idempotent=True, actions=[],
+                      work_item_id=work_item_id, run_id=run_id,
+                      redis={'in_scope': False, 'reason': '同一 run 已完成，不重复发布或生成审计'})
+    _set_run_status(work_item_id, run_id, 'ANALYZING', process_root)
+    if plan.get('work_item_id') != work_item_id or plan.get('run_id') != run_id:
+        output = result(False, error_code='RUN_ID_CONTEXT_MISMATCH',
+                        error='计划身份与 CLI 运行上下文不一致',
+                        applied=False, actions=[], redis={'in_scope': False})
+    else:
+        output = apply_plan(
+            plan, plan_path, execute, config_path, pat_override,
+            collection_override, project_override, legacy_replay=False)
+    output['work_item_id'] = work_item_id
+    output['run_id'] = run_id
+    if output.get('error_code') == 'RUN_NOT_READY':
+        return output
+    if output.get('error_code') == 'SOURCE_CHANGED':
+        terminal = 'FAILED'
+    elif output.get('ok') and output.get('run_mode') == 'analysis-only':
+        terminal = 'ANALYSIS_ONLY'
+    elif output.get('ok'):
+        terminal = 'COMPLETED'
+    else:
+        terminal = 'FAILED'
+    try:
+        _set_run_status(
+            work_item_id, run_id, terminal, process_root,
+            applied=bool(output.get('applied')),
+            error_code=output.get('error_code'),
+            verdict=output.get('verdict'),
+            tags=output.get('tags', []),
+            state_to=output.get('state_to'),
+            run_mode=output.get('run_mode'),
+            warning_count=len((output.get('validation') or {}).get('warnings') or []))
+    except OSError:
+        pass
+    return output
+
+
+def apply_run(work_item_id, run_id, execute, config_path, pat_override=None,
+              collection_override=None, project_override=None, process_root=None):
+    """以规范运行目录内的原子锁串行化普通 apply，避免并发重复审计。"""
+    if (not isinstance(work_item_id, int) or work_item_id <= 0
+            or not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id)):
+        return _apply_run_once(
+            work_item_id, run_id, execute, config_path, pat_override,
+            collection_override, project_override, process_root)
+    run_dir = _canonical_run_dir(work_item_id, run_id, process_root)
+    if not os.path.isdir(run_dir):
+        return _apply_run_once(
+            work_item_id, run_id, execute, config_path, pat_override,
+            collection_override, project_override, process_root)
+    lock_dir = os.path.join(run_dir, '.pipeline-apply-lock')
+    try:
+        os.mkdir(lock_dir)
+    except FileExistsError:
+        return result(False, error_code='RUN_ALREADY_IN_PROGRESS',
+                      error='同一 run_id 已有 apply 调用持有执行锁，拒绝重复生成审计',
+                      work_item_id=work_item_id, run_id=run_id,
+                      applied=False, actions=[], redis={'in_scope': False})
+    try:
+        return _apply_run_once(
+            work_item_id, run_id, execute, config_path, pat_override,
+            collection_override, project_override, process_root)
+    finally:
+        try:
+            os.rmdir(lock_dir)
+        except OSError:
+            pass
+
+
+def apply_legacy_plan(plan, plan_path, execute, config_path, pat_override=None,
+                      collection_override=None, project_override=None):
+    """显式维护回放；永不发布正常 Redis，审计隔离到 legacy-runs。"""
+    return apply_plan(
+        plan, plan_path, execute, config_path, pat_override, collection_override,
+        project_override, legacy_replay=True)
 
 
 def repair_analysis_placement(plan, plan_path, execute, config_path, pat_override=None, collection_override=None, project_override=None):
@@ -1835,7 +3420,8 @@ def repair_analysis_placement(plan, plan_path, execute, config_path, pat_overrid
     validation = validate_plan(plan, plan_path, check_files=True)
     if not validation['ok']:
         return failure_result(plan, '计划校验失败：' + '; '.join(validation['errors']), 'repair-validate',
-                              extra={'validation_errors': validation['errors']},
+                              extra={'validation_errors': validation['errors'],
+                                     'validation_sources': validation.get('validation_sources')},
                               errors=validation['errors'])
     if plan['skill'] != 'auto-req-analysis':
         return failure_result(plan, 'repair-analysis-placement 仅支持 auto-req-analysis 计划', 'repair-validate')
@@ -1907,9 +3493,6 @@ def flow_item(wid, execute, config_path, expected_rev=None, expected_state=None,
             return result(False, error=f"工作项版本已变化：期望 rev {expected_rev}，当前 rev {current['rev']}；请重新确认", mode=run_mode)
         if expected_state and current['state'] != expected_state:
             return result(False, error=f"工作项状态已变化：期望 {expected_state!r}，当前 {current['state']!r}", mode=run_mode)
-        blocked = sorted(set(current['tags']) & DOWNSTREAM_TERMINAL_TAGS)
-        if blocked:
-            return result(False, error=f'工作项已有下游终局标签 {blocked}，禁止覆盖', mode=run_mode)
     except Exception as exc:
         return result(False, error=str(exc), mode=run_mode)
 
@@ -1946,15 +3529,28 @@ def _run_flow(args):
 def main():
     parser = argparse.ArgumentParser(description='auto-req TFS 计划校验与受约束执行器')
     sub = parser.add_subparsers(dest='command', required=True)
+    init = sub.add_parser('init-run', help='为一次新的分析触发原子生成 run_id 与运行回执')
+    init.add_argument('--id', type=int, required=True, help='工作项 ID；run_id 不接受调用方传入')
     validate = sub.add_parser('validate')
     validate.add_argument('--plan', required=True)
-    apply = sub.add_parser('apply')
-    apply.add_argument('--plan', required=True)
+    apply = sub.add_parser('apply', help='按服务端 run_id 加载规范目录中的唯一新计划')
+    apply.add_argument('--id', type=int, required=True, help='工作项 ID')
+    apply.add_argument('--run-id', required=True, help='init-run 返回并由编排器内部传播的 run_id')
     apply.add_argument('--config', default=os.path.join(tfs.SCRIPT_DIR, 'tfs-config.json'))
     apply.add_argument('--pat', default=None, help='临时 PAT；缺省用 TFS_PAT 或配置 tfs.pat')
     apply.add_argument('--collection', default=None, help='临时 collection；缺省用 TFS_COLLECTION 或配置 tfs.collection')
     apply.add_argument('--project', default=None, help='临时 project；缺省用 TFS_PROJECT 或配置 tfs.project')
     apply.add_argument('--execute', action='store_true', help='显式允许写 TFS；缺省只 dry-run')
+    legacy = sub.add_parser('apply-legacy', help='显式维护回放无回执历史计划')
+    legacy.add_argument('--plan', required=True)
+    legacy.add_argument('--config', default=os.path.join(tfs.SCRIPT_DIR, 'tfs-config.json'))
+    legacy.add_argument('--pat', default=None)
+    legacy.add_argument('--collection', default=None)
+    legacy.add_argument('--project', default=None)
+    legacy.add_argument('--execute', action='store_true')
+    status = sub.add_parser('status', help='只按工作项和 run_id 读取规范运行状态')
+    status.add_argument('--id', type=int, required=True)
+    status.add_argument('--run-id', required=True)
     repair = sub.add_parser('repair-analysis-placement')
     repair.add_argument('--plan', required=True)
     repair.add_argument('--config', default=os.path.join(tfs.SCRIPT_DIR, 'tfs-config.json'))
@@ -1977,8 +3573,16 @@ def main():
     flow.add_argument('--execute', action='store_true', help='显式允许写 TFS；缺省只 dry-run')
     args = parser.parse_args()
     try:
-        if args.command == 'flow':
+        if args.command == 'init-run':
+            output = init_run(args.id)
+        elif args.command == 'status':
+            output = get_run_status(args.id, args.run_id)
+        elif args.command == 'flow':
             output = _run_flow(args)
+        elif args.command == 'apply':
+            output = apply_run(
+                args.id, args.run_id, args.execute, args.config,
+                args.pat, args.collection, args.project)
         else:
             plan = read_plan(args.plan)
             if args.command == 'validate':
@@ -1986,15 +3590,26 @@ def main():
                 if not output['ok']:
                     audit = record_failure(plan, '计划校验失败：' + '; '.join(output['errors']), 'validate',
                                          extra={'validation_errors': output['errors'],
-                                                'plan': os.path.abspath(args.plan)})
+                                                'validation_sources': output.get('validation_sources'),
+                                                'validation': output.get('validation'),
+                                                'plan': os.path.abspath(args.plan),
+                                                'command': 'validate',
+                                                'redis': {'in_scope': False}},
+                                         audit_group=(
+                                             'runs' if plan.get('plan_profile') in {
+                                                 RUN_BOUND_PROFILE, ANALYSIS_REF_PROFILE}
+                                             else 'legacy-runs'))
                     if audit:
                         output['audit'] = audit
             elif args.command == 'repair-analysis-placement':
                 output = repair_analysis_placement(plan, args.plan, args.execute, args.config,
                                                    getattr(args, 'pat', None), getattr(args, 'collection', None))
+            elif args.command == 'apply-legacy':
+                output = apply_legacy_plan(
+                    plan, args.plan, args.execute, args.config,
+                    args.pat, args.collection, args.project)
             else:
-                output = apply_plan(plan, args.plan, args.execute, args.config,
-                                    getattr(args, 'pat', None), getattr(args, 'collection', None))
+                raise ValueError(f'未知命令：{args.command}')
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         output = result(False, error=str(exc))
     print(json.dumps(output, ensure_ascii=False, indent=2))

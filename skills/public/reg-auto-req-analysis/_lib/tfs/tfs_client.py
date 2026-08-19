@@ -8,7 +8,7 @@ auto-req-qc / auto-req-analysis 共享 TFS 客户端（标准库 urllib，无第
 HTTP 纪律移植自 reg-req-breakdown/scripts/tfs_batch_upload.py：
   - 按端点显式区分 Content-Type（WIQL/GET 用 json；工作项 PATCH 用 json-patch+json；附件用 octet-stream）
   - 网络错误(-1)/服务端错误(>=500) 重试 3 次
-  - PAT 默认从 tfs-buddy.db.sys_users.pat 取（account 默认 lyf）；也支持 '$ENV' / 字面值（config 里 auth 字段控制）
+  - PAT 优先级：命令行 --pat > 环境变量 $TFS_PAT > 配置 auth.pat（config 里 auth 字段控制，字面值或 '$ENV'；不读任何 sqlite/DB）
 
 所有命令统一打印 JSON 到 stdout；硬错误（配置缺失/PAT 未设）exit 1。
 字段引用名（refname）确认自 reg-req-analysis/scripts/tfs-auto-complete.js：
@@ -53,6 +53,8 @@ PROCESS_DIR = os.path.join(os.path.dirname(os.path.dirname(BUNDLE_ROOT)), '过�
 API = '4.1'
 DEFAULT_ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024
 BEIJING_TZ = datetime.timezone(datetime.timedelta(hours=8), name='Asia/Shanghai')
+ANALYSIS_ARTIFACT_RUN_PATTERN = r'[A-Za-z0-9_-]{8,80}'
+ANALYSIS_REPORT_NAME_PATTERN = r'(?:需求分析报告|变更方案)'
 
 # 字段引用名（确认自 tfs-auto-complete.js）
 F_REQUIREMENT_ANALYSIS = 'Winning.Demand.Analysis'
@@ -218,6 +220,17 @@ def fetch_raw(client, wid):
                          f'/_apis/wit/workitems/{wid}?$expand=relations&api-version={API}', ctype='json')
     if st != 200 or not isinstance(data, dict):
         fail(f"读取工作项 {wid} 失败 (HTTP {st}): {str(data)[:300]}", 'FETCH_FAILED')
+    guard = client.get('_pipeline_source_guard')
+    if isinstance(guard, dict) and guard.get('work_item_id') == wid:
+        client.pop('_pipeline_source_guard', None)
+        current_rev = data.get('rev')
+        current_state = data.get('fields', {}).get(F_STATE, '')
+        if (current_rev != guard.get('rev')
+                or current_state != guard.get('state')):
+            raise RuntimeError(
+                f'SOURCE_CHANGED_DURING_EXECUTION：动作读取 rev/state='
+                f'{current_rev}/{current_state}，执行器持有='
+                f'{guard.get("rev")}/{guard.get("state")}')
     return data
 
 
@@ -281,6 +294,35 @@ def attachment_names(raw):
     return names
 
 
+def _attachment_relation_name(relation):
+    """返回 AttachedFile 关系中的原始文件名；无法确定时返回空串。"""
+    url = relation.get('url', '')
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    name = urllib.parse.unquote(query.get('fileName', [''])[0])
+    return name or (relation.get('attributes') or {}).get('name', '')
+
+
+def _controlled_analysis_attachment_relations(raw, wid):
+    """列出当前工作项三类受控 AI 附件及其零基 relation index。"""
+    escaped_id = re.escape(str(wid))
+    pattern = re.compile(
+        rf'^(?:{ANALYSIS_REPORT_NAME_PATTERN}_{escaped_id}_{ANALYSIS_ARTIFACT_RUN_PATTERN}\.md|'
+        rf'待确认清单_{escaped_id}_{ANALYSIS_ARTIFACT_RUN_PATTERN}\.md|'
+        rf'待补充信息_{escaped_id}_{ANALYSIS_ARTIFACT_RUN_PATTERN}\.json)$')
+    matches = []
+    for relation_index, relation in enumerate(raw.get('relations', []) or []):
+        if relation.get('rel') != 'AttachedFile':
+            continue
+        name = _attachment_relation_name(relation)
+        if pattern.fullmatch(name):
+            matches.append({
+                'index': relation_index,
+                'name': name,
+                'url': relation.get('url', ''),
+            })
+    return matches
+
+
 def attachment_descriptors(raw):
     """列出工作项 AttachedFile 关系，不读取或下载文件。"""
     attachments = []
@@ -288,10 +330,7 @@ def attachment_descriptors(raw):
         if relation.get('rel') != 'AttachedFile':
             continue
         url = relation.get('url', '')
-        query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
-        name = urllib.parse.unquote(query.get('fileName', [''])[0])
-        if not name:
-            name = (relation.get('attributes') or {}).get('name', '')
+        name = _attachment_relation_name(relation)
         attachments.append({
             'name': _safe_attachment_name(name, index),
             'url': url,
@@ -437,8 +476,12 @@ def _attachment_url_allowed(client, url):
     if port != int(client['port']):
         return False
     collection = urllib.parse.quote(str(client['collection']), safe='')
-    prefix = f'/tfs/{collection}/_apis/wit/attachments/'
-    return parsed.path.startswith(prefix)
+    prefixes = [f'/tfs/{collection}/_apis/wit/attachments/']
+    project = client.get('project')
+    if project:
+        prefixes.append(
+            f'/tfs/{collection}/{urllib.parse.quote(str(project), safe="")}/_apis/wit/attachments/')
+    return any(parsed.path.startswith(prefix) for prefix in prefixes)
 
 
 def _host_matches_allowlist(hostname, hosts):
@@ -630,6 +673,20 @@ def patch_workitem(client, wid, raw, operations):
     return wit_retry(client, 'PATCH', f'/_apis/wit/workitems/{wid}?api-version={API}', payload, ctype='patch')
 
 
+def _post_write_identity(data):
+    """从 TFS PATCH 响应提取权威的写后身份，供流水线更新执行检查点。"""
+    if not isinstance(data, dict):
+        return {}
+    identity = {}
+    revision = data.get('rev')
+    if isinstance(revision, int) and not isinstance(revision, bool):
+        identity['post_rev'] = revision
+    fields = data.get('fields')
+    if isinstance(fields, dict) and isinstance(fields.get(F_STATE), str):
+        identity['post_state'] = fields[F_STATE]
+    return identity
+
+
 def add_tag(client, wid, tag, dry_run):
     if tag not in PM_AI_TAGS:
         fail(f"非法标签 {tag}，允许: {sorted(PM_AI_TAGS)}", 'BAD_TAG')
@@ -647,7 +704,8 @@ def add_tag(client, wid, tag, dry_run):
                               [{"op": "replace", "path": f"/fields/{F_TAGS}", "value": ';'.join(after)}])
     if st != 200:
         return {'ok': False, 'id': wid, 'tag': tag, 'before': existing, 'error': f'HTTP {st}: {str(data)[:200]}'}
-    return {'ok': True, 'id': wid, 'tag': tag, 'before': existing, 'after': after, 'dry_run': False}
+    return {'ok': True, 'id': wid, 'tag': tag, 'before': existing, 'after': after,
+            'dry_run': False, **_post_write_identity(data)}
 
 
 def remove_tag(client, wid, tag, dry_run):
@@ -667,7 +725,8 @@ def remove_tag(client, wid, tag, dry_run):
     if st != 200:
         return {'ok': False, 'id': wid, 'tag': tag, 'before': existing,
                 'error': f'HTTP {st}: {str(data)[:200]}'}
-    return {'ok': True, 'id': wid, 'tag': tag, 'before': existing, 'after': after, 'dry_run': False}
+    return {'ok': True, 'id': wid, 'tag': tag, 'before': existing, 'after': after,
+            'dry_run': False, **_post_write_identity(data)}
 
 
 def set_state(client, wid, state, dry_run):
@@ -685,7 +744,8 @@ def set_state(client, wid, state, dry_run):
         # TFS 会校验状态机；非法流转会在此报错 → 调用方据此降级（绝不强转）
         return {'ok': False, 'id': wid, 'before': cur_state, 'target': state,
                 'error': f'HTTP {st}: {str(data)[:200]}'}
-    return {'ok': True, 'id': wid, 'before': cur_state, 'after': state, 'dry_run': False}
+    return {'ok': True, 'id': wid, 'before': cur_state, 'after': state,
+            'dry_run': False, **_post_write_identity(data)}
 
 
 def set_assignee(client, wid, assignee, dry_run):
@@ -700,7 +760,8 @@ def set_assignee(client, wid, assignee, dry_run):
         # 多为身份解析失败（display name/账号 TFS 不接受）→ 调用方据此降级，绝不强写
         return {'ok': False, 'id': wid, 'field': F_ASSIGNED_TO, 'before': cur, 'target': assignee,
                 'error': f'HTTP {st}: {str(data)[:200]}'}
-    return {'ok': True, 'id': wid, 'field': F_ASSIGNED_TO, 'before': cur, 'after': assignee, 'dry_run': False}
+    return {'ok': True, 'id': wid, 'field': F_ASSIGNED_TO, 'before': cur,
+            'after': assignee, 'dry_run': False, **_post_write_identity(data)}
 
 
 def write_field(client, wid, field, value, mode, dry_run, marker=''):
@@ -721,51 +782,70 @@ def write_field(client, wid, field, value, mode, dry_run, marker=''):
     if st != 200:
         return {'ok': False, 'id': wid, 'field': field, 'error': f'HTTP {st}: {str(data)[:200]}'}
     return {'ok': True, 'id': wid, 'field': field, 'mode': mode,
-            'old_len': len(old), 'new_len': len(new_value), 'dry_run': False}
+            'old_len': len(old), 'new_len': len(new_value), 'dry_run': False,
+            **_post_write_identity(data)}
 
 
-def _detail_section_bounds(value, start_title, end_title):
-    """返回两个详细信息区段标题之间可替换内容的字符边界。"""
-    if value.count(start_title) != 1 or value.count(end_title) != 1:
-        raise ValueError(f'详细信息必须各含一个“{start_title}”和“{end_title}”标题')
+def _detail_section_bounds(value, start_title, end_title=None):
+    """返回分析者描述区段可替换内容的字符边界 [start, end)。start_title 必须恰好一个且
+    位于完整 HTML 块标签中；end_title 为可选软边界——存在且位于其后时作终点，否则取末尾
+    （写入只关注“分析者描述”，不依赖“开发者描述”是否存在）。"""
+    if value.count(start_title) != 1:
+        raise ValueError(f'详细信息必须恰好包含一个“{start_title}”标题')
     start_title_at = value.index(start_title)
-    end_title_at = value.index(end_title)
-    if start_title_at >= end_title_at:
-        raise ValueError(f'详细信息中“{start_title}”必须位于“{end_title}”之前')
-
     start_open = value.rfind('<', 0, start_title_at)
     start_close = value.find('</', start_title_at)
     start_close_end = value.find('>', start_close)
-    end_open = value.rfind('<', 0, end_title_at)
-    if min(start_open, start_close, start_close_end, end_open) < 0:
-        raise ValueError('详细信息的分析者描述标题必须位于完整 HTML 块标签中')
-    if not (start_open < start_title_at < start_close < start_close_end < end_open < end_title_at):
-        raise ValueError('详细信息的分析者描述区段 HTML 结构异常')
-    return start_close_end + 1, end_open
+    if min(start_open, start_close, start_close_end) < 0:
+        raise ValueError(f'详细信息的“{start_title}”标题必须位于完整 HTML 块标签中')
+    if not (start_open < start_title_at < start_close < start_close_end):
+        raise ValueError(f'详细信息的“{start_title}”区段 HTML 结构异常')
+    start = start_close_end + 1
+    if end_title and value.count(end_title) == 1:
+        end_title_at = value.index(end_title)
+        end_open = value.rfind('<', 0, end_title_at)
+        if start < end_open < end_title_at:
+            return start, end_open
+    return start, len(value)
+
+
+def _strip_run_markers(value):
+    """剥掉 run 标记注释后比较：标记仅用于幂等去重，不代表内容差异（TFS 落库即剥）。"""
+    return re.sub(r'<!--\s*auto-req-run:[^>]*-->\s*', '', value).strip()
 
 
 def replace_detail_analysis_section(client, wid, html_content, dry_run):
-    """整段替换详细信息中“分析者描述”与“开发者描述”之间的富文本。"""
+    """替换或追加详细信息中“分析者描述”区段的富文本；不依赖“开发者描述”是否存在。"""
     wi = fetch_raw(client, wid)
     old = wi.get('fields', {}).get(F_DESCRIPTION, '') or ''
+    start_title, end_title = '【分析者描述】', '【开发者描述】'
+    appended = False
     try:
-        start, end = _detail_section_bounds(old, '【分析者描述】', '【开发者描述】')
+        if old.count(start_title) == 0:
+            # 非模板工作项：末尾追加分析者描述区段（只关注分析者描述，不新增开发者描述）
+            new_value = old.rstrip() + '<div>【分析者描述】</div>' + html_content
+            appended = True
+        else:
+            start, end = _detail_section_bounds(old, start_title, end_title)
+            new_value = old[:start] + html_content + old[end:]
     except ValueError as exc:
         return {'ok': False, 'id': wid, 'field': F_DESCRIPTION, 'error': str(exc)}
-    new_value = old[:start] + html_content + old[end:]
-    if new_value == old:
+    if _strip_run_markers(new_value) == _strip_run_markers(old):
+        # TFS HTML 字段落库会剥 run 标记注释：只差标记 ≠ 内容差异，不发无效 PATCH
         return {'ok': True, 'id': wid, 'field': F_DESCRIPTION, 'noop': True,
                 'dry_run': dry_run, 'msg': '分析者描述已是目标内容，跳过重复写入'}
     if dry_run:
         return {'ok': True, 'id': wid, 'field': F_DESCRIPTION,
                 'old_len': len(old), 'new_len': len(new_value), 'dry_run': True,
-                'msg': '[dry-run] 将替换详细信息中的分析者描述'}
+                'msg': ('[dry-run] 将向详细信息追加分析者描述区段'
+                        if appended else '[dry-run] 将替换详细信息中的分析者描述')}
     st, data = patch_workitem(client, wid, wi,
                               [{'op': 'replace', 'path': f'/fields/{F_DESCRIPTION}', 'value': new_value}])
     if st != 200:
         return {'ok': False, 'id': wid, 'field': F_DESCRIPTION, 'error': f'HTTP {st}: {str(data)[:200]}'}
     return {'ok': True, 'id': wid, 'field': F_DESCRIPTION,
-            'old_len': len(old), 'new_len': len(new_value), 'dry_run': False}
+            'old_len': len(old), 'new_len': len(new_value), 'dry_run': False,
+            'appended': appended, **_post_write_identity(data)}
 
 
 def _canonical_legacy_markdown(value):
@@ -799,7 +879,25 @@ def remove_legacy_analysis_append(client, wid, expected_body, dry_run):
         return {'ok': False, 'id': wid, 'field': F_REQUIREMENT_ANALYSIS,
                 'error': f'HTTP {st}: {str(data)[:200]}'}
     return {'ok': True, 'id': wid, 'field': F_REQUIREMENT_ANALYSIS,
-            'old_len': len(old), 'new_len': len(new_value), 'dry_run': False}
+            'old_len': len(old), 'new_len': len(new_value), 'dry_run': False,
+            **_post_write_identity(data)}
+
+
+def _attachment_content_sha256(client, relation):
+    """读取当前 TFS 附件内容摘要；同名去重必须同时验证内容。"""
+    url = relation.get('url', '')
+    if not _attachment_url_allowed(client, url):
+        return None, '同名附件 URL 不在当前 TFS 服务范围'
+    request = urllib.request.Request(
+        url, method='GET', headers={'Authorization': auth_header(client['pat'])})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            content = response.read(DEFAULT_ATTACHMENT_MAX_BYTES + 1)
+    except Exception as exc:
+        return None, f'读取同名附件失败：{exc}'
+    if len(content) > DEFAULT_ATTACHMENT_MAX_BYTES:
+        return None, '同名附件超过内容比对上限'
+    return hashlib.sha256(content).hexdigest(), None
 
 
 def upload_attachment(client, wid, file_path, dry_run):
@@ -807,13 +905,25 @@ def upload_attachment(client, wid, file_path, dry_run):
         fail(f"附件不存在: {file_path}", 'FILE_NOT_FOUND')
     file_name = os.path.basename(file_path)
     current = fetch_raw(client, wid)
-    if file_name in attachment_names(current):
-        return {'ok': True, 'id': wid, 'file': file_name, 'noop': True, 'dry_run': dry_run,
-                'msg': '同名附件已关联，跳过重复上传'}
+    with open(file_path, 'rb') as source:
+        local_content = source.read()
+    local_sha256 = hashlib.sha256(local_content).hexdigest()
+    same_name = [relation for relation in current.get('relations', []) or []
+                 if relation.get('rel') == 'AttachedFile'
+                 and _attachment_relation_name(relation) == file_name]
+    for relation in same_name:
+        remote_sha256, error = _attachment_content_sha256(client, relation)
+        if error:
+            return {'ok': False, 'id': wid, 'file': file_name, 'error': error}
+        if remote_sha256 == local_sha256:
+            return {'ok': True, 'id': wid, 'file': file_name, 'noop': True,
+                    'sha256': local_sha256, 'dry_run': dry_run,
+                    'msg': '同名附件内容一致，跳过重复上传'}
     if dry_run:
-        return {'ok': True, 'id': wid, 'file': file_name, 'dry_run': True, 'msg': '[dry-run] 将上传附件'}
-    with open(file_path, 'rb') as f:
-        content = f.read()
+        message = '[dry-run] 将替换同名但内容不同的附件' if same_name else '[dry-run] 将上传附件'
+        return {'ok': True, 'id': wid, 'file': file_name, 'sha256': local_sha256,
+                'replace_same_name': bool(same_name), 'dry_run': True, 'msg': message}
+    content = local_content
     up = '/_apis/wit/attachments?api-version=%s&uploadType=simple&fileName=%s' % (API, urllib.parse.quote(file_name))
     # 上传请求超时后无法知道服务端是否已保存附件；不自动重试，交恢复流程去重处理。
     st, data = wit_http(client, 'POST', up, raw=content, ctype='octet')
@@ -824,10 +934,74 @@ def upload_attachment(client, wid, file_path, dry_run):
     att_url = data.get('url') or f"{client['base_url']}/_apis/wit/attachments/{att_id}?fileName={urllib.parse.quote(file_name)}"
     payload = [{"op": "add", "path": "/relations/-",
                 "value": {"rel": "AttachedFile", "url": att_url, "attributes": {"comment": "AI 分析产出"}}}]
-    st2, _ = patch_workitem(client, wid, current, payload)
+    st2, linked = patch_workitem(client, wid, current, payload)
     if st2 != 200:
         return {'ok': False, 'id': wid, 'file': file_name, 'attachment_id': att_id, 'error': f'link HTTP {st2}'}
-    return {'ok': True, 'id': wid, 'file': file_name, 'attachment_id': att_id, 'dry_run': False}
+    return {'ok': True, 'id': wid, 'file': file_name, 'attachment_id': att_id,
+            'sha256': local_sha256, 'replaced_same_name': bool(same_name),
+            'dry_run': False, **_post_write_identity(linked)}
+
+
+def cleanup_analysis_attachments(client, wid, keep_filename, dry_run, expected_path=None):
+    """解绑旧 AI 分析附件，只保留一条本轮分析报告关系；底层附件 Blob 不删除。"""
+    keep_pattern = re.compile(
+        rf'^{ANALYSIS_REPORT_NAME_PATTERN}_{re.escape(str(wid))}_{ANALYSIS_ARTIFACT_RUN_PATTERN}\.md$')
+    if not isinstance(keep_filename, str) or not keep_pattern.fullmatch(keep_filename):
+        return {'ok': False, 'id': wid, 'keep': keep_filename,
+                'error': '本轮保留附件名不符合需求分析报告命名规范，拒绝清理'}
+
+    current = fetch_raw(client, wid)
+    controlled = _controlled_analysis_attachment_relations(current, wid)
+    keep_relations = [item for item in controlled if item['name'] == keep_filename]
+    if not dry_run and not keep_relations:
+        return {'ok': False, 'id': wid, 'keep': keep_filename,
+                'error': '本轮需求分析报告尚未关联到工作项，拒绝清理历史附件'}
+
+    # 新瘦计划按内容摘要选择保留关系；历史调用仍保留最早同名关系。
+    keep_index = keep_relations[0]['index'] if keep_relations else None
+    if expected_path and keep_relations:
+        with open(expected_path, 'rb') as source:
+            expected_sha256 = hashlib.sha256(source.read()).hexdigest()
+        matching = []
+        for relation in keep_relations:
+            remote_sha256, error = _attachment_content_sha256(client, relation)
+            if error:
+                return {'ok': False, 'id': wid, 'keep': keep_filename, 'error': error}
+            if remote_sha256 == expected_sha256:
+                matching.append(relation)
+        if matching:
+            keep_index = matching[-1]['index']
+        elif not dry_run:
+            return {'ok': False, 'id': wid, 'keep': keep_filename,
+                    'error': '同名需求分析报告均与冻结报告摘要不一致，拒绝清理'}
+    removals = [item for item in controlled if item['index'] != keep_index]
+    removal_names = [item['name'] for item in removals]
+    if dry_run:
+        return {'ok': True, 'id': wid, 'keep': keep_filename, 'removed': removal_names,
+                'noop': not removals, 'dry_run': True, 'verified': False,
+                'msg': '[dry-run] 将解绑历史 AI 分析附件关系' if removals else
+                       '[dry-run] 无历史 AI 分析附件需要解绑'}
+
+    patched = None
+    if removals:
+        operations = [{'op': 'remove', 'path': f"/relations/{item['index']}"}
+                      for item in sorted(removals, key=lambda item: item['index'], reverse=True)]
+        status, data = patch_workitem(client, wid, current, operations)
+        if status != 200:
+            return {'ok': False, 'id': wid, 'keep': keep_filename, 'removed': removal_names,
+                    'error': f'cleanup HTTP {status}: {str(data)[:200]}'}
+        patched = data
+
+    verified_raw = fetch_raw(client, wid)
+    remaining = _controlled_analysis_attachment_relations(verified_raw, wid)
+    remaining_names = [item['name'] for item in remaining]
+    if remaining_names != [keep_filename]:
+        return {'ok': False, 'id': wid, 'keep': keep_filename, 'removed': removal_names,
+                'remaining': remaining_names,
+                'error': '清理后回读验证失败：受控 AI 附件未收敛为唯一的本轮需求分析报告'}
+    return {'ok': True, 'id': wid, 'keep': keep_filename, 'removed': removal_names,
+            'noop': not removals, 'dry_run': False, 'verified': True,
+            **_post_write_identity(patched)}
 
 
 def precheck(client):
@@ -921,9 +1095,12 @@ def list_iterations(client, project, expected_date=None, today=None):
 
 
 # ---------------- audit ----------------
-def record(skill, wid, verdict, tags, state_from, state_to, trace, extra, run_id=''):
+def record(skill, wid, verdict, tags, state_from, state_to, trace, extra, run_id='',
+           audit_group='runs'):
+    if audit_group not in {'runs', 'legacy-runs'}:
+        fail('audit_group 仅允许 runs 或 legacy-runs', 'BAD_AUDIT_GROUP')
     wid_seg = str(wid) if wid else '_no_id'
-    runs_dir = os.path.join(PROCESS_DIR, wid_seg, 'runs')
+    runs_dir = os.path.join(PROCESS_DIR, wid_seg, audit_group)
     os.makedirs(runs_dir, exist_ok=True)
     ts = beijing_timestamp('%Y%m%d_%H%M%S')
     run_id = run_id or uuid.uuid4().hex

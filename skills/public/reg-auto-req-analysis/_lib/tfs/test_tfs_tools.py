@@ -1,4 +1,5 @@
 import datetime
+import copy
 import os
 import sys
 import tempfile
@@ -6,7 +7,10 @@ import unittest
 import gzip
 import json
 import pathlib
+import shutil
+import urllib.parse
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 
@@ -18,6 +22,7 @@ import attachment_runtime as attachment_runtime  # noqa: E402
 import redis_client  # noqa: E402
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import build_menu_business_index as menu_index  # noqa: E402
+import skill_memory  # noqa: E402
 
 
 def resolved_knowledge_route():
@@ -37,6 +42,23 @@ def resolved_knowledge_route():
 
 
 class TfsClientTests(unittest.TestCase):
+    def test_fetch_raw_consumes_pipeline_guard_and_rejects_stale_revision(self):
+        raw = {'id': 1, 'rev': 6, 'fields': {tfs.F_STATE: '已建议'}}
+        client = {'_pipeline_source_guard': {
+            'work_item_id': 1, 'rev': 5, 'state': '已建议',
+        }}
+        with mock.patch.object(tfs, 'wit_retry', return_value=(200, raw)):
+            with self.assertRaisesRegex(RuntimeError, 'SOURCE_CHANGED_DURING_EXECUTION'):
+                tfs.fetch_raw(client, 1)
+        self.assertNotIn('_pipeline_source_guard', client)
+
+        client['_pipeline_source_guard'] = {
+            'work_item_id': 1, 'rev': 6, 'state': '已建议',
+        }
+        with mock.patch.object(tfs, 'wit_retry', return_value=(200, raw)):
+            self.assertIs(tfs.fetch_raw(client, 1), raw)
+        self.assertNotIn('_pipeline_source_guard', client)
+
     def test_map_workitem_exposes_pre_qc_fields(self):
         item = tfs.map_workitem({'id': 1, 'rev': 2, 'fields': {
             'Microsoft.VSTS.CMMI.RequirementType': '功能性的',
@@ -123,11 +145,39 @@ class TfsClientTests(unittest.TestCase):
         self.assertEqual(value, ('<div>【详细调研结果】</div><div>【分析者描述】</div><div>新内容</div>'
                                  '<div>【开发者描述】</div><div>开发保留</div>'))
 
+    def test_replace_detail_analysis_section_returns_patch_revision(self):
+        old = '<div>【分析者描述】</div><div>旧内容</div>'
+        raw = {'id': 1, 'rev': 8, 'fields': {tfs.F_DESCRIPTION: old}}
+        patched = {'id': 1, 'rev': 10, 'fields': {tfs.F_STATE: '已建议'}}
+        with mock.patch.object(tfs, 'fetch_raw', return_value=raw), \
+                mock.patch.object(tfs, 'patch_workitem', return_value=(200, patched)):
+            response = tfs.replace_detail_analysis_section(
+                {}, 1, '<div>新内容</div>', False)
+        self.assertTrue(response['ok'])
+        self.assertEqual(response['post_rev'], 10)
+        self.assertEqual(response['post_state'], '已建议')
+
+    def test_replace_detail_analysis_section_ignores_run_marker_only_difference(self):
+        # 263409 回归：TFS HTML 字段落库剥 run 标记注释——只差标记 ≠ 内容差异，
+        # 必须按 no-op 处理，不发会被 TFS 静默吞掉（不建 revision）的无效 PATCH。
+        section = '<div><br></div><div>内容</div><div><br></div>'
+        old = '<div>【分析者描述】</div>' + section
+        rendered = '<!-- auto-req-run:run_x -->' + section
+        raw = {'id': 1, 'rev': 8, 'fields': {tfs.F_DESCRIPTION: old}}
+        with mock.patch.object(tfs, 'fetch_raw', return_value=raw), \
+                mock.patch.object(tfs, 'patch_workitem') as patch:
+            response = tfs.replace_detail_analysis_section({}, 1, rendered, False)
+        self.assertTrue(response['ok'])
+        self.assertTrue(response['noop'])
+        self.assertIn('已是目标内容', response['msg'])
+        patch.assert_not_called()
+
     def test_replace_detail_analysis_section_rejects_invalid_section_markers(self):
+        # 只有“分析者描述”是硬要求：重复或缺完整 HTML 块标签才拒绝；
+        # “开发者描述”缺失或乱序不再阻断写入（见 appends/replaces 用例）。
         for description in (
-                '<div>【分析者描述】</div>',
-                '<div>【开发者描述】</div><div>【分析者描述】</div>',
-                '<div>【分析者描述】</div><div>【分析者描述】</div><div>【开发者描述】</div>'):
+                '<div>【分析者描述】</div><div>【分析者描述】</div>',   # 重复分析者描述
+                '【分析者描述】裸文本无 HTML 块标签'):                  # 缺完整 HTML 块标签
             raw = {'id': 1, 'rev': 4, 'fields': {tfs.F_DESCRIPTION: description}}
             with self.subTest(description=description), \
                     mock.patch.object(tfs, 'fetch_raw', return_value=raw), \
@@ -135,6 +185,31 @@ class TfsClientTests(unittest.TestCase):
                 response = tfs.replace_detail_analysis_section({}, 1, '<div>新内容</div>', False)
             self.assertFalse(response['ok'])
             patch.assert_not_called()
+
+    def test_replace_detail_analysis_section_appends_when_markers_absent(self):
+        # 非模板工作项：详细信息无【分析者描述】→ 末尾追加分析者描述区段，不新增【开发者描述】
+        old = '<div>附件</div><p>一、必填字段</p><p>原始需求正文</p>'
+        raw = {'id': 1, 'rev': 4, 'fields': {tfs.F_DESCRIPTION: old}}
+        with mock.patch.object(tfs, 'fetch_raw', return_value=raw), \
+                mock.patch.object(tfs, 'patch_workitem', return_value=(200, {})) as patch:
+            response = tfs.replace_detail_analysis_section({}, 1, '<div>新内容</div>', False)
+        self.assertTrue(response['ok'])
+        self.assertTrue(response.get('appended'))
+        value = patch.call_args.args[3][0]['value']
+        self.assertEqual(value, old + '<div>【分析者描述】</div><div>新内容</div>')
+        self.assertEqual(value.count('【分析者描述】'), 1)
+        self.assertNotIn('【开发者描述】', value)
+
+    def test_replace_detail_analysis_section_append_then_idempotent(self):
+        old = '<div>附件</div><p>原始需求正文</p>'
+        appended = old + '<div>【分析者描述】</div><div>新内容</div>'
+        raw = {'id': 1, 'rev': 4, 'fields': {tfs.F_DESCRIPTION: appended}}
+        with mock.patch.object(tfs, 'fetch_raw', return_value=raw), \
+                mock.patch.object(tfs, 'patch_workitem') as patch:
+            response = tfs.replace_detail_analysis_section({}, 1, '<div>新内容</div>', False)
+        self.assertTrue(response['ok'])
+        self.assertTrue(response.get('noop'))
+        patch.assert_not_called()
 
     def test_remove_legacy_analysis_append_requires_exact_suffix(self):
         body = '# 变更方案\n\n&gt; 说明\n'
@@ -170,6 +245,181 @@ class TfsClientTests(unittest.TestCase):
         payload = patch.call_args.args[3]
         self.assertEqual(payload[0]['value']['url'],
                          'http://example/tfs/collection/%E5%81%A5%E5%BA%B7/_apis/wit/attachments/abc?fileName=%E6%96%B9%E6%A1%88_run_12345678.md')
+
+    def test_attachment_noop_requires_same_filename_and_content(self):
+        client = {
+            'base_url': 'http://example/tfs/collection/project',
+            'server': 'example', 'port': 80, 'collection': 'collection',
+            'project': 'project', 'pat': 'x',
+        }
+        name = '需求分析报告_1_run_12345678.md'
+        relation = {'rel': 'AttachedFile',
+                    'url': 'http://example/tfs/collection/_apis/wit/attachments/old?fileName=' + urllib.parse.quote(name)}
+        raw = {'id': 1, 'rev': 8, 'fields': {}, 'relations': [relation]}
+
+        def response(content):
+            opened = mock.MagicMock()
+            opened.__enter__.return_value.read.return_value = content
+            return opened
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, name)
+            with open(path, 'wb') as output:
+                output.write(b'current')
+            with mock.patch.object(tfs, 'fetch_raw', return_value=raw), \
+                    mock.patch.object(tfs.urllib.request, 'urlopen',
+                                      return_value=response(b'current')), \
+                    mock.patch.object(tfs, 'wit_http') as upload:
+                same = tfs.upload_attachment(client, 1, path, False)
+            self.assertTrue(same['noop'])
+            upload.assert_not_called()
+
+            with mock.patch.object(tfs, 'fetch_raw', return_value=raw), \
+                    mock.patch.object(tfs.urllib.request, 'urlopen',
+                                      return_value=response(b'stale')):
+                changed = tfs.upload_attachment(client, 1, path, True)
+        self.assertTrue(changed['replace_same_name'])
+        self.assertFalse(changed.get('noop', False))
+
+        malicious = dict(raw)
+        malicious['relations'] = [{
+            'rel': 'AttachedFile',
+            'url': 'http://example/untrusted?fileName=' + urllib.parse.quote(name),
+        }]
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, name)
+            with open(path, 'wb') as output:
+                output.write(b'current')
+            with mock.patch.object(tfs, 'fetch_raw', return_value=malicious), \
+                    mock.patch.object(tfs.urllib.request, 'urlopen') as urlopen:
+                rejected = tfs.upload_attachment(client, 1, path, True)
+        self.assertFalse(rejected['ok'])
+        urlopen.assert_not_called()
+
+        project_scoped = (
+            'http://example/tfs/collection/project/_apis/wit/attachments/old?fileName='
+            + urllib.parse.quote(name))
+        self.assertTrue(tfs._attachment_url_allowed(client, project_scoped))
+
+    def test_cleanup_can_keep_the_relation_matching_frozen_report_digest(self):
+        client = {'server': 'example', 'port': 80, 'collection': 'collection', 'pat': 'x'}
+        keep = '需求分析报告_1_run_new_1234.md'
+        raw = {'id': 1, 'rev': 8, 'relations': [
+            {'rel': 'AttachedFile',
+             'url': 'http://example/tfs/collection/_apis/wit/attachments/old?fileName=' + urllib.parse.quote(keep)},
+            {'rel': 'AttachedFile',
+             'url': 'http://example/tfs/collection/_apis/wit/attachments/new?fileName=' + urllib.parse.quote(keep)},
+        ]}
+
+        def response(content):
+            opened = mock.MagicMock()
+            opened.__enter__.return_value.read.return_value = content
+            return opened
+
+        verified = {'id': 1, 'rev': 9, 'relations': [raw['relations'][1]]}
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, keep)
+            with open(path, 'wb') as output:
+                output.write(b'current')
+            with mock.patch.object(tfs, 'fetch_raw', side_effect=[raw, verified]), \
+                    mock.patch.object(tfs.urllib.request, 'urlopen',
+                                      side_effect=[response(b'stale'), response(b'current')]), \
+                    mock.patch.object(tfs, 'patch_workitem', return_value=(200, {})) as patch:
+                cleaned = tfs.cleanup_analysis_attachments(
+                    client, 1, keep, False, expected_path=path)
+        self.assertTrue(cleaned['ok'])
+        operations = patch.call_args.args[3]
+        self.assertEqual(operations, [{'op': 'remove', 'path': '/relations/0'}])
+
+    def test_cleanup_analysis_attachments_dry_run_only_targets_controlled_names(self):
+        def attached(name):
+            return {'rel': 'AttachedFile',
+                    'url': 'http://example/attachment?fileName=' + urllib.parse.quote(name)}
+
+        keep = '需求分析报告_1_run_new_1234.md'
+        raw = {'id': 1, 'rev': 8, 'relations': [
+            {'rel': 'Hyperlink', 'url': 'http://example/business'},
+            attached('变更方案_1_run_old_1234.md'),
+            attached(keep),
+            attached(keep),
+            attached('待确认清单_1_run_old_1234.md'),
+            attached('待补充信息_1_run_old_1234.json'),
+            attached('接口说明.md'),
+            attached('变更方案_2_run_old_1234.md'),
+            attached('变更方案_1_short.md'),
+        ]}
+        with mock.patch.object(tfs, 'fetch_raw', return_value=raw), \
+                mock.patch.object(tfs, 'patch_workitem') as patch:
+            response = tfs.cleanup_analysis_attachments({}, 1, keep, True)
+        self.assertTrue(response['ok'])
+        self.assertEqual(response['removed'], [
+            '变更方案_1_run_old_1234.md', keep,
+            '待确认清单_1_run_old_1234.md', '待补充信息_1_run_old_1234.json'])
+        self.assertFalse(response['verified'])
+        patch.assert_not_called()
+
+    def test_cleanup_analysis_attachments_execute_removes_descending_and_verifies(self):
+        def attached(name):
+            return {'rel': 'AttachedFile',
+                    'url': 'http://example/attachment?fileName=' + urllib.parse.quote(name)}
+
+        keep = '需求分析报告_1_run_new_1234.md'
+        before = {'id': 1, 'rev': 8, 'relations': [
+            attached('变更方案_1_run_old_1234.md'),
+            attached(keep),
+            attached('业务附件.pdf'),
+            attached('待确认清单_1_run_old_1234.md'),
+            attached(keep),
+            attached('待补充信息_1_run_old_1234.json'),
+        ]}
+        after = {'id': 1, 'rev': 9, 'relations': [attached(keep), attached('业务附件.pdf')]}
+        with mock.patch.object(tfs, 'fetch_raw', side_effect=[before, after]) as fetch, \
+                mock.patch.object(tfs, 'wit_retry', return_value=(200, {})) as request:
+            response = tfs.cleanup_analysis_attachments({}, 1, keep, False)
+        self.assertTrue(response['ok'])
+        self.assertTrue(response['verified'])
+        self.assertEqual(fetch.call_count, 2)
+        payload = request.call_args.args[3]
+        self.assertEqual(payload[0], {'op': 'test', 'path': '/rev', 'value': 8})
+        self.assertEqual([operation['path'] for operation in payload[1:]],
+                         ['/relations/5', '/relations/4', '/relations/3', '/relations/0'])
+
+    def test_cleanup_analysis_attachments_execute_noop_still_rereads(self):
+        keep = '需求分析报告_1_run_new_1234.md'
+        raw = {'id': 1, 'rev': 8, 'relations': [{
+            'rel': 'AttachedFile',
+            'url': 'http://example/attachment?fileName=' + urllib.parse.quote(keep),
+        }]}
+        with mock.patch.object(tfs, 'fetch_raw', side_effect=[raw, raw]) as fetch, \
+                mock.patch.object(tfs, 'patch_workitem') as patch:
+            response = tfs.cleanup_analysis_attachments({}, 1, keep, False)
+        self.assertTrue(response['ok'])
+        self.assertTrue(response['noop'])
+        self.assertTrue(response['verified'])
+        self.assertEqual(fetch.call_count, 2)
+        patch.assert_not_called()
+
+    def test_cleanup_analysis_attachments_fails_closed_for_missing_current_or_patch_conflict(self):
+        keep = '需求分析报告_1_run_new_1234.md'
+        old = {'id': 1, 'rev': 8, 'relations': [{
+            'rel': 'AttachedFile',
+            'url': 'http://example/attachment?fileName=' + urllib.parse.quote('变更方案_1_run_old_1234.md'),
+        }]}
+        with mock.patch.object(tfs, 'fetch_raw', return_value=old), \
+                mock.patch.object(tfs, 'patch_workitem') as patch:
+            missing = tfs.cleanup_analysis_attachments({}, 1, keep, False)
+        self.assertFalse(missing['ok'])
+        patch.assert_not_called()
+
+        current = {'id': 1, 'rev': 8, 'relations': old['relations'] + [{
+            'rel': 'AttachedFile',
+            'url': 'http://example/attachment?fileName=' + urllib.parse.quote(keep),
+        }]}
+        with mock.patch.object(tfs, 'fetch_raw', return_value=current), \
+                mock.patch.object(tfs, 'patch_workitem', return_value=(412, {'message': 'rev changed'})):
+            conflict = tfs.cleanup_analysis_attachments({}, 1, keep, False)
+        self.assertFalse(conflict['ok'])
+        self.assertIn('HTTP 412', conflict['error'])
 
     def test_download_attachments_limits_scope_and_records_integrity(self):
         class Response:
@@ -334,6 +584,10 @@ class TfsClientTests(unittest.TestCase):
             self.assertTrue(os.path.exists(second['audit']))
             # 审计按工作项分组：落在 <wid>/runs/ 下
             self.assertIn(os.path.join('1', 'runs'), first['audit'])
+            legacy = tfs.record(
+                'auto-req-analysis', 1, 'MANUAL-REVIEW', [], '', '', '', {},
+                'run_legacy_1234', audit_group='legacy-runs')
+            self.assertIn(os.path.join('1', 'legacy-runs'), legacy['audit'])
 
     def test_list_iterations_parses_attributes_and_matches_by_finishdate(self):
         client = {'server': 's', 'port': 80, 'collection': 'c', 'base_url': 'http://s:80/tfs/c/p', 'pat': 'x'}
@@ -1127,12 +1381,1058 @@ class PipelinePlanTests(unittest.TestCase):
     def write_v2_analysis_plan(self, directory, categories, run_id='run_12345678',
                                acquisition=None):
         """evidence-loop-v2 计划：复用 v1 证据闭环骨架，换规则源并挂 evidence_acquisition。"""
-        plan, plan_path, artifact = self.write_analysis_plan(
-            directory, categories, run_id=run_id, analysis_rule='evidence-loop-v1')
+        plan, plan_path, artifact = self.write_current_analysis_plan(
+            directory, categories, run_id=run_id)
         plan['rules_source']['analysis'] = 'evidence-loop-v2'
+        report_name = f'需求分析报告_1_{run_id}.md'
+        report_path = os.path.join(directory, report_name)
+        os.replace(artifact, report_path)
+        with open(report_path, 'r', encoding='utf-8') as f:
+            report_content = f.read()
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write(report_content.replace('# 变更方案\n', '# 需求分析报告\n', 1))
+        plan['artifacts'][0]['path'] = report_name
+        plan['implementation_impacts'] = ['ui-presentation']
+        plan['general_rule_coverage'] = {
+            'scope': {
+                'status': 'CONFIRMED', 'source': 'work-item',
+                'basis': '工作项已明确改动范围。',
+            },
+            'workflow': {
+                'status': 'NOT_APPLICABLE', 'source': 'not-applicable',
+                'basis': '本测试计划不改变业务流程。',
+            },
+            'business_semantics': {
+                'status': 'CONFIRMED', 'source': 'work-item',
+                'basis': '工作项已明确字段业务含义。',
+            },
+            'business_rules': {
+                'status': 'NOT_APPLICABLE', 'source': 'not-applicable',
+                'basis': '本测试计划不新增业务计算或判断规则。',
+            },
+            'permissions': {
+                'status': 'NOT_APPLICABLE', 'source': 'not-applicable',
+                'basis': '本测试计划不改变角色与数据权限。',
+            },
+            'exceptions': {
+                'status': 'NOT_APPLICABLE', 'source': 'not-applicable',
+                'basis': '本测试计划不引入新的异常分支。',
+            },
+            'acceptance': {
+                'status': 'CONFIRMED', 'source': 'work-item',
+                'basis': '工作项已明确可验证的验收结果。',
+            },
+        }
+        plan['business_rule_coverage'] = {
+            'presentation': {
+                'status': 'DEFAULTED',
+                'source': 'presentation-default',
+                'basis': '呈现类默认：沿用当前页面布局。',
+            },
+            'empty_value': {
+                'status': 'DEFAULTED',
+                'source': 'presentation-default',
+                'basis': '呈现类默认：沿用当前空值展示。',
+            },
+            'maintenance_granularity': {
+                'status': 'NOT_APPLICABLE',
+                'source': 'not-applicable',
+                'basis': '本测试计划不修改数据维护。',
+            },
+            'historical_data': {
+                'status': 'NOT_APPLICABLE',
+                'source': 'not-applicable',
+                'basis': '本测试计划不影响历史数据。',
+            },
+        }
+        plan['kb']['database_required'] = False
         plan['evidence_acquisition'] = (
             acquisition if acquisition is not None else self.complete_acquisition())
-        return plan, plan_path, artifact
+        return plan, plan_path, report_path
+
+    def write_analysis_ref_plan(self, directory, work_item_id=1):
+        process_root = os.path.join(directory, '过程文件')
+        initialized = pipeline.init_run(work_item_id, process_root=process_root)
+        run_id = initialized['run_id']
+        run_dir = initialized['run_dir']
+        full, _, report_path = self.write_v2_analysis_plan(
+            run_dir, ['existing-ui-simple'], run_id=run_id)
+        full['work_item_id'] = work_item_id
+        full['expected_rev'] = 5
+        full['expected_state'] = '已建议'
+        semantic = {
+            key: value for key, value in full.items()
+            if key not in {
+                'version', 'run_id', 'skill', 'work_item_id', 'expected_rev', 'expected_state',
+                'verdict', 'tags', 'state_to', 'rules_source', 'analysis_description', 'artifacts',
+            }
+        }
+        closure = {
+            heading: {label: f'{heading}已明确{label}。' for label in labels}
+            for heading, labels in pipeline.ITERATION_ANALYSIS_CLOSURE_REQUIREMENTS.items()
+        }
+        snapshot = {
+            'schema': pipeline.ANALYSIS_RESULT_SCHEMA,
+            'work_item_id': work_item_id,
+            'run_id': run_id,
+            'generated_at_utc': '2026-08-14T00:00:00Z',
+            'verdict': full['verdict'],
+            **semantic,
+            'report': {
+                'closure': closure,
+                'analysis_description': {
+                    'menu_path': '业务管理 > 测试功能',
+                    'categories': [{
+                        'category': 'existing-ui-simple',
+                        'items': [{
+                            'label': '界面优化方案',
+                            'content': '在测试功能页面调整既有提示，不改变数据写入。',
+                        }],
+                    }],
+                },
+                'traceability': [{
+                    'id': 'R1', 'scope': '测试功能提示',
+                    'behavior': '按已确认规则调整提示',
+                    'acceptance': '满足条件时显示调整后的提示',
+                    'status': '已证实', 'basis': '工作项',
+                }],
+            },
+        }
+        snapshot_name = f'分析结果_{work_item_id}_{run_id}.json'
+        snapshot_path = os.path.join(run_dir, snapshot_name)
+        with open(snapshot_path, 'w', encoding='utf-8') as output:
+            json.dump(snapshot, output, ensure_ascii=False, indent=2)
+        os.unlink(report_path)
+        plan = {
+            'version': 2,
+            'plan_profile': pipeline.ANALYSIS_REF_PROFILE,
+            'work_item_id': work_item_id,
+            'run_id': run_id,
+            'expected_rev': 5,
+            'expected_state': '已建议',
+            'run_receipt': initialized['run_receipt'],
+            'analysis_result': {
+                'path': snapshot_name,
+                'sha256': pipeline.sha256_file(snapshot_path),
+            },
+        }
+        plan_path = os.path.join(run_dir, f'执行计划_{work_item_id}_{run_id}.json')
+        with open(plan_path, 'w', encoding='utf-8') as output:
+            json.dump(plan, output, ensure_ascii=False, indent=2)
+        return plan, plan_path, snapshot_path
+
+    def write_run_bound_plan(self, directory, work_item_id=1, verdict='SKIP-ANALYSIS'):
+        process_root = os.path.join(directory, '过程文件')
+        initialized = pipeline.init_run(work_item_id, process_root=process_root)
+        run_id = initialized['run_id']
+        plan = {
+            'version': 2,
+            'plan_profile': pipeline.RUN_BOUND_PROFILE,
+            'run_receipt': initialized['run_receipt'],
+            'run_id': run_id,
+            'skill': 'auto-req-analysis',
+            'work_item_id': work_item_id,
+            'expected_rev': 5,
+            'expected_state': '已建议',
+            'verdict': verdict,
+            'tags': [],
+            'state_to': None,
+            'rules_source': {'qc': 'pre-qc-v1'},
+            'artifacts': [],
+        }
+        if verdict == 'SKIP-ANALYSIS':
+            plan['skip_reason'] = '仅安排已开发接口联调，无新增业务分析范围。'
+        else:
+            tag = ('PM-AI-QC-NEED-INFO' if verdict == 'NEED-INFO'
+                   else 'PM-AI-QC-NEED-REVIEW')
+            plan['tags'] = [tag]
+            plan['checklist'] = {
+                'work_item': f'{work_item_id} 测试需求',
+                'verdict': verdict,
+                'tag': tag,
+                'responsible': '产品',
+                'generated_at_utc': '2026-08-14T00:00:00Z',
+                'next': '补充后使用新的 Idempotency-Key 重新触发',
+                'items': [{
+                    'id': 'q1', 'question': '请确认业务口径？',
+                    'options': ['口径一', '口径二'], 'allow_other': True,
+                }],
+            }
+            filename = f'待补充信息_{work_item_id}_{run_id}.json'
+            plan['artifacts'] = [{'kind': 'qc-followup', 'filename': filename}]
+        plan_path = os.path.join(
+            initialized['run_dir'], f'执行计划_{work_item_id}_{run_id}.json')
+        with open(plan_path, 'w', encoding='utf-8') as output:
+            json.dump(plan, output, ensure_ascii=False, indent=2)
+        return initialized, plan, plan_path
+
+    def add_nonblocking_warning_inputs(self, plan):
+        """263409 回归：格式/审计缺口不改变 NEED-REVIEW 业务终局。"""
+        plan['confirmation_policy'] = pipeline.SINGLE_CONFIRMATION_POLICY
+        plan['checklist']['items'][0]['id'] = 'q-business-rule'
+        plan['knowledge_route'] = resolved_knowledge_route()
+        plan['kb'] = {
+            'ready': True, 'source_ready': True, 'source_required': True,
+            'database_ready': True, 'dedup_ran': True,
+            'tools_used': ['query', 'search_source'],
+            'findings': [{
+                'entity': '病案信息手术信息入口', 'state': '已证实',
+                'source_tool': 'query', 'source_type': 'code',
+                'conclusion': '已定位手术信息入口',
+                'evidence': '代码图谱入口证据',
+                'boundary': '不证明麻醉四要素校验的具体实现',
+            }],
+        }
+        plan['tfs_requirements'] = {
+            'ready': True,
+            'coverage': {'state_filter': '已关闭/已验证'},
+            'tools_used': ['get_work_item'],
+            'findings': [{
+                'work_item_id': 113518,
+                'fact': '麻醉四要素同填同空规则已落地',
+                'state': '已证实', 'maturity': '已落地',
+                'source_tool': 'get_work_item',
+                'conclusion': '历史需求证实同填同空规则',
+                'evidence': '需求113518正文',
+                'boundary': '不证明当前源码实现位置',
+            }],
+            'note': '已核验历史需求正文。',
+        }
+        plan['attachments'] = {
+            'ready': True,
+            'downloaded': [{'name': '历史报告.md'}],
+            'parsed': [{
+                'name': '历史报告.md', 'status': 'parsed',
+                'converter': 'builtin-fallback',
+                'converter_chain': ['builtin-fallback'],
+            }],
+            'skipped': [], 'errors': [],
+        }
+        return plan
+
+    def test_init_run_always_creates_unique_receipted_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = os.path.join(directory, '过程文件')
+            first = pipeline.init_run(263409, root)
+            second = pipeline.init_run(263409, root)
+            self.assertNotEqual(first['run_id'], second['run_id'])
+            self.assertNotEqual(first['run_dir'], second['run_dir'])
+            self.assertRegex(
+                first['run_id'], r'^run_[0-9]{8}_[0-9]{6}_263409_[0-9a-f]{8}$')
+            receipt_path = os.path.join(first['run_dir'], first['run_receipt']['path'])
+            self.assertTrue(os.path.isfile(receipt_path))
+            self.assertEqual(pipeline.sha256_file(receipt_path), first['run_receipt']['sha256'])
+            self.assertEqual(first['session_id'], first['run_id'])
+            self.assertEqual(first['thread_id'], first['run_id'])
+            status = pipeline.get_run_status(263409, first['run_id'], root)
+            self.assertTrue(status['ok'])
+            self.assertEqual(status['status'], 'INITIALIZED')
+            self.assertEqual(status['session_id'], first['run_id'])
+            self.assertEqual(status['thread_id'], first['run_id'])
+
+    def test_apply_run_never_falls_back_when_canonical_plan_is_not_ready(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = os.path.join(directory, '过程文件')
+            initialized = pipeline.init_run(263409, root)
+            with mock.patch.object(tfs, 'load_config') as load_config, \
+                    mock.patch.object(redis_client, 'publish_plan') as publish:
+                response = pipeline.apply_run(
+                    263409, initialized['run_id'], False, 'config.json', process_root=root)
+            status = pipeline.get_run_status(263409, initialized['run_id'], root)
+        self.assertFalse(response['ok'])
+        self.assertEqual(response['error_code'], 'RUN_NOT_READY')
+        self.assertEqual(status['status'], 'INITIALIZED')
+        load_config.assert_not_called()
+        publish.assert_not_called()
+
+    def test_failed_run_rejects_repeat_without_reentering_pipeline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = os.path.join(directory, '过程文件')
+            initialized, _, _ = self.write_run_bound_plan(
+                directory, work_item_id=263409)
+            with mock.patch.object(pipeline, 'apply_plan', return_value={
+                    'ok': False, 'error': '模拟执行失败', 'actions': [],
+                    'redis': {'in_scope': False}}) as apply_plan:
+                first = pipeline.apply_run(
+                    263409, initialized['run_id'], True, 'config.json', process_root=root)
+                repeated = pipeline.apply_run(
+                    263409, initialized['run_id'], True, 'config.json', process_root=root)
+            status = pipeline.get_run_status(263409, initialized['run_id'], root)
+        self.assertFalse(first['ok'])
+        self.assertEqual(status['status'], 'FAILED')
+        self.assertFalse(repeated['ok'])
+        self.assertEqual(repeated['error_code'], 'RUN_TERMINAL_REQUIRES_NEW_RUN')
+        self.assertTrue(repeated['requires_new_run'])
+        apply_plan.assert_called_once()
+
+    def test_concurrent_apply_lock_rejects_duplicate_without_pipeline_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = os.path.join(directory, '过程文件')
+            initialized, _, _ = self.write_run_bound_plan(
+                directory, work_item_id=263409)
+            os.mkdir(os.path.join(initialized['run_dir'], '.pipeline-apply-lock'))
+            with mock.patch.object(pipeline, 'apply_plan') as apply_plan:
+                response = pipeline.apply_run(
+                    263409, initialized['run_id'], True, 'config.json', process_root=root)
+        self.assertFalse(response['ok'])
+        self.assertEqual(response['error_code'], 'RUN_ALREADY_IN_PROGRESS')
+        apply_plan.assert_not_called()
+
+    def test_completed_execute_retry_returns_idempotently_without_new_apply(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = os.path.join(directory, '过程文件')
+            initialized, _, _ = self.write_run_bound_plan(
+                directory, work_item_id=263409)
+            with mock.patch.object(pipeline, 'apply_plan', return_value={
+                    'ok': True, 'applied': True, 'run_mode': 'execute',
+                    'actions': [], 'redis': {'in_scope': True}}) as apply_plan:
+                first = pipeline.apply_run(
+                    263409, initialized['run_id'], True, 'config.json', process_root=root)
+                repeated = pipeline.apply_run(
+                    263409, initialized['run_id'], True, 'config.json', process_root=root)
+        self.assertTrue(first['ok'])
+        self.assertTrue(repeated['ok'])
+        self.assertTrue(repeated['idempotent'])
+        self.assertEqual(repeated['run_mode'], 'already-completed')
+        self.assertEqual(repeated['actions'], [])
+        apply_plan.assert_called_once()
+
+    def test_status_redis_projection_never_returns_another_run(self):
+        current = 'run_20260814_120000_263409_deadbeef'
+        other = {'run_id': 'run_20260813_120000_263409_cafebabe', 'verdict': 'AUTO-ANA'}
+        self.assertIsNone(pipeline.redis_status_projection_for_run(current, other))
+        matching = {'run_id': current.encode('utf-8'), 'verdict': 'MANUAL-REVIEW'}
+        self.assertIs(pipeline.redis_status_projection_for_run(current, matching), matching)
+
+    def test_apply_run_propagates_one_identity_and_records_state_lifecycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = os.path.join(directory, '过程文件')
+            initialized, _, _ = self.write_run_bound_plan(directory, work_item_id=263409)
+            with mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}), \
+                    mock.patch.object(tfs, 'precheck', return_value={'ok': True}), \
+                    mock.patch.object(pipeline, 'preflight', return_value={
+                        'ok': True, 'work_item': {'id': 263409, 'title': '测试', 'tags': []}}), \
+                    mock.patch.object(redis_client, 'publish_plan', return_value={'ok': True}), \
+                    mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}):
+                response = pipeline.apply_run(
+                    263409, initialized['run_id'], False, 'config.json', process_root=root)
+            status = pipeline.get_run_status(263409, initialized['run_id'], root)
+        self.assertTrue(response['ok'])
+        self.assertEqual(response['run_id'], initialized['run_id'])
+        self.assertEqual(status['session_id'], initialized['run_id'])
+        self.assertEqual(status['thread_id'], initialized['run_id'])
+        self.assertEqual(status['status'], 'COMPLETED')
+        self.assertEqual([entry['status'] for entry in status['history']], [
+            'INITIALIZED', 'ANALYZING', 'FROZEN', 'APPLYING', 'COMPLETED'])
+
+    def test_263409_nonblocking_validation_warnings_continue_apply_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = os.path.join(directory, '过程文件')
+            initialized, plan, plan_path = self.write_run_bound_plan(
+                directory, work_item_id=263409, verdict='NEED-REVIEW')
+            self.add_nonblocking_warning_inputs(plan)
+            with open(plan_path, 'w', encoding='utf-8') as output:
+                json.dump(plan, output, ensure_ascii=False, indent=2)
+
+            checked = pipeline.validate_plan(plan, plan_path)
+            self.assertTrue(checked['ok'], checked['errors'])
+            self.assertEqual(checked['validation']['decision'], 'PASS')
+            self.assertEqual({warning['code'] for warning in checked['warnings']}, {
+                'ATTACHMENT_CHAIN_NORMALIZED',
+                'SOURCE_FINDING_MISSING',
+                'REQUIREMENTS_PROBE_NOT_RECORDED',
+            })
+            self.assertEqual(checked['normalizations'][0]['after'], 'builtin-fallback')
+
+            with mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}), \
+                    mock.patch.object(tfs, 'precheck', return_value={'ok': True}), \
+                    mock.patch.object(pipeline, 'preflight', return_value={
+                        'ok': True,
+                        'work_item': {'id': 263409, 'title': '测试', 'tags': []}}), \
+                    mock.patch.object(tfs, 'upload_attachment', return_value={'ok': True}), \
+                    mock.patch.object(tfs, 'add_tag', return_value={'ok': True}), \
+                    mock.patch.object(redis_client, 'publish_plan', return_value={'ok': True}) as publish, \
+                    mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}) as record:
+                response = pipeline.apply_run(
+                    263409, initialized['run_id'], False, 'config.json', process_root=root)
+            status = pipeline.get_run_status(263409, initialized['run_id'], root)
+
+        self.assertTrue(response['ok'])
+        self.assertEqual(response['verdict'], 'NEED-REVIEW')
+        self.assertEqual(response['validation']['decision'], 'PASS')
+        self.assertEqual(len(response['validation']['warnings']), 3)
+        self.assertEqual(status['warning_count'], 3)
+        self.assertEqual(status['status'], 'COMPLETED')
+        self.assertEqual(record.call_args.args[7]['warning_count'], 3)
+        publish.assert_called_once()
+
+    def test_attachment_chain_bad_types_are_warnings_not_exceptions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, base, plan_path = self.write_run_bound_plan(
+                directory, work_item_id=263409, verdict='NEED-REVIEW')
+            self.add_nonblocking_warning_inputs(base)
+            for chain in (['unknown', 'chain'], {'tool': 'builtin'}, 'shell-command'):
+                plan = copy.deepcopy(base)
+                plan['attachments']['parsed'][0]['converter_chain'] = chain
+                checked = pipeline.validate_plan(plan, plan_path, check_files=False)
+                self.assertTrue(checked['ok'], checked['errors'])
+                self.assertIn('ATTACHMENT_CHAIN_INVALID', {
+                    warning['code'] for warning in checked['warnings']})
+
+    def test_manual_terminal_missing_recorded_probe_is_warning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, manual, plan_path = self.write_run_bound_plan(
+                directory, work_item_id=263409, verdict='NEED-REVIEW')
+            self.add_nonblocking_warning_inputs(manual)
+            manual['kb']['findings'] = [{
+                'entity': '麻醉规则源码', 'state': '已证实',
+                'source_tool': 'search_source', 'source_type': 'code',
+                'conclusion': '已定位当前校验逻辑',
+                'evidence': 'Service.java#validate',
+                'boundary': '不证明产品待确认的目标值',
+            }]
+            manual['kb']['tools_used'] = ['query']
+            checked = pipeline.validate_plan(manual, plan_path, check_files=False)
+            self.assertTrue(checked['ok'], checked['errors'])
+            self.assertIn('TOOL_USAGE_NOT_RECORDED', {
+                warning['code'] for warning in checked['warnings']})
+
+    def test_run_bound_source_change_ends_run_without_error_publish(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = os.path.join(directory, '过程文件')
+            initialized, _, _ = self.write_run_bound_plan(
+                directory, work_item_id=263409, verdict='NEED-REVIEW')
+            with mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}), \
+                    mock.patch.object(tfs, 'precheck', return_value={'ok': True}), \
+                    mock.patch.object(pipeline, 'preflight', return_value={
+                        'ok': False, 'error': '工作项版本已变化：计划 rev 5，当前 rev 6'}), \
+                    mock.patch.object(redis_client, 'publish_plan', return_value={'ok': True}) as publish, \
+                    mock.patch.object(redis_client, 'publish_failure') as publish_failure, \
+                    mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}):
+                response = pipeline.apply_run(
+                    263409, initialized['run_id'], False, 'config.json', process_root=root)
+            status = pipeline.get_run_status(263409, initialized['run_id'], root)
+        self.assertTrue(response['ok'])
+        self.assertEqual(response['error_code'], 'SOURCE_CHANGED')
+        self.assertTrue(response['requires_new_run'])
+        self.assertEqual(response['validation']['decision'], 'ANALYSIS_ONLY')
+        self.assertTrue(response['validation']['blocking_errors']['source'])
+        self.assertEqual(status['status'], 'FAILED')
+        publish.assert_called_once()
+        publish_failure.assert_not_called()
+
+    def test_apply_run_rejects_forged_complete_v2_without_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = os.path.join(directory, '过程文件')
+            initialized = pipeline.init_run(263409, root)
+            run_id = initialized['run_id']
+            plan = {
+                'version': 2, 'run_id': run_id, 'skill': 'auto-req-analysis',
+                'work_item_id': 263409, 'expected_rev': 5, 'expected_state': '已建议',
+                'verdict': 'SKIP-ANALYSIS', 'tags': [], 'state_to': None,
+                'rules_source': {'qc': 'pre-qc-v1'}, 'artifacts': [],
+                'skip_reason': '历史计划伪装为本轮输出。',
+            }
+            plan_path = os.path.join(initialized['run_dir'], f'执行计划_263409_{run_id}.json')
+            with open(plan_path, 'w', encoding='utf-8') as output:
+                json.dump(plan, output, ensure_ascii=False, indent=2)
+            with mock.patch.object(tfs, 'load_config') as load_config, \
+                    mock.patch.object(redis_client, 'publish_plan') as publish:
+                response = pipeline.apply_run(
+                    263409, run_id, False, 'config.json', process_root=root)
+        self.assertFalse(response['ok'])
+        self.assertEqual(response['error_code'], 'LEGACY_PLAN_REQUIRES_EXPLICIT_REPLAY')
+        load_config.assert_not_called()
+        publish.assert_not_called()
+
+    def test_run_bound_qc_and_skip_require_receipt_and_canonical_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for verdict in ('SKIP-ANALYSIS', 'NEED-REVIEW'):
+                _, plan, plan_path = self.write_run_bound_plan(
+                    directory, work_item_id=263409, verdict=verdict)
+                checked = pipeline.validate_plan(plan, plan_path)
+                self.assertTrue(checked['ok'], checked['errors'])
+                missing = copy.deepcopy(plan)
+                missing.pop('run_receipt')
+                checked = pipeline.validate_plan(missing, plan_path)
+                self.assertFalse(checked['ok'])
+                self.assertIn('缺少字段 run_receipt', checked['errors'])
+
+    def test_run_bound_plan_digest_is_frozen_per_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, thin, plan_path = self.write_run_bound_plan(directory, work_item_id=263409)
+            expanded, meta, errors = pipeline.materialize_run_bound(thin, plan_path)
+            self.assertEqual(errors, [])
+            pipeline._ensure_frozen_plan(meta, expanded)
+            pipeline._ensure_frozen_plan(meta, expanded)
+            thin['skip_reason'] = '不同的终局摘要。'
+            with open(plan_path, 'w', encoding='utf-8') as output:
+                json.dump(thin, output, ensure_ascii=False, indent=2)
+            expanded, changed_meta, errors = pipeline.materialize_run_bound(thin, plan_path)
+            self.assertEqual(errors, [])
+            with self.assertRaisesRegex(ValueError, 'RUN_ID_ALREADY_FINALIZED'):
+                pipeline._ensure_frozen_plan(changed_meta, expanded)
+
+    def test_apply_legacy_is_explicit_isolated_and_does_not_publish_redis(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_analysis_plan(directory, ['existing-ui-simple'])
+            with mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}), \
+                    mock.patch.object(tfs, 'precheck', return_value={'ok': True}), \
+                    mock.patch.object(pipeline, 'preflight', return_value={
+                        'ok': True, 'work_item': {'tags': []}}), \
+                    mock.patch.object(tfs, 'replace_detail_analysis_section',
+                                      return_value={'ok': True}), \
+                    mock.patch.object(tfs, 'upload_attachment', return_value={'ok': True}), \
+                    mock.patch.object(tfs, 'add_tag', return_value={'ok': True}), \
+                    mock.patch.object(pipeline, 'apply_field_flow', return_value=[]), \
+                    mock.patch.object(redis_client, 'publish_plan') as publish, \
+                    mock.patch.object(redis_client, 'publish_failure') as publish_failure, \
+                    mock.patch.object(tfs, 'record', return_value={'audit': 'legacy.json'}) as record:
+                response = pipeline.apply_legacy_plan(
+                    plan, plan_path, False, 'config.json')
+        self.assertTrue(response['ok'])
+        self.assertEqual(response['run_mode'], 'legacy-replay')
+        self.assertFalse(response['redis']['in_scope'])
+        self.assertEqual(record.call_args.kwargs['audit_group'], 'legacy-runs')
+        publish.assert_not_called()
+        publish_failure.assert_not_called()
+
+    def test_init_run_is_unique_under_concurrency_and_collision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = os.path.join(directory, '过程文件')
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                results = list(pool.map(lambda _: pipeline.init_run(263409, root), range(16)))
+            self.assertEqual(len({item['run_id'] for item in results}), 16)
+
+            with mock.patch.object(tfs, 'beijing_timestamp', return_value='20260814_120000'), \
+                    mock.patch.object(pipeline.secrets, 'token_hex',
+                                      side_effect=['deadbeef', 'deadbeef', 'cafebabe']):
+                first = pipeline.init_run(9, root)
+                second = pipeline.init_run(9, root)
+            self.assertTrue(first['run_id'].endswith('_deadbeef'))
+            self.assertTrue(second['run_id'].endswith('_cafebabe'))
+
+    def test_analysis_ref_requires_receipt_identity_and_matching_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_analysis_ref_plan(directory)
+            valid = pipeline.validate_plan(plan, plan_path)
+            self.assertTrue(valid['ok'], valid['errors'])
+
+            missing = json.loads(json.dumps(plan))
+            missing.pop('run_receipt')
+            checked = pipeline.validate_plan(missing, plan_path)
+            self.assertFalse(checked['ok'])
+            self.assertIn('缺少字段 run_receipt', checked['errors'])
+
+            wrong_path = os.path.join(directory, 'plan.json')
+            checked = pipeline.validate_plan(plan, wrong_path)
+            self.assertFalse(checked['ok'])
+            self.assertTrue(any('SOURCE_RUN_DIRECTORY_MISMATCH' in error
+                                for error in checked['errors']))
+
+    def test_analysis_ref_reports_all_immediately_determinable_shape_errors(self):
+        malformed = {
+            'version': 2,
+            'plan_profile': pipeline.ANALYSIS_REF_PROFILE,
+            'work_item_id': 263409,
+            'run_id': 'bad',
+            'expected_rev': 'x',
+            'expected_state': '',
+            'analysis_result': {},
+        }
+        checked = pipeline.validate_plan(malformed, '/tmp/plan.json')
+        self.assertFalse(checked['ok'])
+        joined = '\n'.join(checked['errors'])
+        self.assertIn('缺少字段 run_receipt', joined)
+        self.assertIn('run_id 必须为', joined)
+        self.assertIn('expected_rev 必须是正整数', joined)
+        self.assertIn('expected_state 必须是非空字符串', joined)
+
+    def test_analysis_ref_collects_independent_reference_errors_in_one_pass(self):
+        run_id = 'run_20260814_120000_263409_deadbeef'
+        malformed = {
+            'version': 2,
+            'plan_profile': pipeline.ANALYSIS_REF_PROFILE,
+            'work_item_id': 263409,
+            'run_id': run_id,
+            'expected_rev': 'x',
+            'expected_state': '',
+            'analysis_result': {},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = os.path.join(directory, '263409', run_id)
+            os.makedirs(run_dir)
+            plan_path = os.path.join(run_dir, f'执行计划_263409_{run_id}.json')
+            checked = pipeline.validate_plan(malformed, plan_path)
+        self.assertFalse(checked['ok'])
+        joined = '\n'.join(checked['errors'])
+        self.assertIn('缺少字段 run_receipt', joined)
+        self.assertIn('expected_rev 必须是正整数', joined)
+        self.assertIn('expected_state 必须是非空字符串', joined)
+        self.assertIn('analysis_result 必须精确包含 path、sha256', joined)
+
+    def test_analysis_ref_receipt_cannot_be_replayed_from_copied_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_analysis_ref_plan(directory)
+            copied = os.path.join(directory, 'copied', '1', plan['run_id'])
+            os.makedirs(os.path.dirname(copied), exist_ok=True)
+            shutil.copytree(os.path.dirname(plan_path), copied)
+            copied_plan = os.path.join(copied, os.path.basename(plan_path))
+            checked = pipeline.validate_plan(plan, copied_plan)
+        self.assertFalse(checked['ok'])
+        self.assertTrue(any('运行回执未绑定当前规范目录' in error
+                            for error in checked['errors']))
+
+    def test_analysis_ref_freeze_rejects_changed_snapshot_but_allows_same_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, snapshot_path = self.write_analysis_ref_plan(directory)
+            expanded, meta, errors = pipeline.materialize_analysis_ref(plan, plan_path)
+            self.assertEqual(errors, [])
+            pipeline._ensure_frozen_analysis(meta, expanded)
+            pipeline._ensure_frozen_analysis(meta, expanded)
+
+            with open(snapshot_path, 'r', encoding='utf-8') as source:
+                snapshot = json.load(source)
+            snapshot['report']['analysis_description']['categories'][0]['items'][0]['content'] = '不同结论。'
+            with open(snapshot_path, 'w', encoding='utf-8') as output:
+                json.dump(snapshot, output, ensure_ascii=False, indent=2)
+            plan['analysis_result']['sha256'] = pipeline.sha256_file(snapshot_path)
+            expanded, changed_meta, errors = pipeline.materialize_analysis_ref(plan, plan_path)
+            self.assertEqual(errors, [])
+            with self.assertRaisesRegex(ValueError, 'RUN_ID_ALREADY_FINALIZED'):
+                pipeline._ensure_frozen_analysis(changed_meta, expanded)
+
+    def test_analysis_ref_requires_generated_utc_timestamp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, snapshot_path = self.write_analysis_ref_plan(directory)
+            with open(snapshot_path, 'r', encoding='utf-8') as source:
+                snapshot = json.load(source)
+            snapshot.pop('generated_at_utc')
+            with open(snapshot_path, 'w', encoding='utf-8') as output:
+                json.dump(snapshot, output, ensure_ascii=False, indent=2)
+            plan['analysis_result']['sha256'] = pipeline.sha256_file(snapshot_path)
+            checked = pipeline.validate_plan(plan, plan_path)
+        self.assertFalse(checked['ok'])
+        self.assertTrue(any('generated_at_utc' in error for error in checked['errors']))
+
+    def test_analysis_ref_materialize_failure_publishes_redis_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_analysis_ref_plan(directory)
+            plan.pop('analysis_result')
+            with open(plan_path, 'w', encoding='utf-8') as output:
+                json.dump(plan, output, ensure_ascii=False, indent=2)
+            with mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}), \
+                    mock.patch.object(redis_client, 'publish_failure',
+                                      return_value={'ok': True, 'key': 'k', 'fields': 7}) as publish_failure, \
+                    mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}):
+                response = pipeline.apply_plan(plan, plan_path, False, 'config.json')
+        self.assertFalse(response['ok'])
+        self.assertEqual(response['error_code'], 'PLAN_VALIDATION_FAILED')
+        self.assertIn('缺少字段 analysis_result', response['errors'])
+        self.assertTrue(response['redis']['in_scope'])
+        publish_failure.assert_called_once()
+        self.assertEqual(publish_failure.call_args.args[3], 'C')
+
+    def test_materialized_plan_content_validation_failure_publishes_redis_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, snapshot_path = self.write_analysis_ref_plan(directory)
+            with open(snapshot_path, 'r', encoding='utf-8') as source:
+                snapshot = json.load(source)
+            snapshot['general_rule_coverage']['acceptance']['status'] = 'PENDING'
+            with open(snapshot_path, 'w', encoding='utf-8') as output:
+                json.dump(snapshot, output, ensure_ascii=False, indent=2)
+            plan['analysis_result']['sha256'] = pipeline.sha256_file(snapshot_path)
+            with open(plan_path, 'w', encoding='utf-8') as output:
+                json.dump(plan, output, ensure_ascii=False, indent=2)
+            with mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}), \
+                    mock.patch.object(redis_client, 'publish_failure',
+                                      return_value={'ok': True, 'key': 'k', 'fields': 7}) as publish_failure, \
+                    mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}):
+                response = pipeline.apply_plan(plan, plan_path, False, 'config.json')
+        self.assertFalse(response['ok'])
+        self.assertTrue(any('general_rule_coverage' in error for error in response['errors']))
+        self.assertTrue(response['redis']['in_scope'])
+        publish_failure.assert_called_once()
+        self.assertEqual(publish_failure.call_args.args[3], 'C')
+
+    def test_analysis_ref_execution_block_publishes_analysis_only_without_tfs_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_analysis_ref_plan(directory)
+            with mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}), \
+                    mock.patch.object(tfs, 'precheck', return_value={'ok': False, 'error': 'not ready'}), \
+                    mock.patch.object(redis_client, 'publish_plan', return_value={'ok': True}) as publish, \
+                    mock.patch.object(redis_client, 'publish_failure') as publish_failure, \
+                    mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}), \
+                    mock.patch.object(tfs, 'replace_detail_analysis_section') as write_description, \
+                    mock.patch.object(tfs, 'upload_attachment') as upload:
+                response = pipeline.apply_plan(plan, plan_path, True, 'config.json')
+        self.assertTrue(response['ok'])
+        self.assertFalse(response['applied'])
+        self.assertEqual(response['run_mode'], 'analysis-only')
+        self.assertEqual(response['actions'], [])
+        self.assertEqual(response['validation']['decision'], 'ANALYSIS_ONLY')
+        self.assertTrue(response['validation']['blocking_errors']['execution'])
+        self.assertEqual(publish.call_args.args[1], 'analysis-only')
+        publish_failure.assert_not_called()
+        write_description.assert_not_called()
+        upload.assert_not_called()
+
+    def test_analysis_ref_source_change_is_terminal_and_requires_new_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_analysis_ref_plan(directory)
+            with mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}), \
+                    mock.patch.object(tfs, 'precheck', return_value={'ok': True}), \
+                    mock.patch.object(pipeline, 'preflight', return_value={
+                        'ok': False, 'error': '工作项版本已变化：计划为 rev 5，当前为 rev 6'}), \
+                    mock.patch.object(redis_client, 'publish_plan', return_value={'ok': True}), \
+                    mock.patch.object(redis_client, 'publish_failure') as publish_failure, \
+                    mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}):
+                response = pipeline.apply_plan(plan, plan_path, False, 'config.json')
+        self.assertTrue(response['ok'])
+        self.assertFalse(response['applied'])
+        self.assertEqual(response['error_code'], 'SOURCE_CHANGED')
+        self.assertFalse(response['retryable'])
+        self.assertTrue(response['requires_new_run'])
+        publish_failure.assert_not_called()
+
+    def test_preflight_allows_only_same_frozen_run_to_resume_its_own_revision_changes(self):
+        run_id = 'run_20260814_120000_1_deadbeef'
+        plan = {
+            'work_item_id': 1, 'run_id': run_id, 'expected_rev': 5,
+            'expected_state': '已建议', 'verdict': 'AUTO-ANA',
+            'rules_source': {'qc': 'pre-qc-v1', 'analysis': 'evidence-loop-v2'},
+        }
+        report = f'需求分析报告_1_{run_id}.md'
+        raw = {'id': 1, 'rev': 9, 'fields': {
+            tfs.F_DESCRIPTION: f'<div>【分析者描述】</div><!-- auto-req-run:{run_id} -->',
+        }, 'relations': [{
+            'rel': 'AttachedFile',
+            'url': 'http://example/attachment?fileName=' + urllib.parse.quote(report),
+        }]}
+        item = {'workItemType': '需求', 'rev': 9, 'state': '已分析', 'tags': []}
+        checkpoint = {'last_rev': 9, 'last_state': '已分析'}
+        with mock.patch.object(tfs, 'fetch_raw', return_value=raw), \
+                mock.patch.object(tfs, 'map_workitem', return_value=item):
+            resumed = pipeline.preflight({}, plan, resume_checkpoint=checkpoint)
+            strict = pipeline.preflight({}, plan)
+        self.assertTrue(resumed['ok'])
+        self.assertTrue(resumed['resumed'])
+        self.assertFalse(strict['ok'])
+
+        item['state'] = '关闭'
+        with mock.patch.object(tfs, 'fetch_raw', return_value=raw), \
+                mock.patch.object(tfs, 'map_workitem', return_value=item):
+            unexpected = pipeline.preflight({}, plan, resume_checkpoint=checkpoint)
+        self.assertFalse(unexpected['ok'])
+
+        item['state'] = '已分析'
+        item['rev'] = 10
+        with mock.patch.object(tfs, 'fetch_raw', return_value=raw), \
+                mock.patch.object(tfs, 'map_workitem', return_value=item):
+            externally_changed = pipeline.preflight({}, plan, resume_checkpoint=checkpoint)
+        self.assertFalse(externally_changed['ok'])
+
+    def test_same_frozen_analysis_ref_supports_dry_run_execute_and_repeat(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_analysis_ref_plan(directory)
+            with mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}), \
+                    mock.patch.object(tfs, 'precheck', return_value={'ok': True}), \
+                    mock.patch.object(pipeline, 'preflight', return_value={
+                        'ok': True, 'work_item': {'id': 1, 'title': '测试需求',
+                                                  'rev': 5, 'state': '已建议', 'tags': []}}), \
+                    mock.patch.object(tfs, 'fetch_raw', return_value={'id': 1}), \
+                    mock.patch.object(tfs, 'map_workitem', return_value={
+                        'rev': 5, 'state': '已建议'}), \
+                    mock.patch.object(tfs, 'replace_detail_analysis_section',
+                                      return_value={'ok': True, 'noop': True}), \
+                    mock.patch.object(tfs, 'upload_attachment',
+                                      return_value={'ok': True, 'noop': True}), \
+                    mock.patch.object(tfs, 'cleanup_analysis_attachments',
+                                      return_value={'ok': True, 'noop': True}), \
+                    mock.patch.object(tfs, 'add_tag', return_value={'ok': True, 'noop': True}), \
+                    mock.patch.object(pipeline, 'apply_field_flow', return_value=[]), \
+                    mock.patch.object(pipeline, '_update_execution_checkpoint', return_value={}), \
+                    mock.patch.object(redis_client, 'publish_plan', return_value={'ok': True}), \
+                    mock.patch.object(redis_client, 'publish_failure') as publish_failure, \
+                    mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}):
+                dry_run = pipeline.apply_plan(plan, plan_path, False, 'config.json')
+                execute = pipeline.apply_plan(plan, plan_path, True, 'config.json')
+                repeated = pipeline.apply_plan(plan, plan_path, True, 'config.json')
+                report = os.path.join(os.path.dirname(plan_path),
+                                      f'需求分析报告_1_{plan["run_id"]}.md')
+                self.assertTrue(os.path.isfile(report))
+        self.assertTrue(dry_run['ok'])
+        self.assertFalse(dry_run['applied'])
+        self.assertTrue(execute['ok'])
+        self.assertTrue(execute['applied'])
+        self.assertTrue(repeated['ok'])
+        self.assertTrue(repeated['applied'])
+        publish_failure.assert_not_called()
+
+    def test_noop_before_external_change_stays_source_changed_analysis_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, snapshot_path = self.write_analysis_ref_plan(directory)
+            with open(snapshot_path, 'r', encoding='utf-8') as source:
+                snapshot = json.load(source)
+            snapshot['verdict'] = 'MANUAL-REVIEW'
+            snapshot.pop('auto_scopes', None)
+            with open(snapshot_path, 'w', encoding='utf-8') as output:
+                json.dump(snapshot, output, ensure_ascii=False, indent=2)
+            plan['analysis_result']['sha256'] = pipeline.sha256_file(snapshot_path)
+
+            observed = iter([
+                {'rev': 5, 'state': '已建议'},
+                {'rev': 6, 'state': '已建议'},
+            ])
+            with mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}), \
+                    mock.patch.object(tfs, 'precheck', return_value={'ok': True}), \
+                    mock.patch.object(pipeline, 'preflight', return_value={
+                        'ok': True, 'work_item': {'id': 1, 'title': '测试需求',
+                                                  'rev': 5, 'state': '已建议', 'tags': []}}), \
+                    mock.patch.object(tfs, 'fetch_raw', return_value={'id': 1}), \
+                    mock.patch.object(tfs, 'map_workitem', side_effect=lambda _raw: next(observed)), \
+                    mock.patch.object(tfs, 'replace_detail_analysis_section',
+                                      return_value={'ok': True, 'noop': True}), \
+                    mock.patch.object(tfs, 'upload_attachment') as upload, \
+                    mock.patch.object(redis_client, 'publish_plan', return_value={'ok': True}), \
+                    mock.patch.object(redis_client, 'publish_failure') as publish_failure, \
+                    mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}):
+                response = pipeline.apply_plan(plan, plan_path, True, 'config.json')
+
+        self.assertTrue(response['ok'])
+        self.assertFalse(response['applied'])
+        self.assertEqual(response['run_mode'], 'analysis-only')
+        self.assertEqual(response['error_code'], 'SOURCE_CHANGED')
+        self.assertTrue(response['requires_new_run'])
+        upload.assert_not_called()
+        publish_failure.assert_not_called()
+
+    def test_execution_checkpoint_binds_resume_to_last_executor_observed_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            thin, plan_path, _ = self.write_analysis_ref_plan(directory)
+            plan, meta, errors = pipeline.materialize_analysis_ref(thin, plan_path)
+            self.assertEqual(errors, [])
+            raw = {'id': 1, 'rev': 7, 'fields': {}}
+            item = {'workItemType': '需求', 'rev': 7, 'state': '已建议', 'tags': []}
+            with mock.patch.object(tfs, 'fetch_raw', return_value=raw), \
+                    mock.patch.object(tfs, 'map_workitem', return_value=item):
+                pipeline._update_execution_checkpoint(
+                    meta, plan, {'collection': 'C'}, ['write-detail-analysis'])
+                checkpoint = pipeline._load_execution_checkpoint(meta, plan)
+                resumed = pipeline.preflight({}, plan, resume_checkpoint=checkpoint)
+            self.assertTrue(resumed['ok'])
+            self.assertTrue(resumed['resumed'])
+
+            item['rev'] = 8
+            with mock.patch.object(tfs, 'fetch_raw', return_value=raw), \
+                    mock.patch.object(tfs, 'map_workitem', return_value=item):
+                changed = pipeline.preflight({}, plan, resume_checkpoint=checkpoint)
+            self.assertFalse(changed['ok'])
+
+    def test_execute_checkpoint_allows_repeat_but_rejects_later_external_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            thin, plan_path, snapshot_path = self.write_analysis_ref_plan(directory)
+            with open(snapshot_path, 'r', encoding='utf-8') as source:
+                snapshot = json.load(source)
+            snapshot['verdict'] = 'MANUAL-REVIEW'
+            snapshot.pop('auto_scopes', None)
+            with open(snapshot_path, 'w', encoding='utf-8') as output:
+                json.dump(snapshot, output, ensure_ascii=False, indent=2)
+            thin['analysis_result']['sha256'] = pipeline.sha256_file(snapshot_path)
+
+            live = {'rev': 5, 'state': '已建议', 'tags': []}
+            noop = {'value': False}
+
+            def fetch(_client, _wid):
+                return {'id': 1, 'fields': {}, 'relations': []}
+
+            def mapped(_raw):
+                return {
+                    'id': 1, 'title': '测试需求', 'workItemType': '需求',
+                    'rev': live['rev'], 'state': live['state'], 'tags': list(live['tags']),
+                }
+
+            def action(*_args, **_kwargs):
+                if noop['value']:
+                    return {'ok': True, 'noop': True}
+                live['rev'] += 1
+                return {'ok': True}
+
+            def add_tag(*_args, **_kwargs):
+                response = action()
+                if not response.get('noop'):
+                    live['tags'] = ['PM-AI-MANUAL-REVIEW']
+                return response
+
+            with mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}), \
+                    mock.patch.object(tfs, 'precheck', return_value={'ok': True}), \
+                    mock.patch.object(tfs, 'fetch_raw', side_effect=fetch), \
+                    mock.patch.object(tfs, 'map_workitem', side_effect=mapped), \
+                    mock.patch.object(tfs, 'replace_detail_analysis_section', side_effect=action), \
+                    mock.patch.object(tfs, 'upload_attachment', side_effect=action), \
+                    mock.patch.object(tfs, 'cleanup_analysis_attachments', side_effect=action), \
+                    mock.patch.object(tfs, 'add_tag', side_effect=add_tag), \
+                    mock.patch.object(redis_client, 'publish_plan', return_value={'ok': True}), \
+                    mock.patch.object(redis_client, 'publish_failure') as publish_failure, \
+                    mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}):
+                first = pipeline.apply_plan(thin, plan_path, True, 'config.json')
+                self.assertTrue(first['ok'], first)
+                self.assertEqual(live['rev'], 9)
+                noop['value'] = True
+                repeated = pipeline.apply_plan(thin, plan_path, True, 'config.json')
+                self.assertTrue(repeated['ok'], repeated)
+                self.assertEqual(live['rev'], 9)
+                live['rev'] = 10
+                external = pipeline.apply_plan(thin, plan_path, True, 'config.json')
+        self.assertTrue(external['ok'])
+        self.assertEqual(external['error_code'], 'SOURCE_CHANGED')
+        self.assertTrue(external['requires_new_run'])
+        publish_failure.assert_not_called()
+
+    def test_execute_checkpoint_uses_patch_revision_without_stale_post_get(self):
+        with tempfile.TemporaryDirectory() as directory:
+            thin, plan_path, snapshot_path = self.write_analysis_ref_plan(directory)
+            with open(snapshot_path, 'r', encoding='utf-8') as source:
+                snapshot = json.load(source)
+            snapshot['verdict'] = 'MANUAL-REVIEW'
+            snapshot.pop('auto_scopes', None)
+            with open(snapshot_path, 'w', encoding='utf-8') as output:
+                json.dump(snapshot, output, ensure_ascii=False, indent=2)
+            thin['analysis_result']['sha256'] = pipeline.sha256_file(snapshot_path)
+
+            live = {'rev': 8, 'state': '已建议'}
+
+            def mapped(_raw):
+                return {'rev': live['rev'], 'state': live['state']}
+
+            def write_description(*_args):
+                # PATCH 响应是写后权威身份；revision 不要求业务动作恰好只增加 1。
+                live['rev'] = 10
+                return {'ok': True, 'post_rev': 10, 'post_state': '已建议'}
+
+            with mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}), \
+                    mock.patch.object(tfs, 'precheck', return_value={'ok': True}), \
+                    mock.patch.object(pipeline, 'preflight', return_value={
+                        'ok': True, 'work_item': {'id': 1, 'title': '测试需求',
+                                                  'rev': 8, 'state': '已建议', 'tags': []}}), \
+                    mock.patch.object(tfs, 'fetch_raw', return_value={'id': 1}) as fetch, \
+                    mock.patch.object(tfs, 'map_workitem', side_effect=mapped), \
+                    mock.patch.object(tfs, 'replace_detail_analysis_section',
+                                      side_effect=write_description), \
+                    mock.patch.object(tfs, 'upload_attachment',
+                                      return_value={'ok': True, 'noop': True}), \
+                    mock.patch.object(tfs, 'cleanup_analysis_attachments',
+                                      return_value={'ok': True, 'noop': True}), \
+                    mock.patch.object(tfs, 'add_tag',
+                                      return_value={'ok': True, 'noop': True}), \
+                    mock.patch.object(redis_client, 'publish_plan', return_value={'ok': True}), \
+                    mock.patch.object(redis_client, 'publish_failure') as publish_failure, \
+                    mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}):
+                response = pipeline.apply_plan(thin, plan_path, True, 'config.json')
+            materialized, meta, errors = pipeline.materialize_analysis_ref(thin, plan_path)
+            self.assertEqual(errors, [])
+            checkpoint = pipeline._load_execution_checkpoint(meta, materialized)
+
+        self.assertTrue(response['ok'], response)
+        self.assertEqual(checkpoint['last_rev'], 10)
+        self.assertIn('write-detail-analysis', checkpoint['completed_actions'])
+        # 四个动作各一次写前检查；写描述后不再额外 GET 验证 +1。
+        self.assertEqual(fetch.call_count, 4)
+        publish_failure.assert_not_called()
+
+    def test_execute_checkpoint_treats_unchanged_post_rev_as_confirmed_noop(self):
+        # 263409 回归：内容仅差 run 标记注释（TFS 落库即剥）时 PATCH 200 但不建 revision，
+        # post_rev == 写前 rev 是 TFS 确认的等效 no-op，不得误判为写后确认失败。
+        with tempfile.TemporaryDirectory() as directory:
+            thin, plan_path, snapshot_path = self.write_analysis_ref_plan(directory)
+            with open(snapshot_path, 'r', encoding='utf-8') as source:
+                snapshot = json.load(source)
+            snapshot['verdict'] = 'MANUAL-REVIEW'
+            snapshot.pop('auto_scopes', None)
+            with open(snapshot_path, 'w', encoding='utf-8') as output:
+                json.dump(snapshot, output, ensure_ascii=False, indent=2)
+            thin['analysis_result']['sha256'] = pipeline.sha256_file(snapshot_path)
+
+            def mapped(_raw):
+                return {'rev': 8, 'state': '已建议'}
+
+            def write_description(*_args):
+                # TFS 接受 PATCH 但未创建新 revision（无字段值变更）。
+                return {'ok': True, 'post_rev': 8, 'post_state': '已建议'}
+
+            with mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}), \
+                    mock.patch.object(tfs, 'precheck', return_value={'ok': True}), \
+                    mock.patch.object(pipeline, 'preflight', return_value={
+                        'ok': True, 'work_item': {'id': 1, 'title': '测试需求',
+                                                  'rev': 8, 'state': '已建议', 'tags': []}}), \
+                    mock.patch.object(tfs, 'fetch_raw', return_value={'id': 1}), \
+                    mock.patch.object(tfs, 'map_workitem', side_effect=mapped), \
+                    mock.patch.object(tfs, 'replace_detail_analysis_section',
+                                      side_effect=write_description), \
+                    mock.patch.object(tfs, 'upload_attachment',
+                                      return_value={'ok': True, 'noop': True}), \
+                    mock.patch.object(tfs, 'cleanup_analysis_attachments',
+                                      return_value={'ok': True, 'noop': True}), \
+                    mock.patch.object(tfs, 'add_tag',
+                                      return_value={'ok': True, 'noop': True}), \
+                    mock.patch.object(redis_client, 'publish_plan', return_value={'ok': True}), \
+                    mock.patch.object(redis_client, 'publish_failure') as publish_failure, \
+                    mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}):
+                response = pipeline.apply_plan(thin, plan_path, True, 'config.json')
+            materialized, meta, errors = pipeline.materialize_analysis_ref(thin, plan_path)
+            self.assertEqual(errors, [])
+            checkpoint = pipeline._load_execution_checkpoint(meta, materialized)
+
+        self.assertTrue(response['ok'], response)
+        self.assertNotIn('POST_WRITE_CONFIRMATION_FAILED', str(response))
+        # 等效 no-op：检查点 rev 不推进，但动作计入已完成，续跑无需重做。
+        self.assertEqual(checkpoint['last_rev'], 8)
+        self.assertIn('write-detail-analysis', checkpoint['completed_actions'])
+        publish_failure.assert_not_called()
+
+    def test_unconfirmed_successful_write_is_visible_in_failure_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            thin, plan_path, snapshot_path = self.write_analysis_ref_plan(directory)
+            with open(snapshot_path, 'r', encoding='utf-8') as source:
+                snapshot = json.load(source)
+            snapshot['verdict'] = 'MANUAL-REVIEW'
+            snapshot.pop('auto_scopes', None)
+            with open(snapshot_path, 'w', encoding='utf-8') as output:
+                json.dump(snapshot, output, ensure_ascii=False, indent=2)
+            thin['analysis_result']['sha256'] = pipeline.sha256_file(snapshot_path)
+
+            with mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}), \
+                    mock.patch.object(tfs, 'precheck', return_value={'ok': True}), \
+                    mock.patch.object(pipeline, 'preflight', return_value={
+                        'ok': True, 'work_item': {'id': 1, 'title': '测试需求',
+                                                  'rev': 8, 'state': '已建议', 'tags': []}}), \
+                    mock.patch.object(tfs, 'fetch_raw', return_value={'id': 1}), \
+                    mock.patch.object(tfs, 'map_workitem', return_value={
+                        'rev': 8, 'state': '已建议'}), \
+                    mock.patch.object(tfs, 'replace_detail_analysis_section',
+                                      return_value={'ok': True}), \
+                    mock.patch.object(redis_client, 'publish_failure', return_value={'ok': True}), \
+                    mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}) as record:
+                response = pipeline.apply_plan(thin, plan_path, True, 'config.json')
+
+        self.assertFalse(response['ok'])
+        self.assertEqual(response['error_code'], 'POST_WRITE_CONFIRMATION_FAILED')
+        self.assertEqual([entry['action'] for entry in response['actions']], [
+            'write-detail-analysis'])
+        self.assertTrue(record.call_args.args[7]['partial_write'])
+
+    def test_263409_ambiguities_stay_in_one_qc_confirmation_batch(self):
+        fixture = os.path.join(os.path.dirname(__file__), 'fixtures', '263409_ambiguity.json')
+        with open(fixture, 'r', encoding='utf-8') as source:
+            payload = json.load(source)
+        self.assertEqual(payload['schema'], 'qc-ambiguity-regression-v1')
+        self.assertNotIn('run_id', payload)
+        ids = {item['id'] for item in payload['required_items']}
+        self.assertEqual(ids, {
+            'q-empty-value', 'q-maintenance-mode', 'q-surgery-rule', 'q-data-scope',
+        })
+        self.assertEqual(payload['expected_verdict'], 'NEED-REVIEW')
+        self.assertIn('自动填充无或-', payload['forbidden_conclusions'])
 
     def test_v1_evidence_loop_plan_still_passes_without_evidence_acquisition(self):
         # 向后兼容：evidence-loop-v1 计划不要求 evidence_acquisition
@@ -1142,10 +2442,180 @@ class PipelinePlanTests(unittest.TestCase):
             self.assertNotIn('evidence_acquisition', plan)
             self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
 
+    def test_v2_legacy_change_plan_filename_still_validates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, report_path = self.write_v2_analysis_plan(
+                directory, ['existing-ui-simple'])
+            legacy_name = f'变更方案_1_{plan["run_id"]}.md'
+            legacy_path = os.path.join(directory, legacy_name)
+            os.replace(report_path, legacy_path)
+            plan['artifacts'][0]['path'] = legacy_name
+            self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
     def test_v2_complete_acquisition_plan_passes(self):
         with tempfile.TemporaryDirectory() as directory:
             plan, plan_path, _ = self.write_v2_analysis_plan(directory, ['existing-ui-simple'])
             self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
+    def test_v2_requires_implementation_impacts_and_business_rule_coverage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_v2_analysis_plan(
+                directory, ['existing-ui-simple'])
+            plan.pop('implementation_impacts')
+            plan.pop('business_rule_coverage')
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('implementation_impacts' in error for error in result['errors']))
+            self.assertTrue(any('business_rule_coverage' in error for error in result['errors']))
+
+    def test_v2_requires_general_seven_dimension_coverage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_v2_analysis_plan(
+                directory, ['existing-ui-simple'])
+            plan.pop('general_rule_coverage')
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('general_rule_coverage' in error for error in result['errors']))
+
+    def test_v2_general_scope_semantics_and_acceptance_require_confirmation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_v2_analysis_plan(
+                directory, ['existing-ui-simple'])
+            plan['general_rule_coverage']['scope'] = {
+                'status': 'NOT_APPLICABLE', 'source': 'not-applicable',
+                'basis': '错误地认为范围不适用。',
+            }
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any(
+                'general_rule_coverage.scope 不允许 NOT_APPLICABLE' in error
+                for error in result['errors']))
+
+    def test_v2_general_dimensions_reject_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_v2_analysis_plan(
+                directory, ['existing-ui-simple'])
+            plan['general_rule_coverage']['workflow'] = {
+                'status': 'DEFAULTED', 'source': 'presentation-default',
+                'basis': '错误地默认沿用当前流程。',
+            }
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any(
+                '通用七面不得使用默认值' in error for error in result['errors']))
+
+    def test_v2_business_rule_confirmation_requires_traceable_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_v2_analysis_plan(
+                directory, ['existing-ui-simple'])
+            plan['business_rule_coverage']['presentation'] = {
+                'status': 'CONFIRMED', 'basis': '产品已确认展示方式。'}
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any(
+                'business_rule_coverage.presentation.source' in error
+                for error in result['errors']))
+
+    def test_v2_data_write_requires_source_and_database_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_v2_analysis_plan(
+                directory, ['existing-ui-simple'])
+            plan['implementation_impacts'] = [
+                'ui-presentation', 'field-assignment', 'api-contract', 'data-read-write',
+            ]
+            plan['business_rule_coverage']['empty_value'] = {
+                'status': 'CONFIRMED', 'source': 'work-item',
+                'basis': '工作项确认允许清空并保存为 null。'}
+            plan['business_rule_coverage']['maintenance_granularity'] = {
+                'status': 'CONFIRMED', 'source': 'work-item',
+                'basis': '工作项确认按明细独立维护。'}
+            plan['business_rule_coverage']['historical_data'] = {
+                'status': 'CONFIRMED', 'source': 'work-item',
+                'basis': '工作项确认历史数据不迁移。'}
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('kb.source_required=true' in error for error in result['errors']))
+            self.assertTrue(any('kb.database_required=true' in error for error in result['errors']))
+
+            plan['kb']['source_required'] = True
+            plan['kb']['database_required'] = True
+            plan['kb']['database_ready'] = True
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('必须实际调用 search_source' in error for error in result['errors']))
+            self.assertTrue(any('必须实际调用数据库图谱工具' in error for error in result['errors']))
+
+            plan['kb']['tools_used'].extend(['search_symbol', 'search_knowledge'])
+            plan['kb']['findings'].extend([
+                {
+                    'entity': 'repo-a:src/SaveService.java#save', 'state': '已证实',
+                    'source_tool': 'search_symbol', 'source_type': 'code',
+                    'conclusion': '源码已确认字段进入保存链路',
+                    'evidence': 'SaveService.save 方法体',
+                    'boundary': '只证明受控仓库源码，不代表现场部署。',
+                },
+                {
+                    'entity': 'HIS.dbo.TEST.ZTNR', 'state': '已证实',
+                    'source_tool': 'search_knowledge', 'source_type': 'database',
+                    'conclusion': '数据库图谱已确认目标字段与正式表',
+                    'evidence': 'Table TEST / Column ZTNR',
+                    'boundary': '只证明图谱快照，不代表现场数据质量。',
+                },
+            ])
+            plan['evidence_acquisition']['db_knowledge'] = {
+                'availability': 'READY', 'coverage_status': 'OUT_OF_SCOPE',
+                'query_status': 'SKIPPED', 'queries': [], 'stop_reason': 'not_applicable',
+            }
+            skipped = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(skipped['ok'])
+            self.assertTrue(any(
+                'evidence_acquisition.db_knowledge 不得为 SKIPPED' in error
+                for error in skipped['errors']))
+            plan['evidence_acquisition']['db_knowledge'] = {
+                'availability': 'READY', 'coverage_status': 'COMPLETE',
+                'query_status': 'HIT',
+                'queries': [{'terms': 'TEST.ZTNR', 'truncated': False}],
+                'stop_reason': 'exhausted',
+            }
+            self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+
+    def test_v2_data_write_rejects_defaulted_empty_maintenance_and_history_rules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_v2_analysis_plan(
+                directory, ['existing-ui-simple'])
+            plan['implementation_impacts'] = ['data-read-write']
+            plan['business_rule_coverage']['empty_value'] = {
+                'status': 'DEFAULTED', 'source': 'presentation-default',
+                'basis': '默认空值保存为空串。'}
+            plan['business_rule_coverage']['maintenance_granularity'] = {
+                'status': 'DEFAULTED', 'source': 'presentation-default',
+                'basis': '默认按当前维护粒度。'}
+            plan['business_rule_coverage']['historical_data'] = {
+                'status': 'DEFAULTED', 'source': 'presentation-default',
+                'basis': '默认不处理历史数据。'}
+            plan['kb']['source_required'] = True
+            plan['kb']['database_required'] = True
+            plan['kb']['database_ready'] = True
+            plan['kb']['tools_used'].extend(['search_symbol', 'search_knowledge'])
+            plan['kb']['findings'].extend([
+                {
+                    'entity': 'repo-a:src/SaveService.java#save', 'state': '已证实',
+                    'source_tool': 'search_symbol', 'source_type': 'code',
+                    'conclusion': '源码已确认保存链路', 'evidence': 'SaveService.save',
+                    'boundary': '不代表现场部署。',
+                },
+                {
+                    'entity': 'HIS.dbo.TEST.ZTNR', 'state': '已证实',
+                    'source_tool': 'search_knowledge', 'source_type': 'database',
+                    'conclusion': '数据库已确认字段', 'evidence': 'TEST.ZTNR',
+                    'boundary': '不代表现场数据质量。',
+                },
+            ])
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertTrue(any('empty_value' in error for error in result['errors']))
+            self.assertTrue(any('maintenance_granularity' in error for error in result['errors']))
+            self.assertTrue(any('historical_data' in error for error in result['errors']))
 
     def test_v2_plan_requires_evidence_acquisition_object(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1356,11 +2826,13 @@ class PipelinePlanTests(unittest.TestCase):
                 mock.patch.object(tfs, 'write_field') as write_field, \
                 mock.patch.object(tfs, 'set_state') as set_state, \
                 mock.patch.object(tfs, 'set_assignee') as set_assignee:
-            response = pipeline.apply_plan(plan, '/tmp/skip-plan.json', True, 'config.json')
+            response = pipeline.apply_plan(
+                plan, '/tmp/skip-plan.json', True, 'config.json', legacy_replay=True)
         self.assertTrue(response['ok'])
         self.assertEqual(response['actions'], [])
-        publish.assert_called_once_with(plan, 'execute', 'C', 'config.json',
-                                        analysis_description_html='', work_item='')
+        self.assertEqual(response['run_mode'], 'legacy-replay')
+        self.assertFalse(response['redis']['in_scope'])
+        publish.assert_not_called()
         for mutation in (remove_tag, add_tag, upload_attachment, replace_detail,
                          write_field, set_state, set_assignee):
             mutation.assert_not_called()
@@ -1456,6 +2928,43 @@ class PipelinePlanTests(unittest.TestCase):
             self.assertFalse(result['ok'])
             self.assertIn(
                 'concise-v3 分析者描述必须且只能包含一个非空“菜单路径”',
+                result['errors'])
+
+    def test_concise_v3_numbered_change_points_are_contiguous_and_structured(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, artifact_path = self.write_current_analysis_plan(
+                directory, ['existing-ui-simple'])
+            with open(artifact_path, 'r', encoding='utf-8') as f:
+                original = f.read()
+            numbered = original.replace(
+                '- **界面优化方案**：已明确界面优化方案\n',
+                '- **界面优化方案**：包含以下两项界面调整。\n'
+                '1. **状态标识**：在患者卡片展示状态标识。\n'
+                '2. **费用信息**：在患者卡片补充费用信息。\n')
+            with open(artifact_path, 'w', encoding='utf-8') as f:
+                f.write(numbered)
+            self.assertTrue(pipeline.validate_plan(plan, plan_path)['ok'])
+            rendered = pipeline.render_analysis_description_html(numbered, 'concise-v3')
+            self.assertIn('<div>&nbsp;&nbsp;&nbsp;&nbsp;1、<strong>状态标识：</strong>在患者卡片展示状态标识。</div>', rendered)
+            self.assertIn('<div>&nbsp;&nbsp;&nbsp;&nbsp;2、<strong>费用信息：</strong>在患者卡片补充费用信息。</div>', rendered)
+            self.assertIn('&nbsp;&nbsp;&nbsp;&nbsp;1、', rendered)
+
+            skipped = numbered.replace('2. **费用信息**', '3. **费用信息**')
+            with open(artifact_path, 'w', encoding='utf-8') as f:
+                f.write(skipped)
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertIn(
+                'concise-v3 多条变更内容必须使用从 1 开始连续的 2–8 项有序编号',
+                result['errors'])
+
+            malformed = numbered.replace('1. **状态标识**：', '1. 状态标识：')
+            with open(artifact_path, 'w', encoding='utf-8') as f:
+                f.write(malformed)
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertIn(
+                'concise-v3 编号变更项 1 必须按“1. **改动点**：内容”填写',
                 result['errors'])
 
     def test_concise_v3_rejects_public_metadata_and_decision_summaries(self):
@@ -1896,6 +3405,12 @@ class PipelinePlanTests(unittest.TestCase):
             self.assertTrue(any('必须实际调用' in error for error in result['errors']))
 
             plan['kb']['tools_used'].append('search_symbol')
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertIn(
+                'kb.source_required=true 且源码 MCP 就绪时必须留下源码 finding',
+                result['errors'])
+
             plan['kb']['findings'].append({
                 'entity': 'repo-a:src/Service.java#save',
                 'state': '候选',
@@ -2277,7 +3792,8 @@ class PipelinePlanTests(unittest.TestCase):
                     mock.patch.object(tfs, 'add_tag', return_value={'ok': True, 'id': 1}) as add_tag, \
                     mock.patch.object(tfs, 'set_state') as set_state, \
                     mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}):
-                response = pipeline.apply_plan(plan, plan_path, False, 'config.json')
+                response = pipeline.apply_plan(
+                    plan, plan_path, False, 'config.json', legacy_replay=True)
         self.assertTrue(response['ok'])
         upload.assert_called_once()
         self.assertEqual(add_tag.call_count, 2)
@@ -2514,10 +4030,165 @@ class PipelinePlanTests(unittest.TestCase):
                     mock.patch.object(tfs, 'upload_attachment', return_value={'ok': True, 'id': 1}), \
                     mock.patch.object(tfs, 'add_tag', return_value={'ok': True, 'id': 1}), \
                     mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}):
-                response = pipeline.apply_plan(plan, plan_path, False, 'config.json')
+                response = pipeline.apply_plan(
+                    plan, plan_path, False, 'config.json', legacy_replay=True)
         self.assertTrue(response['ok'])
         self.assertIn('<div>', replace_detail.call_args.args[2])
         write_field.assert_not_called()
+
+    def test_apply_current_analysis_cleans_attachments_before_terminal_mutations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, artifact_path = self.write_current_analysis_plan(
+                directory, ['existing-ui-simple'])
+            with mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}), \
+                    mock.patch.object(tfs, 'precheck', return_value={'ok': True}), \
+                    mock.patch.object(pipeline, 'preflight',
+                                      return_value={'ok': True, 'work_item': {'tags': []}}), \
+                    mock.patch.object(tfs, 'replace_detail_analysis_section',
+                                      return_value={'ok': True, 'id': 1}), \
+                    mock.patch.object(tfs, 'upload_attachment',
+                                      return_value={'ok': True, 'id': 1}), \
+                    mock.patch.object(tfs, 'cleanup_analysis_attachments',
+                                      return_value={'ok': True, 'id': 1, 'verified': False}) as cleanup, \
+                    mock.patch.object(tfs, 'add_tag', return_value={'ok': True, 'id': 1}), \
+                    mock.patch.object(pipeline, 'apply_field_flow', return_value=[]), \
+                    mock.patch.object(redis_client, 'publish_plan', return_value={'ok': True}), \
+                    mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}):
+                response = pipeline.apply_plan(
+                    plan, plan_path, False, 'config.json', legacy_replay=True)
+        self.assertTrue(response['ok'])
+        self.assertEqual([action['action'] for action in response['actions']], [
+            'write-detail-analysis', 'upload:change-plan', 'cleanup:analysis-artifacts',
+            'add-tag:PM-AI-AUTO-ANA'])
+        cleanup.assert_called_once_with(
+            mock.ANY, 1, os.path.basename(artifact_path), True)
+
+    def test_apply_current_analysis_upload_or_cleanup_failure_stops_terminal_publish(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_current_analysis_plan(directory, ['existing-ui-simple'])
+            common = [
+                mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}),
+                mock.patch.object(tfs, 'precheck', return_value={'ok': True}),
+                mock.patch.object(pipeline, 'preflight',
+                                  return_value={'ok': True, 'work_item': {'tags': []}}),
+                mock.patch.object(tfs, 'replace_detail_analysis_section',
+                                  return_value={'ok': True, 'id': 1}),
+                mock.patch.object(tfs, 'record', return_value={'audit': 'error-audit.json'}),
+            ]
+            for patcher in common:
+                patcher.start()
+            try:
+                with mock.patch.object(tfs, 'upload_attachment',
+                                       return_value={'ok': False, 'error': 'upload failed'}), \
+                        mock.patch.object(tfs, 'cleanup_analysis_attachments') as cleanup, \
+                        mock.patch.object(tfs, 'add_tag') as add_tag, \
+                        mock.patch.object(pipeline, 'apply_field_flow') as field_flow, \
+                        mock.patch.object(redis_client, 'publish_plan') as publish, \
+                        mock.patch.object(redis_client, 'publish_failure',
+                                          return_value={'ok': True}) as pub_fail:
+                    upload_failure = pipeline.apply_plan(
+                        plan, plan_path, True, 'config.json', legacy_replay=True)
+                self.assertFalse(upload_failure['ok'])
+                cleanup.assert_not_called()
+                add_tag.assert_not_called()
+                field_flow.assert_not_called()
+                # legacy-replay 成功和失败都不覆盖正常 Redis 通信结果。
+                publish.assert_not_called()
+                pub_fail.assert_not_called()
+                self.assertIn('redis', upload_failure)
+
+                with mock.patch.object(tfs, 'upload_attachment',
+                                       return_value={'ok': True, 'id': 1}), \
+                        mock.patch.object(tfs, 'cleanup_analysis_attachments',
+                                          return_value={'ok': False, 'error': 'rev changed'}), \
+                        mock.patch.object(tfs, 'add_tag') as add_tag, \
+                        mock.patch.object(pipeline, 'apply_field_flow') as field_flow, \
+                        mock.patch.object(redis_client, 'publish_plan') as publish, \
+                        mock.patch.object(redis_client, 'publish_failure',
+                                          return_value={'ok': True}) as pub_fail:
+                    cleanup_failure = pipeline.apply_plan(
+                        plan, plan_path, True, 'config.json', legacy_replay=True)
+                self.assertFalse(cleanup_failure['ok'])
+                self.assertEqual([action['action'] for action in cleanup_failure['actions']],
+                                 ['write-detail-analysis', 'upload:change-plan'])
+                add_tag.assert_not_called()
+                field_flow.assert_not_called()
+                publish.assert_not_called()
+                pub_fail.assert_not_called()
+                self.assertIn('redis', cleanup_failure)
+            finally:
+                for patcher in reversed(common):
+                    patcher.stop()
+
+    def test_apply_need_review_and_historical_manual_followup_do_not_cleanup(self):
+        run_id = 'run_12345678'
+        need_plan = {
+            'version': 1, 'run_id': run_id, 'skill': 'auto-req-qc', 'work_item_id': 1,
+            'expected_rev': 5, 'expected_state': '活动', 'verdict': 'NEED-REVIEW',
+            'tags': ['PM-AI-QC-NEED-REVIEW'], 'state_to': None, 'rules_source': 'pre-qc-v1',
+            'checklist': {
+                'work_item': '1 测试需求', 'verdict': 'NEED-REVIEW',
+                'tag': 'PM-AI-QC-NEED-REVIEW', 'responsible': '产品',
+                'generated_at_utc': '2026-07-27T00:00:00Z', 'next': '补充后重新触发',
+                'items': [{'id': 'q1', 'question': '校验口径?',
+                           'options': ['拦截', '纠正'], 'allow_other': True}],
+            },
+            'artifacts': [{'kind': 'qc-followup',
+                           'filename': f'待补充信息_1_{run_id}.json'}],
+        }
+        with mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}), \
+                mock.patch.object(tfs, 'precheck', return_value={'ok': True}), \
+                mock.patch.object(pipeline, 'preflight',
+                                  return_value={'ok': True, 'work_item': {'tags': []}}), \
+                mock.patch.object(pipeline, 'upload_inline_artifact',
+                                  return_value={'ok': True, 'id': 1}), \
+                mock.patch.object(tfs, 'cleanup_analysis_attachments') as cleanup, \
+                mock.patch.object(tfs, 'add_tag', return_value={'ok': True, 'id': 1}), \
+                mock.patch.object(redis_client, 'publish_plan', return_value={'ok': True}), \
+                mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}):
+            need_response = pipeline.apply_plan(
+                need_plan, '/tmp/plan.json', False, 'config.json', legacy_replay=True)
+        self.assertTrue(need_response['ok'])
+        cleanup.assert_not_called()
+
+        gap = {
+            'id': 'gap-amount-scope', 'topic': '金额范围', 'missing': '金额取值范围',
+            'impact': '无法确定边界', 'question': '是否限定当前结算范围？',
+            'options': ['限定', '不限定'], 'allow_other': True,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            historical, historical_path = self.make_manual_plan(directory, [gap])
+            followup = f'待确认清单_1_{historical["run_id"]}.md'
+            historical['artifacts'].append({'kind': 'manual-followup', 'path': followup})
+            with open(os.path.join(directory, followup), 'w', encoding='utf-8') as output:
+                output.write('\n'.join([
+                    '# 需求分析待确认项',
+                    f'<!-- auto-req-run:{historical["run_id"]} -->',
+                    '## 需要确认的需求分析信息',
+                    '### gap-amount-scope · 金额范围',
+                    '<!-- analysis-gap:gap-amount-scope -->',
+                    '- **缺失信息**：金额取值范围',
+                    '- **对分析/验收的影响**：无法确定边界',
+                    '- **需确认的问题**：是否限定当前结算范围？',
+                    '- **候选口径**：限定',
+                    '- **允许自由补充**：是',
+                ]))
+            with mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}), \
+                    mock.patch.object(tfs, 'precheck', return_value={'ok': True}), \
+                    mock.patch.object(pipeline, 'preflight',
+                                      return_value={'ok': True, 'work_item': {'tags': []}}), \
+                    mock.patch.object(tfs, 'replace_detail_analysis_section',
+                                      return_value={'ok': True, 'id': 1}), \
+                    mock.patch.object(tfs, 'upload_attachment',
+                                      return_value={'ok': True, 'id': 1}), \
+                    mock.patch.object(tfs, 'cleanup_analysis_attachments') as cleanup, \
+                    mock.patch.object(tfs, 'add_tag', return_value={'ok': True, 'id': 1}), \
+                    mock.patch.object(redis_client, 'publish_plan', return_value={'ok': True}), \
+                    mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}):
+                historical_response = pipeline.apply_plan(
+                    historical, historical_path, False, 'config.json', legacy_replay=True)
+        self.assertTrue(historical_response['ok'])
+        cleanup.assert_not_called()
 
     def test_apply_auto_ana_runs_field_flow_and_skips_assignee_when_unresolvable(self):
         raw_with_leader = {'id': 1, 'rev': 5, 'fields': {
@@ -2542,7 +4213,8 @@ class PipelinePlanTests(unittest.TestCase):
                     mock.patch.object(tfs, 'set_state', return_value={'ok': True, 'id': 1}) as set_state, \
                     mock.patch.object(tfs, 'set_assignee', return_value={'ok': True, 'id': 1}) as set_assignee, \
                     mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}):
-                response = pipeline.apply_plan(plan, plan_path, False, 'config.json')
+                response = pipeline.apply_plan(
+                    plan, plan_path, False, 'config.json', legacy_replay=True)
             self.assertTrue(response['ok'])
             names = [a['action'] for a in response['actions']]
             # 完整顺序：写描述→上传→加标签→迭代→开始日期→完成日期→活动→已分析→指派
@@ -2572,7 +4244,8 @@ class PipelinePlanTests(unittest.TestCase):
                     mock.patch.object(tfs, 'set_state', return_value={'ok': True, 'id': 1}), \
                     mock.patch.object(tfs, 'set_assignee') as set_assignee_absent, \
                     mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}):
-                response = pipeline.apply_plan(plan, plan_path, False, 'config.json')
+                response = pipeline.apply_plan(
+                    plan, plan_path, False, 'config.json', legacy_replay=True)
             self.assertTrue(response['ok'])
             names = [a['action'] for a in response['actions']]
             self.assertIn('set-state:已分析', names)
@@ -2587,11 +4260,140 @@ class PipelinePlanTests(unittest.TestCase):
                     mock.patch.object(tfs, 'precheck', return_value={'ok': True}), \
                     mock.patch.object(pipeline, 'preflight', return_value={'ok': False, 'error': '版本已变化'}), \
                     mock.patch.object(tfs, 'record', return_value={'audit': 'error-audit.json'}) as record:
-                response = pipeline.apply_plan(plan, plan_path, False, 'config.json')
+                response = pipeline.apply_plan(
+                    plan, plan_path, False, 'config.json', legacy_replay=True)
         self.assertFalse(response['ok'])
         self.assertEqual(response['audit'], 'error-audit.json')
         self.assertEqual(record.call_args.args[2], 'ERROR')
         self.assertEqual(record.call_args.args[7]['tfs_requirements'], plan['tfs_requirements'])
+
+    def test_preflight_no_longer_blocks_downstream_passed_tag(self):
+        # PM-AI-MANUAL-PASSED 不再硬挡；preflight 只校验类型/rev/状态，放行带该标签的工作项
+        plan = {'work_item_id': 1, 'expected_rev': 5, 'expected_state': '已建议'}
+        item = {'workItemType': '需求', 'rev': 5, 'state': '已建议',
+                'tags': ['PM-AI-MANUAL-PASSED', 'PM-AI-AUTO-ANA']}
+        with mock.patch.object(tfs, 'fetch_raw', return_value={'id': 1}), \
+                mock.patch.object(tfs, 'map_workitem', return_value=item):
+            gate = pipeline.preflight({'base_url': 'x'}, plan)
+        self.assertTrue(gate['ok'])
+        self.assertEqual(gate['work_item']['tags'], item['tags'])
+
+    def test_apply_invalidates_downstream_passed_tag_on_non_skip_rerun(self):
+        raw_with_leader = {'id': 1, 'rev': 5, 'fields': {
+            'System.State': '已建议', 'System.TeamProject': 'NETHIS5.5',
+            'Demand.Expected.date': '2026-09-06T16:00:00Z',
+            'Winning.Dev.Leader': 'zhang_dong(张栋) <WINNING\\zhang_dong>'}}
+        iter_resp = {'ok': True, 'earliest': {'path': 'NETHIS5.5\\2026\\V6.0.2608.28',
+                                              'finish': '2026-08-28T00:00:00Z'}}
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_analysis_plan(directory, ['existing-ui-simple'])
+            with mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}), \
+                    mock.patch.object(tfs, 'precheck', return_value={'ok': True}), \
+                    mock.patch.object(pipeline, 'preflight', return_value={
+                        'ok': True, 'work_item': {'tags': ['PM-AI-MANUAL-PASSED']}}), \
+                    mock.patch.object(tfs, 'remove_tag', return_value={'ok': True, 'id': 1}) as remove_tag, \
+                    mock.patch.object(tfs, 'replace_detail_analysis_section', return_value={'ok': True, 'id': 1}), \
+                    mock.patch.object(tfs, 'upload_attachment', return_value={'ok': True, 'id': 1}), \
+                    mock.patch.object(tfs, 'add_tag', return_value={'ok': True, 'id': 1}), \
+                    mock.patch.object(tfs, 'fetch_raw', return_value=raw_with_leader), \
+                    mock.patch.object(tfs, 'list_iterations', return_value=iter_resp), \
+                    mock.patch.object(tfs, 'write_field', return_value={'ok': True, 'id': 1}), \
+                    mock.patch.object(tfs, 'set_state', return_value={'ok': True, 'id': 1}), \
+                    mock.patch.object(tfs, 'set_assignee', return_value={'ok': True, 'id': 1}), \
+                    mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}) as record:
+                response = pipeline.apply_plan(
+                    plan, plan_path, False, 'config.json', legacy_replay=True)
+        self.assertTrue(response['ok'])
+        names = [a['action'] for a in response['actions']]
+        # 作废下游通过标签是清旧标签阶段的第一步，先于写分析者描述
+        self.assertEqual(names[0], 'invalidate-tag:PM-AI-MANUAL-PASSED')
+        remove_tag.assert_any_call(mock.ANY, 1, 'PM-AI-MANUAL-PASSED', True)
+        self.assertEqual(record.call_args.args[7]['invalidated_passed_tags'], ['PM-AI-MANUAL-PASSED'])
+
+    def test_apply_skip_analysis_does_not_invalidate_passed_tag(self):
+        plan = {
+            'version': 1, 'run_id': 'run_skip_1234', 'skill': 'auto-req-analysis',
+            'work_item_id': 1, 'expected_rev': 5, 'expected_state': '已建议',
+            'verdict': 'SKIP-ANALYSIS', 'rules_source': {'qc': 'pre-qc-v1'},
+            'tags': [], 'state_to': None, 'artifacts': [],
+            'skip_reason': '接口已开发完成，本工作项仅安排现场联调，无新增业务分析面。',
+        }
+        with mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}), \
+                mock.patch.object(tfs, 'precheck', return_value={'ok': True}), \
+                mock.patch.object(pipeline, 'preflight', return_value={
+                    'ok': True, 'work_item': {'tags': ['PM-AI-MANUAL-PASSED']}}), \
+                mock.patch.object(redis_client, 'publish_plan', return_value={'ok': True}), \
+                mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}) as record, \
+                mock.patch.object(tfs, 'remove_tag') as remove_tag:
+            response = pipeline.apply_plan(
+                plan, '/tmp/skip-plan.json', True, 'config.json', legacy_replay=True)
+        self.assertTrue(response['ok'])
+        self.assertEqual(response['actions'], [])
+        remove_tag.assert_not_called()
+        self.assertEqual(record.call_args.args[7]['invalidated_passed_tags'], [])
+
+    def test_apply_converges_cross_phase_qc_tag_on_analysis_rerun(self):
+        # 分析重跑跨阶段收敛：清掉遗留的 QC 标签，只留本次 AUTO-ANA
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, _ = self.write_current_analysis_plan(
+                directory, ['existing-ui-simple'])
+            with mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}), \
+                    mock.patch.object(tfs, 'precheck', return_value={'ok': True}), \
+                    mock.patch.object(pipeline, 'preflight',
+                                      return_value={'ok': True, 'work_item': {'tags': ['PM-AI-QC-NEED-REVIEW']}}), \
+                    mock.patch.object(tfs, 'remove_tag', return_value={'ok': True, 'id': 1}) as remove_tag, \
+                    mock.patch.object(tfs, 'replace_detail_analysis_section',
+                                      return_value={'ok': True, 'id': 1}), \
+                    mock.patch.object(tfs, 'upload_attachment',
+                                      return_value={'ok': True, 'id': 1}), \
+                    mock.patch.object(tfs, 'cleanup_analysis_attachments',
+                                      return_value={'ok': True, 'id': 1, 'verified': False}), \
+                    mock.patch.object(tfs, 'add_tag', return_value={'ok': True, 'id': 1}), \
+                    mock.patch.object(pipeline, 'apply_field_flow', return_value=[]), \
+                    mock.patch.object(redis_client, 'publish_plan', return_value={'ok': True}), \
+                    mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}):
+                response = pipeline.apply_plan(
+                    plan, plan_path, False, 'config.json', legacy_replay=True)
+        self.assertTrue(response['ok'])
+        names = [a['action'] for a in response['actions']]
+        self.assertIn('remove-tag:PM-AI-QC-NEED-REVIEW', names)
+        self.assertIn('add-tag:PM-AI-AUTO-ANA', names)
+        remove_tag.assert_any_call(mock.ANY, 1, 'PM-AI-QC-NEED-REVIEW', True)
+
+    def test_apply_qc_rerun_removes_leftover_analysis_tag(self):
+        # QC 重跑跨阶段收敛：清掉遗留的分析标签，只留本次 NEED-REVIEW
+        run_id = 'run_qc_cross_1234'
+        need_plan = {
+            'version': 1, 'run_id': run_id, 'skill': 'auto-req-qc', 'work_item_id': 1,
+            'expected_rev': 5, 'expected_state': '活动', 'verdict': 'NEED-REVIEW',
+            'tags': ['PM-AI-QC-NEED-REVIEW'], 'state_to': None, 'rules_source': 'pre-qc-v1',
+            'checklist': {
+                'work_item': '1 测试需求', 'verdict': 'NEED-REVIEW',
+                'tag': 'PM-AI-QC-NEED-REVIEW', 'responsible': '产品',
+                'generated_at_utc': '2026-07-27T00:00:00Z', 'next': '补充后重新触发',
+                'items': [{'id': 'q1', 'question': '校验口径?',
+                           'options': ['拦截', '纠正'], 'allow_other': True}],
+            },
+            'artifacts': [{'kind': 'qc-followup',
+                           'filename': f'待补充信息_1_{run_id}.json'}],
+        }
+        with mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}), \
+                mock.patch.object(tfs, 'precheck', return_value={'ok': True}), \
+                mock.patch.object(pipeline, 'preflight',
+                                  return_value={'ok': True, 'work_item': {'tags': ['PM-AI-AUTO-ANA']}}), \
+                mock.patch.object(pipeline, 'upload_inline_artifact',
+                                  return_value={'ok': True, 'id': 1}), \
+                mock.patch.object(tfs, 'remove_tag', return_value={'ok': True, 'id': 1}) as remove_tag, \
+                mock.patch.object(tfs, 'add_tag', return_value={'ok': True, 'id': 1}), \
+                mock.patch.object(redis_client, 'publish_plan', return_value={'ok': True}), \
+                mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}):
+            response = pipeline.apply_plan(
+                need_plan, '/tmp/plan.json', False, 'config.json', legacy_replay=True)
+        self.assertTrue(response['ok'])
+        names = [a['action'] for a in response['actions']]
+        self.assertIn('remove-tag:PM-AI-AUTO-ANA', names)
+        self.assertIn('add-tag:PM-AI-QC-NEED-REVIEW', names)
+        remove_tag.assert_any_call(mock.ANY, 1, 'PM-AI-AUTO-ANA', True)
 
     def test_repair_analysis_placement_uses_strict_two_step_repair(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2628,17 +4430,83 @@ class PipelinePlanTests(unittest.TestCase):
              mock.patch.object(redis_client, 'publish_plan',
                                return_value={'ok': True, 'key': 'auto-req:qc:plan:DefaultCollection:1', 'fields': 6}) as publish, \
              mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}) as record:
-            result = pipeline.apply_plan(plan, os.path.join(tempfile.gettempdir(), 'plan.json'), False, 'config.json')
+            result = pipeline.apply_plan(
+                plan, os.path.join(tempfile.gettempdir(), 'plan.json'), False,
+                'config.json', legacy_replay=True)
         self.assertTrue(result['ok'])
         self.assertEqual(record.call_args.args[7]['attachments'], plan['attachments'])
         # wiki 审计字段透传到 record 的 extra 字典
         self.assertEqual(record.call_args.args[7]['wiki'], plan['wiki'])
         self.assertEqual(record.call_args.args[7]['tfs_requirements'], plan['tfs_requirements'])
-        # redis 结果降级不阻断，并入审计 extra 与返回
-        self.assertEqual(record.call_args.args[7]['redis']['key'], 'auto-req:qc:plan:DefaultCollection:1')
-        self.assertEqual(result['redis']['key'], 'auto-req:qc:plan:DefaultCollection:1')
-        publish.assert_called_once_with(plan, 'dry-run', 'DefaultCollection', 'config.json',
-                                        analysis_description_html='', work_item='')
+        # 历史维护回放仍保留业务证据审计，但不覆盖正常 Redis 通信结果。
+        self.assertFalse(record.call_args.args[7]['redis']['in_scope'])
+        self.assertFalse(result['redis']['in_scope'])
+        self.assertEqual(record.call_args.args[7]['command'], 'apply')
+        publish.assert_not_called()
+
+    def test_validate_plan_reports_analysis_description_source(self):
+        # validation_errors 不再含来源文件名（保持精确匹配），改由审计 validation_sources
+        # 指出分析者描述校验读取的是哪份 .md，回答“是 .md 还是 JSON content”的歧义。
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, artifact_path = self.write_current_analysis_plan(directory, ['report'])
+            missing = pipeline.CONCISE_V3_ANALYSIS_DESCRIPTION_REQUIREMENTS['report'][0]
+            with open(artifact_path, 'r', encoding='utf-8') as f:
+                content = f.read().replace(f'- **{missing}**：已明确{missing}\n', '')
+            with open(artifact_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            result = pipeline.validate_plan(plan, plan_path)
+            self.assertFalse(result['ok'])
+            self.assertEqual(
+                result.get('validation_sources'),
+                {'analysis_description': os.path.basename(artifact_path)})
+
+    def test_failure_result_records_redis_block_command_and_sources(self):
+        plan = {'work_item_id': 1, 'run_id': 'run_12345678', 'skill': 'auto-req-analysis'}
+        extra = {'validation_errors': ['X'],
+                 'validation_sources': {'analysis_description': '变更方案_1_run_12345678.md'}}
+        # in_scope=True：collection+config_path 齐备时，失败轮也把 redis 结果（ok/reason）落审计
+        with mock.patch.object(redis_client, 'publish_failure',
+                               return_value={'ok': False, 'reason': 'ConnectionRefusedError'}) as pub, \
+                mock.patch.object(pipeline, 'record_failure', return_value='audit.json') as rf:
+            out = pipeline.failure_result(plan, '计划校验失败：X', 'validate',
+                                          collection='NETHIS5.5', config_path='cfg.json', extra=dict(extra))
+        self.assertTrue(out['redis']['in_scope'])
+        self.assertEqual(out['redis']['reason'], 'ConnectionRefusedError')
+        pub.assert_called_once()
+        recorded = rf.call_args.args[6]  # failure_result 经 extra 把 command/redis/sources 传给 record_failure
+        self.assertEqual(recorded['command'], 'apply')
+        self.assertEqual(recorded['redis']['reason'], 'ConnectionRefusedError')
+        self.assertEqual(recorded['validation_sources']['analysis_description'], '变更方案_1_run_12345678.md')
+        # in_scope=False：无 collection 时绝不碰 redis，但 command 仍标注
+        with mock.patch.object(redis_client, 'publish_failure') as pub2, \
+                mock.patch.object(pipeline, 'record_failure', return_value='audit.json'):
+            out2 = pipeline.failure_result(plan, 'err', 'validate', extra=dict(extra))
+        self.assertFalse(out2['redis']['in_scope'])
+        pub2.assert_not_called()
+
+    def test_validate_subcommand_audit_marks_command_and_no_redis_scope(self):
+        # validate 子命令从不写 redis（只读），审计须自标 command='validate'、redis.in_scope=False，
+        # 以与“apply 校验失败”这类同样 run_mode='validate' 但会写 redis 的轮次区分。
+        with tempfile.TemporaryDirectory() as directory:
+            plan, plan_path, artifact_path = self.write_current_analysis_plan(directory, ['report'])
+            missing = pipeline.CONCISE_V3_ANALYSIS_DESCRIPTION_REQUIREMENTS['report'][0]
+            with open(artifact_path, 'r', encoding='utf-8') as f:
+                content = f.read().replace(f'- **{missing}**：已明确{missing}\n', '')
+            with open(artifact_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            # main() 经 read_plan 从磁盘读计划，须先把 plan.json 落盘
+            with open(plan_path, 'w', encoding='utf-8') as f:
+                json.dump(plan, f, ensure_ascii=False)
+            with mock.patch.object(tfs, 'record', return_value={'audit': 'v.json'}) as record, \
+                    mock.patch.object(sys, 'exit'), \
+                    mock.patch('builtins.print'), \
+                    mock.patch.object(sys, 'argv', ['pipeline.py', 'validate', '--plan', plan_path]):
+                pipeline.main()
+            details = record.call_args.args[7]
+            self.assertEqual(details['command'], 'validate')
+            self.assertEqual(details['redis'], {'in_scope': False})
+            self.assertEqual(details['validation_sources'],
+                             {'analysis_description': os.path.basename(artifact_path)})
 
     def test_pipeline_validates_enriched_attachment_runtime_audit(self):
         plan = {
@@ -2676,9 +4544,9 @@ class PipelinePlanTests(unittest.TestCase):
 
         plan['attachments']['parsed'][0]['converter_chain'] = 'shell-command'
         invalid = pipeline.validate_plan(plan, os.path.join(tempfile.gettempdir(), 'plan.json'), False)
-        self.assertFalse(invalid['ok'])
-        self.assertTrue(any('转换链' in error or 'converter_chain' in error
-                            for error in invalid['errors']))
+        self.assertTrue(invalid['ok'])
+        self.assertIn('ATTACHMENT_CHAIN_INVALID', {
+            warning['code'] for warning in invalid['warnings']})
 
     def test_pipeline_rejects_attachment_with_multiple_terminal_outcomes(self):
         plan = {
@@ -2708,7 +4576,7 @@ class PipelinePlanTests(unittest.TestCase):
                 mock.patch.object(redis_client, 'publish_plan', return_value={'ok': True}), \
                 mock.patch.object(tfs, 'record', return_value={'audit': 'audit.json'}):
             pipeline.apply_plan(plan, os.path.join(tempfile.gettempdir(), 'plan.json'), False,
-                                'config.json', 'pat-x', 'CollX', 'ProjX')
+                                'config.json', 'pat-x', 'CollX', 'ProjX', legacy_replay=True)
         # pat/collection/project override 透传给 load_config
         self.assertEqual(load_config.call_args.args, ('config.json', 'pat-x', 'CollX', 'ProjX'))
 
@@ -2921,6 +4789,145 @@ class PipelinePlanTests(unittest.TestCase):
             pipeline.flow_item(2, False, 'config.json', assignee_override='WINNING\\other')
         set_assignee.assert_called_once_with(mock.ANY, 2, 'WINNING\\other', True)
 
+    def test_flow_item_no_longer_blocks_downstream_passed_tag(self):
+        raw = {'id': 2, 'rev': 7, 'fields': {
+            'System.State': '已建议', 'System.TeamProject': 'NETHIS5.5',
+            'System.WorkItemType': '需求',
+            'System.Tags': 'PM-AI-MANUAL-PASSED; PM-AI-AUTO-ANA',
+            'Demand.Expected.date': '2026-09-06T16:00:00Z',
+            'Winning.Dev.Leader': 'zhang_dong(张栋) <WINNING\\zhang_dong>'}}
+        iter_resp = {'ok': True, 'earliest': {'path': 'NETHIS5.5\\2026\\V6.0.2608.28',
+                                              'finish': '2026-08-28T00:00:00Z'}}
+        with mock.patch.object(tfs, 'load_config', return_value={'collection': 'C'}), \
+                mock.patch.object(tfs, 'precheck', return_value={'ok': True}), \
+                mock.patch.object(tfs, 'fetch_raw', return_value=raw), \
+                mock.patch.object(tfs, 'list_iterations', return_value=iter_resp), \
+                mock.patch.object(tfs, 'write_field', return_value={'ok': True}), \
+                mock.patch.object(tfs, 'set_state', return_value={'ok': True}), \
+                mock.patch.object(tfs, 'set_assignee', return_value={'ok': True}), \
+                mock.patch.object(tfs, 'record', return_value={'audit': 'a.json'}):
+            response = pipeline.flow_item(2, False, 'config.json')
+        self.assertTrue(response['ok'])
+        self.assertNotIn('禁止覆盖', response.get('error', ''))
+
+
+class SkillMemoryTests(unittest.TestCase):
+    def request(self, **overrides):
+        request = {
+            'work_item_id': 262214,
+            'run_id': 'run_262214_20260811',
+            'round_diagnosis_categories': ['信息判断错误'],
+            'runtime_lesson': False,
+            'reason': '批量场景遗漏可跨需求复用',
+            'candidate': {
+                'title': '分析前必须枚举单条与批量场景',
+                'category': '分析·方案',
+                'scenario': '同一入口同时支持单条处理与批量处理时。',
+                'practice': '分别核对选择、跳过、汇总和结果反馈，不能用单条路径代替批量路径。',
+                'replaces': [],
+            },
+        }
+        request.update(overrides)
+        return request
+
+    def test_skill_memory_appends_header_and_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, '经验记忆.md')
+            result = skill_memory.process_request(self.request(), path, date='2026-08-11')
+            content = pathlib.Path(path).read_text(encoding='utf-8')
+        self.assertEqual(result['status'], 'APPENDED')
+        self.assertEqual(result['active_count'], 1)
+        self.assertIn('# skill 经验记忆', content)
+        self.assertIn('## 2026-08-11 · 分析前必须枚举单条与批量场景', content)
+
+    def test_skill_memory_retry_is_deduplicated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, '经验记忆.md')
+            skill_memory.process_request(self.request(), path, date='2026-08-11')
+            result = skill_memory.process_request(self.request(), path, date='2026-08-12')
+            content = pathlib.Path(path).read_text(encoding='utf-8')
+        self.assertEqual(result['status'], 'DEDUP_NOOP')
+        self.assertEqual(content.count('## '), 1)
+
+    def test_skill_memory_deduplicates_legacy_heading_with_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory, '经验记忆.md')
+            path.write_text(
+                '# skill 经验记忆\n\n'
+                '## 2026-08-06 13:23 · 分析前必须枚举单条与批量场景\n'
+                '- 类别：分析·方案\n'
+                '- 场景：同一入口同时支持单条处理与批量处理时。\n'
+                '- 做法：分别核对选择、跳过、汇总和结果反馈，不能用单条路径代替批量路径。\n',
+                encoding='utf-8')
+            result = skill_memory.process_request(self.request(), str(path), date='2026-08-11')
+            content = path.read_text(encoding='utf-8')
+        self.assertEqual(result['status'], 'DEDUP_NOOP')
+        self.assertEqual(content.count('## '), 1)
+
+    def test_skill_memory_not_applicable_does_not_create_memory_file(self):
+        request = self.request(round_diagnosis_categories=['信息不足·合理gap'],
+                               reason='只补齐已识别的信息缺口', candidate=None)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, '经验记忆.md')
+            result = skill_memory.process_request(request, path)
+            exists = os.path.exists(path)
+        self.assertEqual(result['status'], 'NOT_APPLICABLE')
+        self.assertFalse(exists)
+
+    def test_skill_memory_persistable_diagnosis_requires_candidate(self):
+        request = self.request(candidate=None)
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(skill_memory.MemoryInputError):
+                skill_memory.process_request(request, os.path.join(directory, '经验记忆.md'))
+
+    def test_skill_memory_replacement_keeps_append_only_and_counts_active(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, '经验记忆.md')
+            first = skill_memory.process_request(self.request(), path, date='2026-08-11')
+            old_heading = first['entry_title']
+            replacement = self.request(candidate={
+                'title': '分析前必须逐一枚举单条与批量场景',
+                'category': '分析·方案',
+                'scenario': '入口支持单条、批量或混合选择时。',
+                'practice': '分别闭合各场景的选择、跳过、汇总和结果反馈。',
+                'replaces': [old_heading],
+            })
+            result = skill_memory.process_request(replacement, path, date='2026-08-12')
+            content = pathlib.Path(path).read_text(encoding='utf-8')
+        self.assertEqual(result['status'], 'APPENDED')
+        self.assertEqual(result['active_count'], 1)
+        self.assertIn(f'- 取代：{old_heading}', content)
+        self.assertEqual(content.count('## '), 2)
+
+    def test_skill_memory_failure_is_written_to_result_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = os.path.join(directory, 'input.json')
+            result_path = os.path.join(directory, 'result.json')
+            pathlib.Path(input_path).write_text(json.dumps(self.request(), ensure_ascii=False),
+                                                encoding='utf-8')
+            with mock.patch.object(skill_memory, 'process_request', side_effect=PermissionError('denied')):
+                exit_code = skill_memory.main([
+                    'record', '--input', input_path, '--result', result_path,
+                    '--memory-file', os.path.join(directory, '经验记忆.md'),
+                ])
+            result = json.loads(pathlib.Path(result_path).read_text(encoding='utf-8'))
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['status'], 'FAILED')
+        self.assertIn('denied', result['reason'])
+
+    def test_skill_memory_rejects_connection_fields(self):
+        request = self.request(tfs_pat='secret')
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(skill_memory.MemoryInputError):
+                skill_memory.process_request(request, os.path.join(directory, '经验记忆.md'))
+
+    def test_skill_memory_rejects_unknown_diagnosis_category(self):
+        request = self.request(round_diagnosis_categories=['信息判断错'])
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(skill_memory.MemoryInputError):
+                skill_memory.process_request(request, os.path.join(directory, '经验记忆.md'))
+
 
 class RedisClientTests(unittest.TestCase):
     def test_plan_and_index_keys_are_isolated_by_collection(self):
@@ -2977,6 +4984,74 @@ class RedisClientTests(unittest.TestCase):
         # 该分析 plan 无 kb/description：仅 6 基础字段
         self.assertEqual(set(analysis_fields),
                          {'run_id', 'verdict', 'tags', 'state_to', 'generated_at_utc', 'run_mode'})
+
+    def test_publish_failure_writes_error_marker_and_clears_stale_success_fields(self):
+        commands = []
+
+        class Connection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return None
+
+            def execute(self, *args):
+                commands.append(args)
+                return 1
+
+        # 上一轮成功(AUTO-ANA)已落 analysis_description/knowledge/checklist/next/skip_reason 等残留；
+        # publish_failure 必须覆盖 verdict=ERROR 并清掉这些字段，使失败状态自洽完整(状态完整性)。
+        checklist = {'work_item': '1 标题', 'generated_at_utc': '2026-08-13T00:00:00Z'}
+        plan = {'work_item_id': 1, 'run_id': 'run_fail_0001', 'verdict': 'AUTO-ANA',
+                'tags': ['PM-AI-AUTO-ANA'], 'state_to': '已分析', 'checklist': checklist}
+        with mock.patch.object(redis_client, '_Connection', return_value=Connection()), \
+                mock.patch.object(redis_client, 'load_redis_config', return_value={'ttl_seconds': 0}):
+            response = redis_client.publish_failure(plan, RuntimeError('上传失败：rev changed'),
+                                                    'execute', 'CollectionA', 'config.json')
+        self.assertTrue(response['ok'])
+        hset = commands[0]
+        self.assertEqual(hset[:2], ('HSET', 'auto-req:qc:plan:CollectionA:1'))
+        fields = dict(zip(hset[2::2], hset[3::2]))
+        # 失败摘要：本轮 run_id + verdict=ERROR + error + 空 tags/state_to + 时间/run_mode + work_item 标签
+        self.assertEqual(fields['run_id'], 'run_fail_0001')
+        self.assertEqual(fields['verdict'], 'ERROR')
+        self.assertEqual(fields['error'], '上传失败：rev changed')
+        self.assertEqual(fields['tags'], '')
+        self.assertEqual(fields['state_to'], '')
+        self.assertEqual(fields['run_mode'], 'execute')
+        self.assertEqual(fields['generated_at_utc'], '2026-08-13T00:00:00Z')
+        self.assertEqual(fields['work_item'], '1 标题')
+        # 与成功摘要同键同索引
+        self.assertIn(('SADD', 'auto-req:qc:ids:CollectionA', '1'), commands)
+        # 清掉上一轮成功残留动作字段(work_item 因有标签保留，不在删除之列)
+        for stale in ('checklist', 'next', 'skip_reason', 'analysis_description', 'knowledge'):
+            self.assertIn(('HDEL', 'auto-req:qc:plan:CollectionA:1', stale), commands)
+        self.assertNotIn(('HDEL', 'auto-req:qc:plan:CollectionA:1', 'work_item'), commands)
+
+    def test_publish_failure_returns_not_ok_on_missing_inputs_or_errors(self):
+        plan = {'work_item_id': 1, 'run_id': 'run_fail_0002', 'verdict': 'AUTO-ANA',
+                'tags': [], 'state_to': '已分析'}
+        # 缺 collection → 不写
+        self.assertFalse(redis_client.publish_failure(plan, 'e', 'execute', '', 'config.json')['ok'])
+        # 缺 work_item_id → 不写
+        no_id = dict(plan, work_item_id='')
+        self.assertFalse(redis_client.publish_failure(no_id, 'e', 'execute', 'CollectionA', 'config.json')['ok'])
+        # 连接抛异常 → {ok:false,reason}，绝不向上抛
+        class Boom:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return None
+
+            def execute(self, *args):
+                raise OSError('connection refused')
+
+        with mock.patch.object(redis_client, '_Connection', return_value=Boom()), \
+                mock.patch.object(redis_client, 'load_redis_config', return_value={'ttl_seconds': 0}):
+            response = redis_client.publish_failure(plan, 'e', 'execute', 'CollectionA', 'config.json')
+        self.assertFalse(response['ok'])
+        self.assertIn('connection refused', response['reason'])
 
     def test_publish_plan_writes_analysis_description_and_knowledge_summary(self):
         commands = []

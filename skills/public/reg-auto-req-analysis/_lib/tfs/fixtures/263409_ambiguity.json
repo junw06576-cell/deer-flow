@@ -1,0 +1,27 @@
+{
+  "schema": "qc-ambiguity-regression-v1",
+  "work_item_id": 263409,
+  "purpose": "仅用于验证四个业务歧义必须集中进入 QC；不是执行计划，不含 run_id。",
+  "expected_verdict": "NEED-REVIEW",
+  "required_items": [
+    {
+      "id": "q-empty-value",
+      "question": "未记录对应情况时，最终保存和展示使用“无”还是“-”？"
+    },
+    {
+      "id": "q-maintenance-mode",
+      "question": "该值由用户选择、用户手工填写，还是系统依据规则自动填充？"
+    },
+    {
+      "id": "q-surgery-rule",
+      "question": "手术与非手术的判定依据是什么？"
+    },
+    {
+      "id": "q-data-scope",
+      "question": "规则适用于新增、编辑以及历史数据中的哪些范围？"
+    }
+  ],
+  "forbidden_conclusions": [
+    "自动填充无或-"
+  ]
+}

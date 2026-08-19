@@ -142,13 +142,12 @@ EOF
 # 方式A：重启 gateway 容器（秒级）
 docker compose --env-file .env -p deer-flow -f docker/docker-compose.yaml -f docker/docker-compose.dood.yaml up -d --force-recreate gateway
 
-# 方式B（修正版）：管理员登录 + CSRF 双重提交触发热重载（不重启容器）
+# 方式B：管理员登录 + CSRF 双重提交触发热重载（不重启容器）——一条命令，复制即用
 #   说明：/api/skills/reload 是 admin-only 的 POST，内部 token 调不动，必须走管理员 session
-ADMIN_EMAIL="${DEER_FLOW_ADMIN_EMAIL:-506391157@qq.com}"; ADMIN_PASS="${DEER_FLOW_ADMIN_PASSWORD:-Admin@123}"
-CJ="/tmp/deerflow_reload.cookies"; rm -f "$CJ"
-curl -s -c "$CJ" --data-urlencode "username=$ADMIN_EMAIL" --data-urlencode "password=$ADMIN_PASS" http://127.0.0.1:2026/api/v1/auth/login/local
-CSRF=$(grep csrf_token "$CJ" | awk '{print $NF}')
-curl -s -b "$CJ" -H "X-CSRF-Token: $CSRF" -X POST http://127.0.0.1:2026/api/skills/reload
+CJ=/tmp/df_reload.cookies; rm -f "$CJ"; \
+curl -s -c "$CJ" --data-urlencode "username=${DEER_FLOW_ADMIN_EMAIL:-506391157@qq.com}" --data-urlencode "password=${DEER_FLOW_ADMIN_PASSWORD:-Admin@123}" http://127.0.0.1:2026/api/v1/auth/login/local >/dev/null; \
+CSRF=$(grep csrf_token "$CJ" | awk '{print $NF}'); \
+curl -s -b "$CJ" -H "X-CSRF-Token: $CSRF" -X POST http://127.0.0.1:2026/api/skills/reload; \
 rm -f "$CJ"
 ```
 

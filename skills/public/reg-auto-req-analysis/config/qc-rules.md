@@ -2,7 +2,7 @@
 
 > **状态：已接入事前质控规则。**完整规则、项目关键词字典和更新记录见 `../references/pre-qc-rules.md`；本文件只保留自动化执行时必须遵循的判定顺序与终局映射。
 >
-> 质控**不修改 TFS 状态**。**质控阶段的**查重仍为预留项，不参与**质控 verdict** 判定（分析阶段的“功能已存在”判定另由 `references/confidence-heuristic.md` 第 4 项反向条款与 `pipeline.py` 硬闸约束，不影响质控）。
+> 质控**不修改 TFS 状态**。**正式查重 verdict**（项目内/跨项目关键词查重子系统）仍为预留项，不参与**质控 verdict** 判定；但 **KB 发现链命中的重复**（见 `references/qc-kb-recipe.md`）可作为 `references/qc-checklist.md` #5「无明显重复」维度的证据参与终局（实现级命中 `maturity=已落地` → 写 items 请产品确认）。分析阶段的"功能已存在"判定另由 `references/confidence-heuristic.md` 第 4 项反向条款与 `pipeline.py` 硬闸约束，不影响质控。
 
 ## 读取字段
 
@@ -29,7 +29,7 @@
    - PIMIS B 级 → `NEED-REVIEW`，责任方“研发负责人”，确认迭代剩余容量与 21 天时效；
    - 期望日期：调 `tfs_client.py list-iterations`（`--project` 用工作项 teamProject、`--expected-date` 可选；完整命令见 `../_lib/COMMANDS.md`）取官方迭代日历的 `matched`（`finishDate ≤ 期望日` 的最近可交付迭代，判定基准见 `references/pre-qc-rules.md §三.3`）。`matched` 存在且当前日期 ≤ `matched.finish − 7天`（代码提交截止）→ 正常处理；时间紧张 → `NEED-REVIEW`（责任方”研发负责人”）；`matched=null`（期望日早于所有迭代 `finishDate`）或查询失败 → `NEED-REVIEW`，责任方”现场/排期方”，不得猜测日期。
 3. **高风险早筛**（spec 清晰度二分）：查 `../_lib/high-risk-categories.md`。从需求标题/描述即可识别的高风险（多见 ①②⑤），**按 spec 是否清晰分**（清晰度判据见 `references/qc-checklist.md` §一 #7-#9）：
-   - 高风险 + **spec 清晰**（口径/范围/处理/验收可分析）→ **`PASS` 进分析**——由分析阶段②等定性为 `MANUAL-REVIEW` + `PM-AI-STOP-AUTO` 兜底人工复核，**质控不挡回**（描述清晰的高风险需求挡回产品价值低，`STOP-AUTO` 已兜底）。
+   - 高风险 + **spec 清晰**（口径/范围/处理/验收可分析）→ **本条不挡回**（不产 `NEED-REVIEW`），进入分析由②等定性为 `MANUAL-REVIEW` + `PM-AI-STOP-AUTO` 兜底——**但其余阻断项（#10 根因方向、PIMIS/时效、范围排除、`NEED-INFO` 等）仍独立生效，rule 3 不是短路 PASS**（描述清晰的高风险需求挡回产品价值低，`STOP-AUTO` 已兜底）。
    - 高风险 + **spec 不清**（业务规则/范围/口径存疑）→ 初判 `NEED-REVIEW`，先按 KB/wiki 补证规则复核；不能逐项由已证实既有规则闭合时，责任方“产品”。
    - 质控早筛**不打 STOP-AUTO**（分析阶段产物）；它只决定“清晰的高风险放行进分析 vs 不清的高风险挡回产品”。
 4. **项目归属（AI 自主判断·不做字典限制）**：由 AI 判断标题是否含**可识别的项目/客户/区域/大区归属**——`references/pre-qc-rules.md` 的关键词字典仅作**参考**，非硬性限制，AI 可识别字典之外的合理归属（真实地名/客户名/区域名）。能识别出归属即通过；标题完全无项目/区域/客户/大区归属信息 → `NEED-INFO`，责任方“实施/创建者”，要求补充具体项目、客户或区域信息。
@@ -37,10 +37,14 @@
 6. **合理性 / spec 清晰度**：描述内部冲突、业务规则存疑、或 **spec 清晰度任一存疑**（范围/边界、取值/数据源口径、与现有路径一致性，详见 `references/qc-checklist.md` §一 #7-#9）→ 先按 `references/qc-checklist.md` §二·收敛规则二分：**呈现类**存疑 → 默认现状不变（记 `notes`，不单独触发 NEED-REVIEW）；**正确性/方向类**存疑 → 初判 `NEED-REVIEW`，再决定是否可由 KB/wiki 已证实的现状规则逐项闭合。不能闭合时交产品，item 进清单并受 `MAX_QC_ITEMS` 收敛。**意图**：PASS 进分析的 spec 必须已清；已证实既有规则可成为清晰度证据，dev 级细节（具体字段名/mapper）不算 spec 歧义。
    - **6a. 需求方向/根因一致性（治标警惕）**：需求为性能/异常抱怨（卡顿/慢/等待/超时/延迟/崩溃/卡死/无响应/数据错乱/报错）**且** 需求方（常见实施/现场）给的方案为**使用层规避**（上限/提醒/分批/限制/阈值/不超过/最多N条/临时截断/规避/绕过）而非根因优化（加索引/分页/异步/缓存/重构）→ 属**方向类存疑** → `NEED-REVIEW`（责任方 **产品 + 研发负责人**），item 问"是否先做根因排查，而非套上限/提醒"，`priority:P0`，详见 `references/qc-checklist.md` §一 #10。**意图**：异常量级的数据不应致异常卡顿/错误，规避方案治标可能掩盖真实缺陷；PASS 进分析的应是“方向已对、根因已明”，不在分析里再抛根因类待确认。
    - **评估时机**：本规则为纯标题/描述文本可定，在 SKILL.md 步骤 3 的“事前质控文本快扫”中评估；命中为客观硬性 `NEED-REVIEW`，必须交产品 + 研发负责人确认根因，不得由静态 KB/wiki 发现链放行。
-7. **单次集中确认闸门**：完成附件、必要 KB/wiki/GitNexus 发现链后，按分析闭环做一次业务决策预演。将所有 PM 可回答、且答案会改变业务方案或验收的范围、业务含义/取值、规则、权限、异常和验收缺口去重合并进同一份 checklist；普通需求目标 1–3 个主题、复杂需求最多 5 个。技术证据缺口不问 PM。
+7. **单次集中确认闸门（两层检查）**：完成附件、必要 KB/wiki/GitNexus 发现链后，按分析闭环做一次业务决策预演。逐面检查不等于逐面提问：先用工作项、附件、继承 PM 答案或已证实产品规则闭合，只把仍会改变业务方案或验收的 PM 缺口去重合并进同一 checklist；普通需求目标 1–3 个主题、复杂需求最多 5 个。技术证据缺口不问 PM。
+   - **7a. 通用七面检查**：所有非 SKIP 需求检查范围、流程、业务含义/取值、业务规则、权限、异常、验收。范围、业务含义和验收必须有明确依据；其余确不涉及时可写不适用及理由，但不得使用默认值。缺口使用稳定 ID `q-scope` / `q-workflow` / `q-business-semantics` / `q-business-rules` / `q-permissions` / `q-exceptions` / `q-acceptance`。
+   - **7b. 字段/接口/持久化专项四面检查**：新增或调整展示字段、接口参数、模板绑定、读取/保存/编辑时，必须逐项覆盖展示方式、空值语义、维护粒度、历史数据。纯布局/占位可按呈现类默认；按头还是按明细、单条还是批量、是否允许清空、历史是否迁移/回填/兼容等会改变数据模型、范围或验收，缺失时固定回 `NEED-REVIEW` 并使用稳定 ID `q-presentation` / `q-empty-value` / `q-maintenance-granularity` / `q-historical-data` 合并提问。不得把这些 PM 决策降成 `evidence_gap` 或交研发自行决定。
 8. **通过**：只有上述阻断项均消除且业务决策预演无剩余 PM 缺口，才可 `PASS` 链入分析。新计划写 `confirmation_policy=qc-single-batch-v1`。
 
-## KB/wiki 补证复核
+## spec 清晰度补证闸（KB/wiki 已证实规则放松 NEED-REVIEW→PASS）
+
+> 本节**不新增 verdict 类别**：终局仍只产 `NEED-INFO`/`NEED-REVIEW`/`SKIP`/`PASS`；仅用 KB/wiki 已证实的现状规则，放松 **spec 清晰度类（#7-#9 正确性/方向）** 的初判 `NEED-REVIEW`→`PASS`。PIMIS/时效、范围排除、§6a 根因方向等硬阻断**不可**由此放松。
 
 初判 `NEED-REVIEW` 后，在不存在范围排除、PIMIS/迭代时效、`NEED-INFO`、或 §6a 根因方向等硬阻断时，运行只读菜单索引、产品 wiki 与代码/数据库知识图谱。仅当**每个**初判项都满足以下条件，才将初判改为 `PASS` 并进入阶段二：
 

@@ -1,14 +1,12 @@
 import json
-import time
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 
 from config import AGENT_NAME, get_redis_client
 from middleware.auth import verify_api_key
 from models import AnalysisRequest, TaskStatusResponse, TaskSubmitResponse
-from services.deerflow_client import _RUN_POLL_TIMEOUT_SECONDS, DeerFlowClient
+from services.deerflow_client import DeerFlowClient
 from services.redis_qc_client import RedisQcClient, build_qc_plan_key
-from services.run_registry import run_registry
 from services.task_manager import TaskStatus, create_task_manager
 
 router = APIRouter(prefix="/api/v1/analysis", tags=["analysis"])
@@ -64,9 +62,10 @@ def get_analysis_result(task_id: str, _: None = Depends(verify_api_key)):
 
 
 def _run_analysis_task(task_id: str, req: AnalysisRequest):
-    """Run DeerFlow agent in the background."""
+    """Run DeerFlow agent in the background（阻塞 wait + plan run_id 对账）。"""
     task_manager.update_task(task_id, TaskStatus.PROCESSING)
     redis_key = build_qc_plan_key(req.collection_name, req.work_item_id)
+    baseline_run_id = _plan_run_id(redis_key)  # 本次提交前 plan key 的落盘标记
 
     try:
         request_payload = {
@@ -129,36 +128,48 @@ def _run_analysis_task(task_id: str, req: AnalysisRequest):
                 f"{json.dumps(request_payload, ensure_ascii=False)}"
             )
 
-        run_id = deerflow_client.start_run(
+        deerflow_client.run_agent(
             collection_name=req.collection_name,
             work_item_id=req.work_item_id,
             message=message,
             agent_name=AGENT_NAME,
         )
 
-        # 登记到调度注册表：由 run_poller 调度线程统一轮询并收尾（对账 Redis）。
-        # 本线程到此返回，不再占用后台线程等待。
-        run_registry.register(
-            task_id=task_id,
-            run_id=run_id,
-            tid=deerflow_client.thread_id(req.collection_name, req.work_item_id),
-            redis_key=redis_key,
-            deadline=time.time() + _RUN_POLL_TIMEOUT_SECONDS,  # epoch 秒，跨进程可比较
-        )
-
-    except Exception as exc:
-        # 点火失败（如 POST /runs 异常）：对账 Redis，agent 可能已写盘，避免假失败。
-        if _read_result_from_redis(redis_key) is not None:
+        # run 正常结束：仅当 agent 写了新结果（plan run_id 变化）才判成功，
+        # 防止旧数据被当成新结果（2026-08-13 假成功复盘）。
+        if _plan_run_id(redis_key) != baseline_run_id:
             task_manager.update_task(
                 task_id,
                 TaskStatus.COMPLETED,
-                result={
-                    "redis_key": redis_key,
-                    "skill_status": "success(reconciled)",
-                },
+                result={"redis_key": redis_key, "skill_status": "success"},
+            )
+        else:
+            task_manager.update_task(
+                task_id,
+                TaskStatus.FAILED,
+                error="Agent run 结束但未写入新结果（plan run_id 未更新）",
+            )
+
+    except Exception as exc:
+        # wait 超时/异常：若 agent 实际已写盘（run_id 变化），按成功处理
+        if _plan_run_id(redis_key) != baseline_run_id:
+            task_manager.update_task(
+                task_id,
+                TaskStatus.COMPLETED,
+                result={"redis_key": redis_key, "skill_status": "success(reconciled)"},
             )
         else:
             task_manager.update_task(task_id, TaskStatus.FAILED, error=str(exc))
+
+
+def _plan_run_id(redis_key: str):
+    """读取 plan key 的 run_id（agent 每次落盘都会更新），用于对账判断本次是否真的写入新结果。"""
+    if redis_client is None:
+        return None
+    val = redis_client.hget(redis_key, "run_id")
+    if val is None:
+        return None
+    return val.decode() if isinstance(val, bytes) else val
 
 
 def _read_result_from_redis(redis_key: str):
