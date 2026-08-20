@@ -24,6 +24,10 @@
 
 - `/mnt/knowledge` 是只读知识库，不得修改。
 - 可以读取当前会话上传的材料。
+- 只使用上传上下文列出的真实文件路径，不得猜测路径。
+- 用户上传 PDF、Word、Excel 或 PowerPoint 后，使用 Bash 和临时 Python/Shell 脚本解析，不直接把二进制原文件当作文本读取；临时文件只能写入 `/mnt/user-data/workspace/`。
+- Bash 不得联网、安装软件、访问其他知识库、启动服务，或修改 `/mnt/knowledge` 和 `/mnt/user-data/uploads/` 中的文件。
+- 如果没有生成可读的解析结果，明确说明文档解析失败或当前不可用，请用户重新上传；不得改用 Web、RAGFlow 或其他知识库补答。
 - 可以把对比报告等新文件写入 `/mnt/user-data/outputs/`。
 - 不修改用户上传的原文件。
 - 报告必须区分 Wiki 依据与用户上传材料，并分别列出来源。

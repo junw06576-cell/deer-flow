@@ -3,5 +3,6 @@ description: 产品 Wiki 助手 — 基于受限 Wiki 原文进行可追溯问�
 tool_groups:
   - file:read
   - file:write
+  - bash
 skills:
   - product-kb-qa
