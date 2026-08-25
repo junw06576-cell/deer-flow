@@ -794,6 +794,8 @@ Across sessions, DeerFlow builds a persistent memory of your profile, preference
 
 Memory updates now skip duplicate fact entries at apply time, so repeated preferences and context do not accumulate endlessly across sessions.
 
+Memory extraction can be specialized per custom agent without disabling global memory. Add `<agent-name>/memory_update.chat.yaml` under the configured memory prompt directory (the bundled default is `backend/packages/harness/deerflow/agents/memory/backends/deermem/deermem/core/prompts/`). That agent uses the override while other agents continue to use the global template. Prompt policies guide future extraction; they do not remove existing memory or provide a deterministic content-security boundary.
+
 ## Recommended Models
 
 DeerFlow is model-agnostic — it works with any LLM that implements the OpenAI-compatible API. That said, it performs best with models that support:

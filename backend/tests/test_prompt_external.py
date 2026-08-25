@@ -79,6 +79,71 @@ def test_load_prompt_agent_override_resolves(tmp_path: Path) -> None:
     assert "RESEARCHER-SPECIFIC" not in other
 
 
+def test_load_prompt_messages_agent_override_resolves(tmp_path: Path) -> None:
+    variables = {
+        "current_memory": "{}",
+        "conversation": "CONVERSATION",
+        "correction_hint": "",
+        "staleness_review_section": "",
+        "consolidation_section": "",
+    }
+    default_prompt = """format: chat
+version: "1.0"
+messages:
+  - role: system
+    content: GLOBAL-DEFAULT
+  - role: user
+    content: "{conversation}"
+"""
+    agent_prompt = default_prompt.replace("GLOBAL-DEFAULT", "REG-WIKI-SPECIFIC")
+    (tmp_path / "memory_update.chat.yaml").write_text(default_prompt, encoding="utf-8")
+    (tmp_path / "reg-wiki-kb").mkdir()
+    (tmp_path / "reg-wiki-kb" / "memory_update.chat.yaml").write_text(agent_prompt, encoding="utf-8")
+
+    reg_wiki_messages = load_prompt_messages(
+        "memory_update",
+        variables,
+        agent_name="reg-wiki-kb",
+        prompts_dir=str(tmp_path),
+    )
+    other_messages = load_prompt_messages(
+        "memory_update",
+        variables,
+        agent_name="auto-anaylsis-agent",
+        prompts_dir=str(tmp_path),
+    )
+
+    assert "REG-WIKI-SPECIFIC" in reg_wiki_messages[0].content
+    assert "GLOBAL-DEFAULT" in other_messages[0].content
+    assert "REG-WIKI-SPECIFIC" not in other_messages[0].content
+
+
+def test_reg_wiki_bundled_memory_policy_is_isolated() -> None:
+    variables = {
+        "current_memory": "{}",
+        "conversation": "用户询问了一个产品功能。",
+        "correction_hint": "",
+        "staleness_review_section": "",
+        "consolidation_section": "",
+    }
+
+    reg_wiki_messages = load_prompt_messages(
+        "memory_update",
+        variables,
+        agent_name="reg-wiki-kb",
+    )
+    other_messages = load_prompt_messages(
+        "memory_update",
+        variables,
+        agent_name="auto-anaylsis-agent",
+    )
+
+    assert "Policy ID: reg-wiki-kb-memory-v1" in reg_wiki_messages[0].content
+    assert "禁止沉淀" in reg_wiki_messages[0].content
+    assert "Wiki 目录、文件名、标题、数量、路径" in reg_wiki_messages[0].content
+    assert "Policy ID: reg-wiki-kb-memory-v1" not in other_messages[0].content
+
+
 def test_load_prompt_messages_returns_system_user() -> None:
     # Chat form: system (static rules) + user (dynamic placeholders).
     variables = {
