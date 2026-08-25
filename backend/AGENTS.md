@@ -578,6 +578,12 @@ The cached value is reused for both the blocking (`runs.wait`) and streaming (`_
 - `storage.py` - File-based storage with per-user isolation; cache keyed by `(user_id, agent_name)` tuple
 - `tools.py` - Tool-driven memory mode (`memory_search`, `memory_add`, `memory_update`, `memory_delete`) using the same storage/update primitives
 
+**Per-Agent Extraction Prompts**:
+- `load_prompt_messages()` resolves `{prompts_dir}/{agent_name}/memory_update.chat.yaml` before the global `{prompts_dir}/memory_update.chat.yaml` template.
+- With the bundled prompt directory, place an override under `packages/harness/deerflow/agents/memory/backends/deermem/deermem/core/prompts/<agent-name>/`.
+- Overrides affect only future LLM-based extraction for the matching agent. They do not mutate existing memory, filter injected memory, or replace runtime evidence/authorization controls.
+- `reg-wiki-kb` uses a dedicated extraction prompt that stores user preferences and workflows but excludes Wiki facts, index metadata, tool results, uploads, and transient availability errors.
+
 **Per-User Isolation**:
 - Memory is stored per-user at `{base_dir}/users/{user_id}/memory.json`
 - Per-agent per-user memory at `{base_dir}/users/{user_id}/agents/{agent_name}/memory.json`

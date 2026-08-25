@@ -130,6 +130,10 @@ These apply repo-wide; module guides own the module-specific detail.
 - **Documentation update policy** — keep docs in sync with code: update `README.md` for
   user-facing changes and the relevant `AGENTS.md` for development/architecture changes in
   the same change set.
+- **Per-agent memory extraction** — keep agent-specific `memory_update.chat.yaml` overrides
+  under `backend/packages/harness/deerflow/agents/memory/backends/deermem/deermem/core/prompts/<agent-name>/`;
+  other agents must continue to fall back to the global prompt, and prompt isolation must
+  have regression coverage.
 - **Test-driven development** — features and bug fixes ship with tests. Backend tests live
   in `backend/tests/` (TDD is mandatory there; see [backend/AGENTS.md](backend/AGENTS.md));
   frontend tests live in `frontend/tests/`.
