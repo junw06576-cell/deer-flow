@@ -86,7 +86,7 @@ tools:
   group: ragflow
   
 tool_search:
-  enabled: false
+  enabled: true
 tool_output:
   enabled: true
   externalize_min_chars: 12000
