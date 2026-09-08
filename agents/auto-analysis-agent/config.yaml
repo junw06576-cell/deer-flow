@@ -1,7 +1,9 @@
 name: auto-analysis-agent
 description: TFS需求分析专家，可根据需求号进行需求合理性评估、需求分析两阶段工作，支持将分析结果回写TFS。
 skills:
-  - reg-auto-req-analysis
+  - reg-auto-req-analysis-offline
 tool_groups:
   - bash
+  - file:read
+  - file:write
 recursion_limit: 500

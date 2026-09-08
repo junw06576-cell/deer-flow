@@ -10,7 +10,7 @@ logging:
     enabled: false
     format: text
 token_usage:
-  enabled: false
+  enabled: true
 token_budget:
   enabled: false
   max_tokens: 200000
@@ -20,8 +20,8 @@ token_budget:
   hard_stop_threshold: 1.0
 max_recursion_limit: 1000
 models:
-- name: deepseek-v4-flash
-  display_name: Wincode / deepseek-v4-flash
+- name: qwen3.7-plus
+  display_name: Wincode / qwen3.7-plus
   use: langchain_openai:ChatOpenAI
   model: deepseek-v4-flash
   api_key: $OPENAI_API_KEY
@@ -30,7 +30,7 @@ models:
   max_retries: 2
   max_tokens: 8192
   supports_vision: false
-  supports_thinking: true
+  supports_thinking: false
 tool_groups:
 - name: web
 - name: file:read
@@ -125,6 +125,8 @@ uploads:
   pdf_converter: auto
 sandbox:
   use: deerflow.community.aio_sandbox:AioSandboxProvider
+  idle_timeout: 1200
+  replicas: 6
   bash_output_max_chars: 20000
   read_file_output_max_chars: 50000
   ls_output_max_chars: 20000
@@ -148,6 +150,7 @@ sandbox:
   environment:
     REDIS_HOST: host.docker.internal
     REDIS_PORT: "26380"
+    REDIS_PASSWORD: 92e3ffa5db03aca31594021ddbf3c466
 skills:
   container_path: /mnt/skills
 skill_scan:
@@ -158,7 +161,7 @@ title:
   max_chars: 60
   model_name: null
 summarization:
-  enabled: false
+  enabled: true
   model_name: null
   trigger:
   - type: tokens
@@ -247,3 +250,15 @@ channel_connections:
     enabled: false
   wecom:
     enabled: false
+
+channels:
+  # Docker 部署用服务名；本地 make dev 改回 localhost:8001
+  langgraph_url: http://gateway:8001/api
+  gateway_url: http://gateway:8001
+  wecom:
+    enabled: true
+    bot_id: aib40Gq4tOOksWmTHi8pz-x6MWVjtPyR73S
+    bot_secret: 7A61b43Pinxbcrq6A2zHCbsb1BO46ePj7M7d2DAdXiX
+    session:
+      # 关键：企微入口消息全部路由给 reg-wiki-kb 智能体（经 lead_agent + agent_name 转发）
+      assistant_id: reg-wiki-kb
