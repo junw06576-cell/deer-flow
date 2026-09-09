@@ -876,12 +876,15 @@ class AioSandboxProvider(WarmPoolLifecycleMixin[SandboxInfo], SandboxProvider):
         effective_user_id = self._effective_acquire_user_id(user_id)
         extra_mounts = self._get_extra_mounts(thread_id, user_id=effective_user_id)
 
-        # Enforce replicas: only warm-pool containers count toward eviction budget.
-        # Active sandboxes are in use by live threads and must not be forcibly stopped.
-        replicas, total = self._replica_count()
-        if total >= replicas:
-            evicted = self._evict_oldest_warm()
-            self._log_replicas_soft_cap(replicas, sandbox_id, evicted)
+        # 使用 replicas 作为活跃沙箱的硬上限，防止多用户并发 OOM。
+        # release() 仍然将容器放入 warm pool 供同线程复用，
+        # 但超过上限时拒绝创建新容器而非发出警告后继续创建。
+        replicas = self._config.get("replicas", DEFAULT_REPLICAS)
+        with self._lock:
+            if self._active_count_locked() >= replicas:
+                raise RuntimeError(
+                    f"已达到沙箱并发上限 ({replicas})，请等待当前任务完成后重试"
+                )
 
         info = self._backend.create(thread_id, sandbox_id, extra_mounts=extra_mounts or None, user_id=effective_user_id)
 
@@ -897,12 +900,15 @@ class AioSandboxProvider(WarmPoolLifecycleMixin[SandboxInfo], SandboxProvider):
         effective_user_id = self._effective_acquire_user_id(user_id)
         extra_mounts = await asyncio.to_thread(self._get_extra_mounts, thread_id, user_id=effective_user_id)
 
-        # Enforce replicas: only warm-pool containers count toward eviction budget.
-        # Active sandboxes are in use by live threads and must not be forcibly stopped.
-        replicas, total = self._replica_count()
-        if total >= replicas:
-            evicted = await asyncio.to_thread(self._evict_oldest_warm)
-            self._log_replicas_soft_cap(replicas, sandbox_id, evicted)
+        # 使用 replicas 作为活跃沙箱的硬上限，防止多用户并发 OOM。
+        # release() 仍然将容器放入 warm pool 供同线程复用，
+        # 但超过上限时拒绝创建新容器而非发出警告后继续创建。
+        replicas = self._config.get("replicas", DEFAULT_REPLICAS)
+        with self._lock:
+            if self._active_count_locked() >= replicas:
+                raise RuntimeError(
+                    f"已达到沙箱并发上限 ({replicas})，请等待当前任务完成后重试"
+                )
 
         info = await asyncio.to_thread(self._backend.create, thread_id, sandbox_id, extra_mounts=extra_mounts or None, user_id=effective_user_id)
 

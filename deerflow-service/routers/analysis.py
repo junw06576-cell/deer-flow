@@ -1,5 +1,7 @@
 import json
+import time
 
+import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 
 from config import AGENT_NAME, get_redis_client
@@ -62,10 +64,12 @@ def get_analysis_result(task_id: str, _: None = Depends(verify_api_key)):
 
 
 def _run_analysis_task(task_id: str, req: AnalysisRequest):
-    """Run DeerFlow agent in the background（阻塞 wait + plan run_id 对账）。"""
+    """Run DeerFlow agent in the background（阻塞 wait + 超时兜底 + plan run_id 对账）。"""
     task_manager.update_task(task_id, TaskStatus.PROCESSING)
     redis_key = build_qc_plan_key(req.collection_name, req.work_item_id)
-    baseline_run_id = _plan_run_id(redis_key)  # 本次提交前 plan key 的落盘标记
+    baseline = _plan_probe(redis_key)  # (run_id, generated_at_utc) 本次提交前的落盘基线
+
+    timeout_happened = False
 
     try:
         request_payload = {
@@ -73,8 +77,14 @@ def _run_analysis_task(task_id: str, req: AnalysisRequest):
             "collection_name": req.collection_name,
             "work_item_id": req.work_item_id,
             "tfs_project": req.tfs_project,
-            "tfs_pat": req.tfs_pat,
             "redis_key": redis_key,
+        }
+
+        # request-scoped secrets：键名对齐 tfs_client.py 的优先级（--pat > TFS_PAT > tfs.pat）
+        tfs_secrets = {
+            "TFS_PAT": req.tfs_pat,
+            "TFS_COLLECTION": req.collection_name,
+            "TFS_PROJECT": req.tfs_project,
         }
 
         if req.human_feedback:
@@ -133,43 +143,91 @@ def _run_analysis_task(task_id: str, req: AnalysisRequest):
             work_item_id=req.work_item_id,
             message=message,
             agent_name=AGENT_NAME,
+            tfs_secrets=tfs_secrets,
         )
 
-        # run 正常结束：仅当 agent 写了新结果（plan run_id 变化）才判成功，
-        # 防止旧数据被当成新结果（2026-08-13 假成功复盘）。
-        if _plan_run_id(redis_key) != baseline_run_id:
-            task_manager.update_task(
-                task_id,
-                TaskStatus.COMPLETED,
-                result={"redis_key": redis_key, "skill_status": "success"},
-            )
-        else:
-            task_manager.update_task(
-                task_id,
-                TaskStatus.FAILED,
-                error="Agent run 结束但未写入新结果（plan run_id 未更新）",
-            )
-
+    except httpx.ReadTimeout:
+        # 超时：agent 可能还在跑，给兜底窗口等 Redis 落盘
+        timeout_happened = True
     except Exception as exc:
-        # wait 超时/异常：若 agent 实际已写盘（run_id 变化），按成功处理
-        if _plan_run_id(redis_key) != baseline_run_id:
+        # wait 其它异常：若 agent 实际已写盘，按成功处理
+        if _plan_probe(redis_key) != baseline:
             task_manager.update_task(
                 task_id,
                 TaskStatus.COMPLETED,
                 result={"redis_key": redis_key, "skill_status": "success(reconciled)"},
             )
         else:
-            task_manager.update_task(task_id, TaskStatus.FAILED, error=str(exc))
+            task_manager.update_task(
+                task_id,
+                TaskStatus.FAILED,
+                error=f"AGENT_TASK_EXCEPTION: Agent 运行异常——{exc}",
+            )
+        return
+
+    # ── 对账阶段 ──
+    # 超时后兜底轮询：agent 可能还在跑，给一个收尾窗口（最多等 60s）让 Redis 落盘
+    if timeout_happened:
+        _grace_probe(redis_key, baseline, timeout=60.0)
+
+    if _plan_probe(redis_key) != baseline:
+        task_manager.update_task(
+            task_id,
+            TaskStatus.COMPLETED,
+            result={
+                "redis_key": redis_key,
+                "skill_status": "success(reconciled)" if timeout_happened else "success",
+            },
+        )
+    else:
+        error_msg = (
+            "AGENT_RESULT_NOT_FRESH: Agent 已结束但未写入新结果。"
+            "可能原因：Agent 未执行到写入步骤、publish_plan 失败降级、"
+            "或结果与上一轮完全相同。建议重新提交任务，"
+            "或在工作项中补充信息后重试。"
+        )
+        task_manager.update_task(
+            task_id,
+            TaskStatus.FAILED,
+            error=error_msg,
+        )
+
+
+def _grace_probe(redis_key: str, baseline, timeout: float = 60.0):
+    """超时后兜底轮询：等 Redis 落盘，最大等 timeout 秒。
+
+    每次间隔 5s 查一次，若 run_id/generated_at_utc 任一变化立即返回。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _plan_probe(redis_key) != baseline:
+            return
+        time.sleep(5)
+
+
+def _plan_probe(redis_key: str):
+    """读取 plan key 的落盘信号，用于对账判断本次是否真的写入新结果。
+
+    返回 (run_id, generated_at_utc) 二元组。agent 每次 publish_plan 落盘时，
+    `run_id` 与 `generated_at_utc`（UTC 时间戳）都会同时刷新；两个信号任一变
+    化即可认定"本 run 写入了新结果"，避免 agent 复用历史 run_id 时被误判失败
+    （2026-08-13 假成功 / 2026-08-25 假失败复盘）。
+    """
+    if redis_client is None:
+        return (None, None)
+
+    def _get(field):
+        val = redis_client.hget(redis_key, field)
+        if val is None:
+            return None
+        return val.decode() if isinstance(val, bytes) else val
+
+    return (_get("run_id"), _get("generated_at_utc"))
 
 
 def _plan_run_id(redis_key: str):
-    """读取 plan key 的 run_id（agent 每次落盘都会更新），用于对账判断本次是否真的写入新结果。"""
-    if redis_client is None:
-        return None
-    val = redis_client.hget(redis_key, "run_id")
-    if val is None:
-        return None
-    return val.decode() if isinstance(val, bytes) else val
+    """兼容占位：仅读 run_id。新代码应优先使用 _plan_probe 的双信号。"""
+    return _plan_probe(redis_key)[0]
 
 
 def _read_result_from_redis(redis_key: str):

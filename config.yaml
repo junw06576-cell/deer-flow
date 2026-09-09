@@ -23,7 +23,7 @@ models:
 - name: qwen3.7-plus
   display_name: Wincode / qwen3.7-plus
   use: langchain_openai:ChatOpenAI
-  model: deepseek-v4-flash
+  model: qwen3.7-plus
   api_key: $OPENAI_API_KEY
   base_url: $OPENAI_BASE_URL
   timeout: 600.0
@@ -31,6 +31,9 @@ models:
   max_tokens: 8192
   supports_vision: false
   supports_thinking: false
+  when_thinking_disabled:
+    extra_body:
+      reasoning_effort: "low"
 tool_groups:
 - name: web
 - name: file:read
@@ -185,11 +188,9 @@ memory:
   backend_config:
     storage_path: ''
     debounce_seconds: 30
-    model:
-      provider: openai
-      model: deepseek-v4-flash
-      api_key: $OPENAI_API_KEY
-      base_url: $OPENAI_BASE_URL
+    # 故意不显式配 model：让 DeerMem 退回 host_llm（= 主模型 qwen3.7-plus，
+    # 已带 when_thinking_disabled -> thinking.enabled:false），避免 build_llm
+    # 自建模型时 glm 默认开 reasoning 把 token 偷偷烧掉。
     max_facts: 100
     fact_confidence_threshold: 0.7
     max_injection_tokens: 2000

@@ -29,13 +29,13 @@ services:
   redis:
     image: redis:7-alpine
     container_name: deer-flow-redis
-    command: ["redis-server", "--appendonly", "yes"]
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "92e3ffa5db03aca31594021ddbf3c466"]
     ports:
       - "26380:6379"
     volumes:
       - redis-data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "92e3ffa5db03aca31594021ddbf3c466", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -129,7 +129,7 @@ services:
       - DEER_FLOW_HOME=/app/backend/.deer-flow
       - DEER_FLOW_CONFIG_PATH=/app/backend/config.yaml
       - DEER_FLOW_EXTENSIONS_CONFIG_PATH=/app/backend/extensions_config.json
-      - DEER_FLOW_STREAM_BRIDGE_REDIS_URL=${DEER_FLOW_STREAM_BRIDGE_REDIS_URL:-redis://redis:6379/0}
+      - DEER_FLOW_STREAM_BRIDGE_REDIS_URL=${DEER_FLOW_STREAM_BRIDGE_REDIS_URL:-redis://:92e3ffa5db03aca31594021ddbf3c466@redis:6379/0}
       - DEER_FLOW_CHANNELS_LANGGRAPH_URL=${DEER_FLOW_CHANNELS_LANGGRAPH_URL:-http://gateway:8001/api}
       - DEER_FLOW_CHANNELS_GATEWAY_URL=${DEER_FLOW_CHANNELS_GATEWAY_URL:-http://gateway:8001}
       - DEER_FLOW_INTERNAL_AUTH_TOKEN=${DEER_FLOW_INTERNAL_AUTH_TOKEN}
@@ -197,7 +197,7 @@ services:
       - DEERFLOW_BASE_URL=http://gateway:8001
       - API_KEY=tfs-buddy-secret-key
       - DEER_FLOW_INTERNAL_AUTH_TOKEN=${DEER_FLOW_INTERNAL_AUTH_TOKEN}
-      - REDIS_URL=redis://host.docker.internal:26380/0
+      - REDIS_URL=redis://:92e3ffa5db03aca31594021ddbf3c466@host.docker.internal:26380/0
     depends_on:
       redis:
         condition: service_healthy

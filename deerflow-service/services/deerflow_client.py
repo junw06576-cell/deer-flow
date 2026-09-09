@@ -35,7 +35,7 @@ class DeerFlowClient:
         # 生成 CSRF double-submit cookie 对（server-to-server 调用绕过 CSRF 校验）
         self._csrf_token = secrets.token_urlsafe(64)
         self._client = httpx.Client(
-            timeout=600.0,
+            timeout=1800.0,
             headers=headers,
             cookies={"csrf_token": self._csrf_token},
         )
@@ -51,6 +51,7 @@ class DeerFlowClient:
         work_item_id: int,
         message: str,
         agent_name: str,
+        tfs_secrets: dict | None = None,
         timeout: float = 1800.0,
     ) -> str:
         """
@@ -77,6 +78,12 @@ class DeerFlowClient:
             "thread_id": tid,
             "non_interactive": True,
         }
+        # request-scoped secrets：随 run context 传到 backend，由
+        # backend/tools_auto_req.py 的 _run(use_pat=True) 读取 TFS_PAT 拼成
+        # `--pat` 直传 tfs_client/pipeline 子进程。PAT 不进 prompt、不进命令串
+        # 的历史/trace，实现"每个提交人用自己的 PAT"且互不覆盖。
+        if tfs_secrets:
+            context["secrets"] = tfs_secrets
         payload = {
             "input": {
                 "messages": [

@@ -143,6 +143,36 @@ docker exec deer-flow-service curl -s http://gateway:8001/api/v1/health
 
 ---
 
+### 报错 5：`redis.exceptions.AuthenticationError: Authentication required`
+
+**现象**：`GET /api/v1/analysis/{task_id}` 返回 500，traceback 尾部是 `Authentication required`，调用链 `get_analysis_result → get_task → hgetall`。
+
+**原因**：deerflow-service 连 Redis 时没带密码或密码不匹配。Redis 容器开了 `--requirepass`，而 deerflow-service 的 `REDIS_URL` 里密码为空 / 写错 / 是旧 env（改了 compose 没 recreate）。
+
+**排查**（对比两侧实际值，一锤定音）：
+
+```bash
+# 1. Redis 实际 requirepass
+docker inspect deer-flow-redis --format '{{json .Config.Cmd}}'
+
+# 2. deerflow-service 实际 REDIS_URL（看 redis://: 后面的密码）
+docker exec deer-flow-service env | grep REDIS_URL
+
+# 3. 用密码直连验证
+docker exec deer-flow-redis redis-cli -a '92e3ffa5db03aca31594021ddbf3c466' ping
+```
+
+**解决**：确认 compose 里 `REDIS_URL` 密码 = Redis `--requirepass` 密码后，重建容器（deerflow-service 是 build 镜像，env 注入必须 recreate 才生效）：
+
+```bash
+docker compose --env-file .env -p deer-flow \
+  -f docker/docker-compose.yaml \
+  -f docker/docker-compose.dood.yaml \
+  up -d --force-recreate deerflow-service
+```
+
+---
+
 ## 五、测试 API 是否正常
 
 在服务器上：

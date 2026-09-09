@@ -33,5 +33,8 @@ template: |-
   ``valid:30d`` that is clearly stable, or a goal nearing completion whose window
   should shrink. Omit facts whose current window already seems appropriate.
 
+  Language: write every "reason" in the PRIMARY language of the conversation
+  (the same language you use for the rest of the output). Never default to English.
+
   Be conservative - when in doubt, KEEP. Removing a valid fact is worse than
   keeping a slightly stale one, because the next review cycle will re-evaluate it.

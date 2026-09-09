@@ -22,6 +22,8 @@ template: |-
   - correction: Explicit corrections or mistakes to avoid repeating
 
   Rules:
+  - Language: write each fact "content" in the PRIMARY language of the message above.
+    Never default to English.
   - Only extract clear, specific facts
   - Confidence should reflect certainty (explicit statement = 0.9+, implied = 0.6-0.8)
   - Skip vague or temporary information

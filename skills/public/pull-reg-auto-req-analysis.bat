@@ -8,8 +8,8 @@ rem  - dir exists (non-git)   -> show hint, do nothing
 rem  Change PAT: update AUTH below (echo :YourPAT | base64)
 rem ============================================================
 
-set "DIR=%~dp0reg-auto-req-analysis"
-set "URL=http://tfs2018-web.winning.com.cn:8080/tfs/WinCode/Skill/_git/reg-auto-req-analysis"
+set "DIR=%~dp0reg-auto-req-analysis-offline"
+set "URL=http://tfs2018-web.winning.com.cn:8080/tfs/WinCode/Skill/_git/reg-auto-req-analysis-offline
 set "AUTH=OmRjZnd4dm5idGc2NmxrZHRlenVzNWw3N3lycno1ZnFuemxzbXd3aGkybjNocDdpemF2bWE="
 
 if exist "%DIR%\.git" (
