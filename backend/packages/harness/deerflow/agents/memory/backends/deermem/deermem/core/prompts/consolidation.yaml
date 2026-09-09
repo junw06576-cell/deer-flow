@@ -18,6 +18,8 @@ template: |-
   Each entry: {{"sourceIds": ["fact_id_1", "fact_id_2"], "consolidated": {{"content": "...", "category": "...", "confidence": 0.9}}}}
 
   Rules:
+  - Language: write the consolidated "content" in the PRIMARY language of the conversation
+    (the same language you use for the rest of the output). Never default to English.
   - The consolidated fact must preserve ALL key details from source facts
   - Only consolidate facts that describe the same aspect of the user
   - Confidence of consolidated fact = max of source confidences

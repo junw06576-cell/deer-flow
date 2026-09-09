@@ -77,6 +77,21 @@ messages:
       - earlierContext: Patterns from slightly older interactions still relevant
       - longTermBackground: Unchanging foundational facts about the user
 
+      **Language Rule (highest priority — overrides the language of these instructions)**:
+      - ALL text you generate — every section summary, every newFacts "content", every
+        factsToConsolidate "consolidated.content", and every removal/extension "reason" —
+        MUST be written in the PRIMARY language of the <conversation> below.
+      - Detect that language from the user's turns (ignore incidental identifiers, code,
+        quoted English product names, and the fact that these instructions are in English).
+      - Concretely: if the user writes in Simplified Chinese, output Simplified Chinese.
+        If the user writes in Japanese, output Japanese. Never fall back to English by default.
+      - Language migration: if the existing <current_memory> is written in a DIFFERENT
+        language than the current conversation, treat that as a mismatch to fix on this
+        update — rewrite those sections in the conversation's language (set shouldUpdate=true
+        for them and carry over ALL existing content, translating it rather than dropping it),
+        and rewrite any existing fact stored in the wrong language.
+      - Do not mix languages within a single section or a single fact.
+
       **Multilingual Content**:
       - Preserve original language for proper nouns and company names
       - Keep technical terms in their original form (DeepSeek, LangGraph, etc.)
@@ -109,6 +124,8 @@ messages:
       }}
 
       Important Rules:
+      - LANGUAGE: apply the Language Rule to EVERY generated string (summaries, fact
+        content, consolidation content, reasons). Output in the conversation's language.
       - Only set shouldUpdate=true if there's meaningful new information
       - Follow length guidelines: workContext/personalContext are concise (1-3 sentences), topOfMind and history sections are detailed (paragraphs)
       - Include specific metrics, version numbers, and proper nouns in facts

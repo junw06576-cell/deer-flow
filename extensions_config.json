@@ -3,129 +3,257 @@
     "my_package.mcp.auth:build_auth_interceptor"
   ],
   "mcpServers": {
-    "github": {
-      "enabled": false,
-      "type": "stdio",
-      "command": "npx",
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-github"
-      ],
-      "env": {
-        "GITHUB_TOKEN": "$GITHUB_TOKEN"
-      },
-      "tool_call_timeout": 60,
-      "description": "GitHub MCP server for repository operations"
-    },
-    "postgres": {
-      "enabled": false,
-      "type": "stdio",
-      "command": "npx",
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-postgres",
-        "postgresql://localhost/mydb"
-      ],
-      "env": {},
-      "description": "PostgreSQL database access",
-      "routing": {
-        "mode": "prefer",
-        "priority": 50,
-        "keywords": [
-          "database",
-          "SQL",
-          "table",
-          "订单",
-          "用户"
-        ]
-      },
-      "tools": {
-        "query": {
-          "routing": {
-            "mode": "prefer",
-            "priority": 100,
-            "keywords": [
-              "查库",
-              "订单表",
-              "指标"
-            ]
-          }
-        }
-      }
-    },
     "tfs-requirements": {
       "enabled": true,
       "type": "http",
-      "url": "http://172.16.0.192:4751/mcp",
+      "url": "http://host.docker.internal:4751/mcp",
       "headers": {},
-      "description": "TFS需求历史 — 历史业务背景、工作项关系、验收条件、附件清单与变更原因",
-      "routing": {
-        "mode": "prefer",
-        "priority": 80,
-        "keywords": [
-          "需求历史",
-          "历史需求",
-          "验收条件",
-          "工作项关系",
-          "变更原因"
-        ]
-      }
+      "description": "TFS需求历史 — 历史业务背景、工作项关系、验收条件、附件清单与变更原因"
     },
     "gitnexus-team": {
       "enabled": true,
       "type": "http",
-      "url": "http://172.16.0.192:4747/api/mcp",
+      "url": "http://host.docker.internal:4747/api/mcp",
       "headers": {},
-      "description": "代码图谱 — 路由、调用链、影响分析、跨项目代码、模块/类/方法定位",
-      "routing": {
-        "mode": "prefer",
-        "priority": 70,
-        "keywords": [
-          "代码",
-          "路由",
-          "调用链",
-          "模块",
-          "接口",
-          "类",
-          "方法"
-        ]
-      }
+      "description": "代码图谱 — 路由、调用链、影响分析、跨项目代码、模块/类/方法定位"
     },
     "db-knowledge": {
       "enabled": true,
       "type": "http",
-      "url": "http://172.16.0.192:4748/mcp",
+      "url": "http://host.docker.internal:4748/mcp",
       "headers": {},
-      "description": "数据库图谱 — 表、字段、读写关系、文档说明",
-      "routing": {
-        "mode": "prefer",
-        "priority": 60,
-        "keywords": [
-          "数据库",
-          "表",
-          "字段",
-          "表结构",
-          "数据模型"
-        ]
-      }
+      "description": "数据库图谱 — 表、字段、读写关系、文档说明"
     },
     "cloudhis-source": {
       "enabled": true,
       "type": "http",
-      "url": "http://172.16.0.192:4752/mcp",
+      "url": "http://host.docker.internal:4752/mcp",
       "headers": {},
-      "description": "CloudHIS源码 — 源码搜索、类/方法/控制器路由/MyBatis映射符号定位",
-      "routing": {
-        "mode": "prefer",
-        "priority": 65,
-        "keywords": [
-          "源码",
-          "代码定位",
-          "方法实现",
-          "控制器",
-          "MyBatis映射"
-        ]
-      }
+      "description": "CloudHIS源码 — 源码搜索、类/方法/控制器路由/MyBatis映射符号定位"
+    },
+    "hms-requirements-history": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10912/products/hms/mcp",
+      "headers": {},
+      "description": "HMS需求历史 — 历史业务背景、工作项关系、验收条件、附件清单与变更原因"
+    },
+    "hms-code-graph": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10910/products/hms/mcp",
+      "headers": {},
+      "description": "HMS代码图谱 — 路由、调用链、影响分析、跨项目代码、模块/类/方法定位"
+    },
+    "hms-source-code": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10913/products/hms/mcp",
+      "headers": {},
+      "description": "HMS源码 — 源码搜索、类/方法/控制器路由/MyBatis映射符号定位"
+    },
+    "hms-database": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10911/products/hms/mcp",
+      "headers": {},
+      "description": "HMS数据库图谱 — 表、字段、读写关系、文档说明"
+    },
+    "sphs-requirements-history": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10912/products/sphs/mcp",
+      "headers": {},
+      "description": "SPHS需求历史 — 历史业务背景、工作项关系、验收条件、附件清单与变更原因"
+    },
+    "sphs-code-graph": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10910/products/sphs/mcp",
+      "headers": {},
+      "description": "SPHS代码图谱 — 路由、调用链、影响分析、跨项目代码、模块/类/方法定位"
+    },
+    "sphs-source-code": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10913/products/sphs/mcp",
+      "headers": {},
+      "description": "SPHS源码 — 源码搜索、类/方法/控制器路由/MyBatis映射符号定位"
+    },
+    "sphs-database": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10911/products/sphs/mcp",
+      "headers": {},
+      "description": "SPHS数据库图谱 — 表、字段、读写关系、文档说明"
+    },
+    "itr-requirements-history": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10912/products/itr/mcp",
+      "headers": {},
+      "description": "ITR需求历史 — 历史业务背景、工作项关系、验收条件、附件清单与变更原因"
+    },
+    "itr-code-graph": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10910/products/itr/mcp",
+      "headers": {},
+      "description": "ITR代码图谱 — 路由、调用链、影响分析、跨项目代码、模块/类/方法定位"
+    },
+    "itr-source-code": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10913/products/itr/mcp",
+      "headers": {},
+      "description": "ITR源码 — 源码搜索、类/方法/控制器路由/MyBatis映射符号定位"
+    },
+    "itr-database": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10911/products/itr/mcp",
+      "headers": {},
+      "description": "ITR数据库图谱 — 表、字段、读写关系、文档说明"
+    },
+    "ehr-requirements-history": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10912/products/ehr/mcp",
+      "headers": {},
+      "description": "EHR需求历史 — 历史业务背景、工作项关系、验收条件、附件清单与变更原因"
+    },
+    "ehr-code-graph": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10910/products/ehr/mcp",
+      "headers": {},
+      "description": "EHR代码图谱 — 路由、调用链、影响分析、跨项目代码、模块/类/方法定位"
+    },
+    "ehr-source-code": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10913/products/ehr/mcp",
+      "headers": {},
+      "description": "EHR源码 — 源码搜索、类/方法/控制器路由/MyBatis映射符号定位"
+    },
+    "ehr-database": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10911/products/ehr/mcp",
+      "headers": {},
+      "description": "EHR数据库图谱 — 表、字段、读写关系、文档说明"
+    },
+    "mchs-requirements-history": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10912/products/mchs/mcp",
+      "headers": {},
+      "description": "MCHS需求历史 — 历史业务背景、工作项关系、验收条件、附件清单与变更原因"
+    },
+    "mchs-code-graph": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10910/products/mchs/mcp",
+      "headers": {},
+      "description": "MCHS代码图谱 — 路由、调用链、影响分析、跨项目代码、模块/类/方法定位"
+    },
+    "mchs-source-code": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10913/products/mchs/mcp",
+      "headers": {},
+      "description": "MCHS源码 — 源码搜索、类/方法/控制器路由/MyBatis映射符号定位"
+    },
+    "mchs-database": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10911/products/mchs/mcp",
+      "headers": {},
+      "description": "MCHS数据库图谱 — 表、字段、读写关系、文档说明"
+    },
+    "resident-health-requirements-history": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10912/products/ehr/mcp",
+      "headers": {},
+      "description": "区卫需求历史 — 历史业务背景、工作项关系、验收条件、附件清单与变更原因"
+    },
+    "resident-health-code-graph": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10910/products/ehr/mcp",
+      "headers": {},
+      "description": "区卫代码图谱 — 路由、调用链、影响分析、跨项目代码、模块/类/方法定位"
+    },
+    "resident-health-source-code": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10913/products/ehr/mcp",
+      "headers": {},
+      "description": "区卫源码 — 源码搜索、类/方法/控制器路由/MyBatis映射符号定位"
+    },
+    "resident-health-database": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10911/products/ehr/mcp",
+      "headers": {},
+      "description": "区卫数据库图谱 — 表、字段、读写关系、文档说明"
+    },
+    "sxzz-requirements-history": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10912/products/sxzz/mcp",
+      "headers": {},
+      "description": "SXZZ需求历史 — 历史业务背景、工作项关系、验收条件、附件清单与变更原因"
+    },
+    "sxzz-code-graph": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10910/products/sxzz/mcp",
+      "headers": {},
+      "description": "SXZZ代码图谱 — 路由、调用链、影响分析、跨项目代码、模块/类/方法定位"
+    },
+    "sxzz-source-code": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10913/products/sxzz/mcp",
+      "headers": {},
+      "description": "SXZZ源码 — 源码搜索、类/方法/控制器路由/MyBatis映射符号定位"
+    },
+    "sxzz-database": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10911/products/sxzz/mcp",
+      "headers": {},
+      "description": "SXZZ数据库图谱 — 表、字段、读写关系、文档说明"
+    },
+    "ics-requirements-history": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10912/products/ics/mcp",
+      "headers": {},
+      "description": "ICS需求历史 — 历史业务背景、工作项关系、验收条件、附件清单与变更原因"
+    },
+    "ics-code-graph": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10910/products/ics/mcp",
+      "headers": {},
+      "description": "ICS代码图谱 — 路由、调用链、影响分析、跨项目代码、模块/类/方法定位"
+    },
+    "ics-source-code": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10913/products/ics/mcp",
+      "headers": {},
+      "description": "ICS源码 — 源码搜索、类/方法/控制器路由/MyBatis映射符号定位"
+    },
+    "ics-database": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10911/products/ics/mcp",
+      "headers": {},
+      "description": "ICS数据库图谱 — 表、字段、读写关系、文档说明"
     }
   },
   "skills": {}

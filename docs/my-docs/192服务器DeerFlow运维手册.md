@@ -12,13 +12,125 @@
 
 > **📝 使用说明**：本手册中的所有命令均已登录服务器后的直接可执行命令，无需加 `ssh` 前缀。直接在终端粘贴执行即可。
 
-> **🔐 API 认证说明**：当前部署启用了 BETTER_AUTH 登录认证，`/api/*` 接口（除 `/health`、`/docs` 等）都需要认证，**裸 curl 会返回 `401 Unauthorized`**。本手册所有 curl 命令统一通过内部 token 认证，执行前先取 token：
->
-> ```bash
-> # 从 .env 读取内部 token（每次新开终端会话都需要重新执行）
-> > ```
->
-> 之后手册中的 curl 命令均带 `-H "X-DeerFlow-Internal-Token: $TOKEN"` 使用。
+> **🔐 API 认证说明**：
+> - 当前部署启用 BETTER_AUTH 登录认证，裸 curl `/api/*` 会返回 `401 Unauthorized`（GET 免 CSRF，但内部 token 仍要带）。所有 curl 执行前先取 token（每次新开终端都要重跑）：
+>   ```bash
+>   TOKEN=$(grep '^DEER_FLOW_INTERNAL_AUTH_TOKEN=' /opt/deer-flow/.env | sed 's/.*=//')
+>   ```
+>   之后 curl 统一带 `-H "X-DeerFlow-Internal-Token: $TOKEN"`。
+> - **管理员登录 + CSRF 热重载**（仅 reload skill、不重启容器；`/api/skills/reload` 是 admin-only 的 POST，内部 token 调不动，必须走管理员 session）：
+>   ```bash
+>   ADMIN_EMAIL="${DEER_FLOW_ADMIN_EMAIL:-506391157@qq.com}"; ADMIN_PASS="${DEER_FLOW_ADMIN_PASSWORD:-Admin@123}"
+>   CJ="/tmp/df_reload.cookies"; rm -f "$CJ"
+>   curl -s -c "$CJ" --data-urlencode "username=$ADMIN_EMAIL" --data-urlencode "password=$ADMIN_PASS" http://127.0.0.1:2026/api/v1/auth/login/local
+>   CSRF=$(grep csrf_token "$CJ" | awk '{print $NF}')
+>   curl -s -b "$CJ" -H "X-CSRF-Token: $CSRF" -X POST http://127.0.0.1:2026/api/skills/reload
+>   rm -f "$CJ"
+>   ```
+
+---
+
+## 常用运维命令速查：内存占用 TOP10 进程
+
+### 命令
+
+```bash
+ps -eo pid,user,%mem,rss,cmd --sort=-rss | head -10
+```
+
+### 说明
+
+按物理内存占用（RSS）降序列出前 10 个进程，用于快速定位"谁把内存吃光了"。
+
+| 列 | 含义 |
+|----|------|
+| `PID` | 进程 ID（配合 `kill` / `/proc/{pid}` 使用） |
+| `USER` | 进程属主（注意 root 的进程要 root 权限才能 kill） |
+| `%MEM` | 占物理内存百分比 |
+| `RSS` | 实际占用物理内存，单位 **KB**（看数字时心里除以 1024 换算成 MB） |
+| `CMD` | 完整启动命令（确认是哪个服务/容器进程） |
+
+### 使用场景
+
+- 服务器卡顿/OOM 排查的第一步，先看是哪个进程占用异常。
+- DeerFlow 部署在 Docker 里，如果看到 `python` / `uvicorn`（gateway）、`node`（前端）占用高，对应容器名参考背景信息的容器表。
+
+### 配套命令
+
+```bash
+# 看整机内存（-h 人类可读；看 available 而不是 free，available 才是真正还能用的）
+free -h
+
+# 按容器维度看内存/CPU（DeerFlow 四个容器的实时占用）
+docker stats --no-stream
+
+# 找到占用最高的进程后，确认它属于哪个容器（拿 PID 查 cgroup）
+cat /proc/<PID>/cgroup
+```
+
+### 常见问题
+
+| 现象 | 原因 | 解决 |
+|------|------|------|
+| 某个 `python` 进程 RSS 持续增长 | gateway 内 LangGraph run 或沙箱进程泄漏 | 结合 `docker stats` 定位容器，必要时重启对应容器（见场景一的重建命令） |
+| `ps` 里看不到 Docker 容器内部细节 | 容器进程在宿主机 ps 中只显示入口进程 | 用 `docker exec <容器名> ps -eo pid,%mem,rss,cmd --sort=-rss \| head` 看容器内部 |
+| RSS 之和远大于物理内存 | 共享库被多进程重复计算，RSS 有重复统计 | 属正常现象，判断瓶颈以 `free -h` 的 available 为准 |
+
+---
+
+## 常用运维命令速查：查看路径磁盘占用
+
+### 命令
+
+```bash
+# 1. 看某个路径的总占用（最常用，-s 只显示汇总，-h 人类可读）
+du -sh /opt/deer-flow
+
+# 2. 看该路径下每个子目录各占多少（逐层下钻定位大文件）
+du -h --max-depth=1 /opt/deer-flow | sort -rh | head -15
+
+# 3. 找出该路径下所有超过 100MB 的大文件（-size +100M 可改成 +1G 等）
+find /opt/deer-flow -type f -size +100M -exec ls -lh {} \; 2>/dev/null
+```
+
+### 说明
+
+| 命令 | 用途 |
+|------|------|
+| `du -sh <路径>` | 一个数字看总量，适合先回答"这目录到底多大" |
+| `du -h --max-depth=1 <路径> \| sort -rh` | 按大小降序列出一层子目录，逐级下钻找占用大头 |
+| `find ... -size +100M` | 直接定位大文件本体（du 定位目录，find 定位文件） |
+
+> **⚠️ 注意**：`du` 会真实遍历磁盘统计，对超大目录（几十 GB、文件极多）会跑几十秒甚至几分钟，**不是卡死**，耐心等。加 `2>/dev/null` 可屏蔽无权限文件的报错刷屏。
+
+### 使用场景
+
+- 磁盘告警（`df -h` 使用率超阈值）后，定位是哪个目录膨胀了。
+- DeerFlow 常见的占用大头：`/opt/deer-flow/auto-dev-work/过程文件/`（需求分析报告持续累积）、`.deer-flow/`（thread 目录残留，见记忆中"thread 残留堆积"问题）、Docker 日志与镜像（`/var/lib/docker/`）。
+
+### 配套命令
+
+```bash
+# 看各挂载点磁盘使用率（排查的第一步，先确认是哪个分区满了）
+df -h
+
+# 只看根分区，输出简洁（| 换成你关心的挂载点，如 /data）
+df -h /
+
+# 容器维度：看容器日志文件、镜像、卷各自占用（DeerFlow 专用排查）
+docker system df -v
+
+# 清理 Docker 悬空镜像/构建缓存/已停止容器（释放 /var/lib/docker 空间，业务数据不受影响）
+docker system prune
+```
+
+### 常见问题
+
+| 现象 | 原因 | 解决 |
+|------|------|------|
+| `du -sh` 数字比 `df` 显示的小很多 | 已删除文件仍被进程持有（句柄未释放），空间未真正归还 | `lsof +L1` 找到持有已删文件的进程，重启对应容器/进程释放 |
+| Docker 占用大 | 容器日志无上限疯长、旧镜像堆积 | `docker system df -v` 定位；清理日志或配 `json-file` 日志上限 |
+| `/opt/deer-flow` 下的 bind mount 目录用 du 统计偏小 | 目录同时被挂进容器，实际数据可能在别处（如 `.deer-flow` 指向 `DEER_FLOW_HOME`） | 用 `docker inspect deer-flow-gateway --format '{{json .Mounts}}'` 确认真实落盘位置再统计 |
 
 ---
 
@@ -142,21 +254,13 @@ EOF
 # 方式A：重启 gateway 容器（秒级）
 docker compose --env-file .env -p deer-flow -f docker/docker-compose.yaml -f docker/docker-compose.dood.yaml up -d --force-recreate gateway
 
-# 方式B（修正版）：管理员登录 + CSRF 双重提交触发热重载（不重启容器）
-#   说明：/api/skills/reload 是 admin-only 的 POST，内部 token 调不动，必须走管理员 session
-ADMIN_EMAIL="${DEER_FLOW_ADMIN_EMAIL:-506391157@qq.com}"; ADMIN_PASS="${DEER_FLOW_ADMIN_PASSWORD:-Admin@123}"
-CJ="/tmp/deerflow_reload.cookies"; rm -f "$CJ"
-curl -s -c "$CJ" --data-urlencode "username=$ADMIN_EMAIL" --data-urlencode "password=$ADMIN_PASS" http://127.0.0.1:2026/api/v1/auth/login/local
-CSRF=$(grep csrf_token "$CJ" | awk '{print $NF}')
-curl -s -b "$CJ" -H "X-CSRF-Token: $CSRF" -X POST http://127.0.0.1:2026/api/skills/reload
-rm -f "$CJ"
+# 方式B：管理员登录 + CSRF 双重提交触发热重载（不重启容器）——命令见开头「API 认证说明」统一块
 ```
 
 #### 验证
 
 ```bash
-# 从 API 确认技能是否可见（GET 免 CSRF，用内部 token 即可）
-TOKEN=$(grep '^DEER_FLOW_INTERNAL_AUTH_TOKEN=' /opt/deer-flow/.env | sed 's/.*=//')
+# 从 API 确认技能是否可见（TOKEN 见开头认证说明）
 curl -s -H "X-DeerFlow-Internal-Token: $TOKEN" http://127.0.0.1:2026/api/skills | python3 -m json.tool | grep '"name"'
 ```
 
@@ -418,14 +522,7 @@ rm -rf /opt/deer-flow/skills/public/要删除的skill名
 # 2. 方式A：重启 gateway（秒级）
 docker compose --env-file .env -p deer-flow -f docker/docker-compose.yaml -f docker/docker-compose.dood.yaml up -d --force-recreate gateway
 
-# 方式B（修正版）：管理员登录 + CSRF 双重提交触发热重载（不重启容器）
-#   说明：/api/skills/reload 是 admin-only 的 POST，内部 token 调不动，必须走管理员 session
-ADMIN_EMAIL="${DEER_FLOW_ADMIN_EMAIL:-506391157@qq.com}"; ADMIN_PASS="${DEER_FLOW_ADMIN_PASSWORD:-Admin@123}"
-CJ="/tmp/deerflow_reload.cookies"; rm -f "$CJ"
-curl -s -c "$CJ" --data-urlencode "username=$ADMIN_EMAIL" --data-urlencode "password=$ADMIN_PASS" http://127.0.0.1:2026/api/v1/auth/login/local
-CSRF=$(grep csrf_token "$CJ" | awk '{print $NF}')
-curl -s -b "$CJ" -H "X-CSRF-Token: $CSRF" -X POST http://127.0.0.1:2026/api/skills/reload
-rm -f "$CJ"
+# 方式B（修正版）：管理员登录 + CSRF 双重提交触发热重载（不重启容器）——命令见开头「API 认证说明」统一块
 ```
 
 #### 验证
@@ -460,14 +557,7 @@ docker exec deer-flow-gateway rm -rf /app/backend/.deer-flow/users/你的user_id
 刷新前端 skill 列表页面，该 skill 应变为"内置"分类。如仍不更新，可热重载：
 
 ```bash
-# 方式B（修正版）：管理员登录 + CSRF 双重提交触发热重载（不重启容器）
-#   说明：/api/skills/reload 是 admin-only 的 POST，内部 token 调不动，必须走管理员 session
-ADMIN_EMAIL="${DEER_FLOW_ADMIN_EMAIL:-506391157@qq.com}"; ADMIN_PASS="${DEER_FLOW_ADMIN_PASSWORD:-Admin@123}"
-CJ="/tmp/deerflow_reload.cookies"; rm -f "$CJ"
-curl -s -c "$CJ" --data-urlencode "username=$ADMIN_EMAIL" --data-urlencode "password=$ADMIN_PASS" http://127.0.0.1:2026/api/v1/auth/login/local
-CSRF=$(grep csrf_token "$CJ" | awk '{print $NF}')
-curl -s -b "$CJ" -H "X-CSRF-Token: $CSRF" -X POST http://127.0.0.1:2026/api/skills/reload
-rm -f "$CJ"
+# 方式B（修正版）：管理员登录 + CSRF 双重提交触发热重载（不重启容器）——命令见开头「API 认证说明」统一块
 ```
 
 ---
@@ -539,6 +629,35 @@ print(f'\nTotal steps: {len(lines)}')
 "
 ```
 
+### 5. 常见报错定位（deerflow-service）
+
+> 完整速查见 `deerflow-service/TROUBLESHOOT.md`，这里列最高频的两种。
+
+**① `redis.exceptions.AuthenticationError: Authentication required`**（轮询 `GET /api/v1/analysis/{task_id}` 时 500）
+
+- 根因（已实锤 2026-09-01）：deerflow-service 的 `REDIS_URL` 缺了 `:密码@` 段，裸连 Redis 被 `--requirepass` 拒绝。Redis 要密码 `92e3ffa5db03aca31594021ddbf3c466`，但容器实际 env 是 `redis://host.docker.internal:26380/0`（无密码）→ 服务器 compose 落后于本地 / 被手动改丢密码。
+- 排查：
+  ```bash
+  docker inspect deer-flow-redis --format '{{json .Config.Cmd}}'          # Redis 实际密码
+  docker exec deer-flow-service env | grep REDIS_URL                      # service 实际 REDIS_URL 密码
+  docker exec deer-flow-redis redis-cli -a '92e3ffa5db03aca31594021ddbf3c466' ping   # 验证密码
+  ```
+- 修复（精确 sed 补密码 + 重建，改前先备份）：
+  ```bash
+  cd /opt/deer-flow
+  cp docker/docker-compose.yaml docker/docker-compose.yaml.bak.$(date +%Y%m%d_%H%M%S)
+  sed -i 's|REDIS_URL=redis://host.docker.internal:26380/0|REDIS_URL=redis://:92e3ffa5db03aca31594021ddbf3c466@host.docker.internal:26380/0|' docker/docker-compose.yaml
+  grep -n 'REDIS_URL' docker/docker-compose.yaml                            # 确认已带密码
+  docker compose --env-file .env -p deer-flow -f docker/docker-compose.yaml -f docker/docker-compose.dood.yaml up -d --force-recreate deerflow-service
+  docker exec deer-flow-service env | grep REDIS_URL                       # 验证容器 env 已带密码
+  ```
+  > ⚠️ 若 grep 出的 REDIS_URL 不是 `redis://host.docker.internal:26380/0` 这种硬编码（比如 `${REDIS_URL}` 从 .env 读），先别 sed，改成去对应 .env 里补密码。
+
+**② `redis.exceptions.ConnectionError: Error -2 ... host.docker.internal:26380`**
+
+- 根因：`host.docker.internal` 是 Docker Desktop 专用，Linux 不认，需 `extra_hosts`（compose 已配置，若手动改丢则报此错）。
+- 修复：确认 deerflow-service 段有 `extra_hosts: ["host.docker.internal:host-gateway"]` 后重建容器。
+
 ---
 
 ## 场景八：修改 deerflow-service 源码并生效
@@ -601,102 +720,11 @@ docker logs deer-flow-service --tail 10
 
 ### 操作步骤
 
-#### 1. 将脚本放到服务器（本地源文件：`scripts/pull-reg-auto-req-analysis.sh`）
+#### 1. 脚本已就位（无需重建）
 
-可直接 scp 上传，或服务器上直接创建：
+拉取脚本随本仓库提交在 `scripts/pull-reg-auto-req-analysis.sh`，服务器上对应 `/opt/deer-flow/scripts/pull-reg-auto-req-analysis.sh`（`chmod +x` 已就绪）。脚本行为：自动判断增量 `git pull` / 全量 `clone` 两种模式，失败自动回滚，**绝不向 TFS 推送**。
 
-```bash
-cat > /opt/deer-flow/scripts/pull-reg-auto-req-analysis.sh << 'SCRIPT_EOF'
-#!/usr/bin/env bash
-# pull-reg-auto-req-analysis.sh
-# 从 TFS 仓库拉取 reg-auto-req-analysis skill 到 DeerFlow 服务器（纯拉取，绝不推送）
-#
-# 两种模式自动判断：
-#   - 目标目录已是 git 仓库（remote 指向 TFS）→ 增量 pull（日常更新走这里）
-#   - 目标目录不存在 / 不是 git 仓库 / remote 不对 → 挪走旧目录 + 全量 clone（首次或重置）
-#
-# 用法（二选一，推荐方式 1，PAT 不进 shell history）：
-#   1. export TFS_PAT="你的PAT" && bash pull-reg-auto-req-analysis.sh
-#   2. bash pull-reg-auto-req-analysis.sh "你的PAT"
-set -uo pipefail
-
-SKILL_DIR="/opt/deer-flow/skills/public/reg-auto-req-analysis"
-REPO_URL="http://tfs2018-web.winning.com.cn:8080/tfs/WinCode/Skill/_git/reg-auto-req-analysis"
-
-# ---- PAT 来源：环境变量优先，其次脚本参数 ----
-PAT="${TFS_PAT:-}"
-[ -z "$PAT" ] && [ $# -ge 1 ] && PAT="$1"
-if [ -z "$PAT" ]; then
-  echo "错误：未提供 PAT。用法：export TFS_PAT=xxx 后执行，或 bash 本脚本 \"PAT\""
-  exit 1
-fi
-
-# TFS 2018 basic auth：直接注入 Authorization 头
-# （credential store 的空用户名条目在 Linux git 上不兼容，会回退交互提示，故不用）
-AUTH_B64="$(printf '%s' ":$PAT" | base64 -w0)"
-gitc() { git -c http.extraHeader="AUTHORIZATION: Basic ${AUTH_B64}" "$@"; }
-
-echo "===== [1/5] 探测远程仓库 ====="
-if ! gitc ls-remote "$REPO_URL" >/dev/null 2>&1; then
-  echo "  ✘ 远程仓库不可访问（认证失败或仓库不存在），中止"
-  exit 1
-fi
-echo "  ✔ 远程仓库可访问"
-
-echo "===== [2/5] 判断本地仓库状态 ====="
-CUR_REMOTE="$(git -C "$SKILL_DIR" remote get-url origin 2>/dev/null || true)"
-if [ -d "$SKILL_DIR/.git" ] && [ "$CUR_REMOTE" = "$REPO_URL" ]; then
-  echo "  ✔ 已是 TFS git 仓库 → 增量 pull 模式"
-  echo "===== [3/5] git pull ====="
-  cd "$SKILL_DIR" || exit 1
-  if gitc pull origin master; then
-    echo "===== 完成 ====="
-    git log --oneline -3
-    echo "（本脚本不执行任何 push，TFS 仓库不会被改动）"
-    exit 0
-  else
-    echo "  ✘ pull 失败：可能本地有未提交修改，请先检查: git -C $SKILL_DIR status"
-    exit 1
-  fi
-fi
-if [ -d "$SKILL_DIR" ]; then
-  echo "  ⚠ 目录存在但不是 TFS 仓库（remote=${CUR_REMOTE:-无}）→ 全量 clone 模式"
-else
-  echo "  - 目录不存在 → 全量 clone 模式"
-fi
-
-TS="$(date +%Y%m%d_%H%M%S)"
-BACKUP_DIR="${SKILL_DIR}.old.${TS}"
-
-echo "===== [4/5] 挪走现有目录 ====="
-if [ -d "$SKILL_DIR" ]; then
-  mv "$SKILL_DIR" "$BACKUP_DIR"
-  echo "  ✔ 已挪走: $BACKUP_DIR"
-fi
-
-echo "===== [5/5] clone 远程仓库 ====="
-if ! gitc clone "$REPO_URL" "$SKILL_DIR"; then
-  echo "  ✘ clone 失败"
-  if [ -d "$BACKUP_DIR" ]; then
-    rm -rf "$SKILL_DIR" 2>/dev/null
-    mv "$BACKUP_DIR" "$SKILL_DIR"
-    echo "  ↺ 已回滚到原目录"
-  fi
-  exit 1
-fi
-echo "  ✔ clone 完成"
-
-echo "===== 验证 ====="
-git -C "$SKILL_DIR" log --oneline -5
-echo "  remote: $(git -C "$SKILL_DIR" remote get-url origin 2>/dev/null)"
-echo "  顶层条目: $(ls "$SKILL_DIR" | tr '\n' ' ')"
-echo ""
-echo "完成。确认无误后可删除备份目录："
-[ -d "$BACKUP_DIR" ] && echo "  rm -rf \"$BACKUP_DIR\""
-echo "（本脚本不执行任何 push，TFS 仓库不会被改动）"
-SCRIPT_EOF
-chmod +x /opt/deer-flow/scripts/pull-reg-auto-req-analysis.sh
-```
+> 本手册不再内联脚本全文，以 git 仓库中的 `scripts/pull-reg-auto-req-analysis.sh` 为准。改脚本逻辑请直接改仓库文件后同步到服务器。
 
 #### 2. 执行拉取
 
@@ -714,7 +742,7 @@ unset TFS_PAT
 | 目录已是 TFS git 仓库（日常增量更新） | 直接 `git pull`，不挪不删 |
 | 目录不存在 / 不是仓库 / remote 不对（首次或重置） | 挪走旧目录为 `.old.时间戳` + 全量 clone，失败自动回滚 |
 
-> **🔥 已增强**：脚本在 pull / clone 成功后**会自动热加载**——以管理员身份登录（`DEER_FLOW_ADMIN_EMAIL` / `DEER_FLOW_ADMIN_PASSWORD`，默认 `506391157@qq.com` / `Admin@123`）拿到 session + CSRF 后，调用 `POST http://127.0.0.1:2026/api/skills/reload` 让 Gateway 重新扫描最新 skill，无需手动重启容器。若登录失败或接口异常，脚本仅提示 skill 文件已就位、不自动重启 gateway，留待 Gateway 下次自然重载或人工处理。步骤 1 内嵌脚本已同步此逻辑；若按手册重建该文件，请确保包含此热加载步骤。
+> **🔥 已增强**：脚本在 pull / clone 成功后**会自动热加载**——以管理员身份登录（`DEER_FLOW_ADMIN_EMAIL` / `DEER_FLOW_ADMIN_PASSWORD`，默认 `506391157@qq.com` / `Admin@123`）拿到 session + CSRF 后，调用 `POST http://127.0.0.1:2026/api/skills/reload` 让 Gateway 重新扫描最新 skill，无需手动重启容器。若登录失败或接口异常，脚本仅提示 skill 文件已就位、不自动重启 gateway，留待 Gateway 下次自然重载或人工处理。
 #### 3. 验证
 
 ```bash
@@ -744,6 +772,81 @@ rm -rf /opt/deer-flow/skills/public/reg-auto-req-analysis.old.*
 | 拉下来缺文件（如无 `runtime/`） | TFS 仓库版本落后 | 对比 `.old.*` 备份，确认以哪边为准；仓库内容以 TFS 提交为准 |
 
 > **注意**：`_lib/tfs/tfs-config.json`（含 PAT 的运行时配置）**不进仓库**（`.gitignore` 排除，仅提交 template），拉取后不会出现在目录中。skill 实际运行用的配置在 `/opt/deer-flow/auto-dev-work/skills/` 副本中，不受 public 目录更新影响。
+
+---
+
+## 场景十：查看当前是否有正在执行的 run
+
+### 背景
+
+一个需求分析任务 = Gateway 里的一个 LangGraph run，run 记录存两处：
+
+| 位置 | 路径 / 说明 |
+|------|------|
+| **sqlite `runs` 表** | 宿主机 `/opt/deer-flow/backend/.deer-flow/data/deerflow.db`，run 创建时即写入一条 `running` 记录 |
+| **Gateway 内存（RunManager）** | 进程内缓存，API 查询返回「内存 + sqlite」并集，状态最准 |
+
+需求分析的 thread_id 格式固定为 `{collection}-{workItemId}`（如 `WN_Data_Platform-242042`）。
+
+### 方法一：全局查 sqlite（不知道 thread_id 时用）
+
+```bash
+# 查所有正在执行的 run（无输出 = 当前没有在跑的 run，属正常现象不是报错）
+sqlite3 /opt/deer-flow/backend/.deer-flow/data/deerflow.db \
+  "SELECT thread_id, run_id, status, datetime(created_at,'unixepoch','localtime') FROM runs WHERE status='running' ORDER BY created_at DESC;"
+
+# 验证表是活的：看 status 分布（只有 idle/success/error、没有 running 行 → 实锤没任务在跑）
+sqlite3 /opt/deer-flow/backend/.deer-flow/data/deerflow.db \
+  "SELECT status, COUNT(*) FROM runs GROUP BY status;"
+
+# 看最近 10 条 run（确认最近一次分析啥时候跑的、结果如何）
+sqlite3 /opt/deer-flow/backend/.deer-flow/data/deerflow.db \
+  "SELECT thread_id, run_id, status, datetime(created_at,'unixepoch','localtime') FROM runs ORDER BY created_at DESC LIMIT 10;"
+```
+
+### 方法二：API 按 thread 查（已知 thread_id，结果最准）
+
+```bash
+TOKEN=$(grep '^DEER_FLOW_INTERNAL_AUTH_TOKEN=' /opt/deer-flow/.env | sed 's/.*=//')
+curl -sS "http://127.0.0.1:2026/api/threads/WN_Data_Platform-242042/runs" \
+  -H "X-DeerFlow-Internal-Token: $TOKEN" \
+  -H "X-DeerFlow-Owner-User-Id: tfs-buddy" | python3 -m json.tool
+```
+
+看返回里每条 run 的 `status` 字段：`running` = 正在执行；其余常见值 `idle` / `success` / `error`。GET 请求免 CSRF，直接 curl 即可。**owner 头 `X-DeerFlow-Owner-User-Id: tfs-buddy` 千万别漏**，漏了报的是 `Thread not found` 而不是 401，容易误判。
+
+### 判断标准
+
+| sqlite 结果 | API 结果 | 结论 |
+|------------|---------|------|
+| 无 running | — | 没有任务在跑（run 创建时即落 sqlite，空表 ≈ 真的没有） |
+| 有 running | 也是 running | 真的在跑 |
+| 有 running | 不是 running（如 success/error） | **僵尸记录**：gateway 重启留下的残留，以 API 为准 |
+
+### 常见问题
+
+| 现象 | 原因 | 解决 |
+|------|------|------|
+| sqlite 查询无输出 | 查询成功但无 `running` 记录 = 当前没有在跑的 run | 正常现象，不是报错 |
+| API 返回 `Thread not found` 而非 401 | 漏了 owner 头 | 补 `-H "X-DeerFlow-Owner-User-Id: tfs-buddy"` |
+| sqlite 有 running 但任务实际早结束 | gateway 重启留下的僵尸状态（内存副本已清，sqlite 状态未刷回） | 用方法二 API 复核；确认无用后重启 gateway 清理内存 |
+
+### 配套：重启 gateway（清理内存缓存 / 让挂载配置生效）
+
+> **⚠️ 重启会杀掉当前所有正在执行的 run 和 SSE 连接**——先按上文确认没有 `running` 的 run 再操作。
+
+```bash
+# 情况 A：改了 config.yaml / agents/*/config.yaml / SOUL.md 等卷挂载文件 → restart 即可（秒级）
+docker restart deer-flow-gateway
+
+# 情况 B：改了 .env 或 docker-compose.yaml → 必须重建容器（docker restart 不会重读 env_file，改了也白改）
+docker compose --env-file .env -p deer-flow -f docker/docker-compose.yaml -f docker/docker-compose.dood.yaml up -d --force-recreate gateway
+
+# 验证已启动
+docker ps | grep gateway    # STATUS 显示 Up X seconds 即正常
+```
+
+> Gateway 冷启动要加载 agent/skill 配置，起来后第一次请求慢个几秒属正常。
 
 ---
 

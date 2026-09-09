@@ -9,6 +9,7 @@ import logging
 from langchain.tools import tool
 
 from deerflow.sandbox.tools import ensure_sandbox_initialized
+from deerflow.runtime.secret_context import extract_request_secrets
 from deerflow.tools.types import Runtime
 
 logger = logging.getLogger(__name__)
@@ -16,8 +17,19 @@ logger = logging.getLogger(__name__)
 SKILL_ROOT = "/mnt/skills/public/reg-auto-req-analysis"
 
 
-def _run(runtime: Runtime, cmd: str, timeout: int = 300) -> str:
-    """在沙箱中执行命令并返回输出。"""
+def _run(runtime: Runtime, cmd: str, timeout: int = 300, use_pat: bool = False) -> str:
+    """在沙箱中执行命令并返回输出。
+
+    use_pat=True 时，会从调用方 request-scoped secrets（context.secrets）读取
+    TFS_PAT，并追加 `--pat <token>` 到命令尾部。这把 PAT 直传到 tfs_client /
+    pipeline 子进程，优先级 `--pat > $TFS_PAT > tfs.pat`，不依赖 LLM 拼参数、
+    也不依赖 tfs-config.json 的全局兜底 PAT。
+    """
+    if use_pat:
+        _secrets = extract_request_secrets(getattr(runtime, "context", None))
+        _pat = _secrets.get("TFS_PAT")
+        if _pat:
+            cmd += f" --pat {_pat}"
     sandbox = ensure_sandbox_initialized(runtime)
     try:
         output = sandbox.execute_command(cmd, timeout=timeout)
@@ -33,7 +45,7 @@ def _run(runtime: Runtime, cmd: str, timeout: int = 300) -> str:
 def tfs_precheck(runtime: Runtime, config_path: str = "/mnt/user-data/workspace/tfs-config.json") -> str:
     """TFS connectivity and authentication self-check."""
     cmd = f"python3 {SKILL_ROOT}/_lib/tfs/tfs_client.py precheck --config {config_path} 2>&1"
-    return _run(runtime, cmd)
+    return _run(runtime, cmd, use_pat=True)
 
 
 @tool("tfs_fetch")
@@ -42,7 +54,7 @@ def tfs_fetch(runtime: Runtime, work_item_id: int,
     """Fetch a TFS work item. Auto-creates workspace directories."""
     _run(runtime, f"mkdir -p /mnt/user-data/workspace/过程文件/{work_item_id} 2>/dev/null")
     cmd = f"python3 {SKILL_ROOT}/_lib/tfs/tfs_client.py fetch {work_item_id} --config {config_path} 2>&1"
-    return _run(runtime, cmd)
+    return _run(runtime, cmd, use_pat=True)
 
 
 @tool("tfs_download_attachments")
@@ -60,7 +72,7 @@ def tfs_download_attachments(runtime: Runtime, work_item_id: int,
     _run(runtime, f"mkdir -p {output_dir} 2>/dev/null")
     cmd = (f"python3 {SKILL_ROOT}/_lib/tfs/tfs_client.py download-attachments {work_item_id} "
            f"--output-dir {output_dir} --include-external --config {config_path} 2>&1")
-    return _run(runtime, cmd)
+    return _run(runtime, cmd, use_pat=True, timeout=300)
 
 
 @tool("tfs_list_iterations")
@@ -95,7 +107,7 @@ def tfs_add_tag(runtime: Runtime, work_item_id: int, tag: str,
     if dry_run:
         cmd += " --dry-run"
     cmd += " 2>&1"
-    return _run(runtime, cmd)
+    return _run(runtime, cmd, use_pat=True)
 
 
 # ── pipeline.py ────────────────────────────────────────────────
@@ -124,7 +136,7 @@ def pipeline_apply(runtime: Runtime, plan_path: str,
     if execute:
         cmd += " --execute"
     cmd += " 2>&1"
-    return _run(runtime, cmd)
+    return _run(runtime, cmd, use_pat=True)
 
 
 # ── attachment_converter.py ────────────────────────────────────

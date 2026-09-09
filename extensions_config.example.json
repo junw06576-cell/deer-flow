@@ -52,6 +52,400 @@
           }
         }
       }
+    },
+    "cloudhis-requirements-history": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.192:4751/mcp",
+      "headers": {},
+      "description": "TFS需求历史 — 历史业务背景、工作项关系、验收条件、附件清单与变更原因",
+      "routing": {
+        "mode": "prefer",
+        "priority": 80,
+        "keywords": [
+          "需求历史",
+          "历史需求",
+          "验收条件",
+          "工作项关系",
+          "变更原因"
+        ]
+      }
+    },
+    "cloudhis-code-graph": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.192:4747/api/mcp",
+      "headers": {},
+      "description": "代码图谱 — 路由、调用链、影响分析、跨项目代码、模块/类/方法定位",
+      "routing": {
+        "mode": "prefer",
+        "priority": 70,
+        "keywords": [
+          "代码",
+          "路由",
+          "调用链",
+          "模块",
+          "接口",
+          "类",
+          "方法"
+        ]
+      }
+    },
+    "cloudhis-database": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.192:4748/mcp",
+      "headers": {},
+      "description": "数据库图谱 — 表、字段、读写关系、文档说明",
+      "routing": {
+        "mode": "prefer",
+        "priority": 60,
+        "keywords": [
+          "数据库",
+          "表",
+          "字段",
+          "表结构",
+          "数据模型"
+        ]
+      }
+    },
+    "cloudhis-source-code": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.192:4752/mcp",
+      "headers": {},
+      "description": "CloudHIS源码 — 源码搜索、类/方法/控制器路由/MyBatis映射符号定位",
+      "routing": {
+        "mode": "prefer",
+        "priority": 65,
+        "keywords": [
+          "源码",
+          "代码定位",
+          "方法实现",
+          "控制器",
+          "MyBatis映射"
+        ]
+      }
+    },
+    "hms-requirements-history": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10912/products/hms/mcp",
+      "headers": {},
+      "description": "HMS需求历史 — 历史业务背景、工作项关系、验收条件、附件清单与变更原因",
+      "routing": {
+        "mode": "prefer",
+        "priority": 75,
+        "keywords": [
+          "hms",
+          "医院管理系统",
+          "hms需求",
+          "hms历史",
+          "hms验收",
+          "hms工作项",
+          "hms变更"
+        ]
+      }
+    },
+    "hms-code-graph": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10910/products/hms/mcp",
+      "headers": {},
+      "description": "HMS代码图谱 — 路由、调用链、影响分析、跨项目代码、模块/类/方法定位",
+      "routing": {
+        "mode": "prefer",
+        "priority": 68,
+        "keywords": [
+          "hms",
+          "医院管理系统",
+          "hms代码",
+          "hms路由",
+          "hms调用链",
+          "hms接口",
+          "hms模块",
+          "hms类",
+          "hms方法"
+        ]
+      }
+    },
+    "hms-source-code": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10913/products/hms/mcp",
+      "headers": {},
+      "description": "HMS源码 — 源码搜索、类/方法/控制器路由/MyBatis映射符号定位",
+      "routing": {
+        "mode": "prefer",
+        "priority": 63,
+        "keywords": [
+          "hms",
+          "医院管理系统",
+          "hms源码",
+          "hms代码定位",
+          "hms方法实现",
+          "hms控制器",
+          "hms映射"
+        ]
+      }
+    },
+    "hms-database": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10911/products/hms/mcp",
+      "headers": {},
+      "description": "HMS数据库图谱 — 表、字段、读写关系、文档说明",
+      "routing": {
+        "mode": "prefer",
+        "priority": 58,
+        "keywords": [
+          "hms",
+          "医院管理系统",
+          "hms数据库",
+          "hms表",
+          "hms字段",
+          "hms表结构",
+          "hms数据模型"
+        ]
+      }
+    },
+    "sphs-requirements-history": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10912/products/sphs/mcp",
+      "headers": {},
+      "description": "SPHS需求历史 — 历史业务背景、工作项关系、验收条件、附件清单与变更原因",
+      "routing": {
+        "mode": "prefer",
+        "priority": 75,
+        "keywords": [
+          "sphs",
+          "sphs需求",
+          "sphs历史",
+          "sphs验收",
+          "sphs工作项",
+          "sphs变更"
+        ]
+      }
+    },
+    "sphs-code-graph": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10910/products/sphs/mcp",
+      "headers": {},
+      "description": "SPHS代码图谱 — 路由、调用链、影响分析、跨项目代码、模块/类/方法定位",
+      "routing": {
+        "mode": "prefer",
+        "priority": 68,
+        "keywords": [
+          "sphs",
+          "sphs代码",
+          "sphs路由",
+          "sphs调用链",
+          "sphs接口",
+          "sphs模块",
+          "sphs类",
+          "sphs方法"
+        ]
+      }
+    },
+    "sphs-source-code": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10913/products/sphs/mcp",
+      "headers": {},
+      "description": "SPHS源码 — 源码搜索、类/方法/控制器路由/MyBatis映射符号定位",
+      "routing": {
+        "mode": "prefer",
+        "priority": 63,
+        "keywords": [
+          "sphs",
+          "sphs源码",
+          "sphs代码定位",
+          "sphs方法实现",
+          "sphs控制器",
+          "sphs映射"
+        ]
+      }
+    },
+    "sphs-database": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10911/products/sphs/mcp",
+      "headers": {},
+      "description": "SPHS数据库图谱 — 表、字段、读写关系、文档说明",
+      "routing": {
+        "mode": "prefer",
+        "priority": 58,
+        "keywords": [
+          "sphs",
+          "sphs数据库",
+          "sphs表",
+          "sphs字段",
+          "sphs表结构",
+          "sphs数据模型"
+        ]
+      }
+    },
+    "itr-requirements-history": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10912/products/itr/mcp",
+      "headers": {},
+      "description": "ITR需求历史 — 历史业务背景、工作项关系、验收条件、附件清单与变更原因",
+      "routing": {
+        "mode": "prefer",
+        "priority": 75,
+        "keywords": [
+          "itr",
+          "itr需求",
+          "itr历史",
+          "itr验收",
+          "itr工作项",
+          "itr变更"
+        ]
+      }
+    },
+    "itr-code-graph": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10910/products/itr/mcp",
+      "headers": {},
+      "description": "ITR代码图谱 — 路由、调用链、影响分析、跨项目代码、模块/类/方法定位",
+      "routing": {
+        "mode": "prefer",
+        "priority": 68,
+        "keywords": [
+          "itr",
+          "itr代码",
+          "itr路由",
+          "itr调用链",
+          "itr接口",
+          "itr模块",
+          "itr类",
+          "itr方法"
+        ]
+      }
+    },
+    "itr-source-code": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10913/products/itr/mcp",
+      "headers": {},
+      "description": "ITR源码 — 源码搜索、类/方法/控制器路由/MyBatis映射符号定位",
+      "routing": {
+        "mode": "prefer",
+        "priority": 63,
+        "keywords": [
+          "itr",
+          "itr源码",
+          "itr代码定位",
+          "itr方法实现",
+          "itr控制器",
+          "itr映射"
+        ]
+      }
+    },
+    "itr-database": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10911/products/itr/mcp",
+      "headers": {},
+      "description": "ITR数据库图谱 — 表、字段、读写关系、文档说明",
+      "routing": {
+        "mode": "prefer",
+        "priority": 58,
+        "keywords": [
+          "itr",
+          "itr数据库",
+          "itr表",
+          "itr字段",
+          "itr表结构",
+          "itr数据模型"
+        ]
+      }
+    },
+    "ehr-requirements-history": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10912/products/ehr/mcp",
+      "headers": {},
+      "description": "EHR需求历史 — 历史业务背景、工作项关系、验收条件、附件清单与变更原因",
+      "routing": {
+        "mode": "prefer",
+        "priority": 75,
+        "keywords": [
+          "ehr",
+          "电子病历",
+          "ehr需求",
+          "ehr历史",
+          "ehr验收",
+          "ehr工作项",
+          "ehr变更"
+        ]
+      }
+    },
+    "ehr-code-graph": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10910/products/ehr/mcp",
+      "headers": {},
+      "description": "EHR代码图谱 — 路由、调用链、影响分析、跨项目代码、模块/类/方法定位",
+      "routing": {
+        "mode": "prefer",
+        "priority": 68,
+        "keywords": [
+          "ehr",
+          "电子病历",
+          "ehr代码",
+          "ehr路由",
+          "ehr调用链",
+          "ehr接口",
+          "ehr模块",
+          "ehr类",
+          "ehr方法"
+        ]
+      }
+    },
+    "ehr-source-code": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10913/products/ehr/mcp",
+      "headers": {},
+      "description": "EHR源码 — 源码搜索、类/方法/控制器路由/MyBatis映射符号定位",
+      "routing": {
+        "mode": "prefer",
+        "priority": 63,
+        "keywords": [
+          "ehr",
+          "电子病历",
+          "ehr源码",
+          "ehr代码定位",
+          "ehr方法实现",
+          "ehr控制器",
+          "ehr映射"
+        ]
+      }
+    },
+    "ehr-database": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10911/products/ehr/mcp",
+      "headers": {},
+      "description": "EHR数据库图谱 — 表、字段、读写关系、文档说明",
+      "routing": {
+        "mode": "prefer",
+        "priority": 58,
+        "keywords": [
+          "ehr",
+          "电子病历",
+          "ehr数据库",
+          "ehr表",
+          "ehr字段",
+          "ehr表结构",
+          "ehr数据模型"
+        ]
+      }
     }
   },
   "skills": {}
