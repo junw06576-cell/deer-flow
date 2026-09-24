@@ -23,7 +23,7 @@ models:
 - name: qwen3.7-plus
   display_name: Wincode / qwen3.7-plus
   use: langchain_openai:ChatOpenAI
-  model: qwen3.7-plus
+  model: deepseek-v4-flash
   api_key: $OPENAI_API_KEY
   base_url: $OPENAI_BASE_URL
   timeout: 600.0
@@ -33,7 +33,8 @@ models:
   supports_thinking: false
   when_thinking_disabled:
     extra_body:
-      reasoning_effort: "low"
+      thinking:
+        enabled: false
 tool_groups:
 - name: web
 - name: file:read
@@ -168,10 +169,10 @@ summarization:
   model_name: null
   trigger:
   - type: tokens
-    value: 32000
+    value: 128000
   keep:
     type: messages
-    value: 10
+    value: 100
   trim_tokens_to_summarize: 15564
   summary_prompt: null
   skill_file_read_tool_names:
@@ -180,7 +181,7 @@ summarization:
   - view
   - cat
 memory:
-  enabled: true
+  enabled: false
   injection_enabled: true
   shutdown_flush_timeout_seconds: 30.0
   manager_class: deermem
