@@ -542,6 +542,8 @@ Skills 是 DeerFlow 能做“几乎任何事”的关键。
 
 Skills 采用按需渐进加载，不会一次性把所有内容都塞进上下文。只有任务确实需要时才加载，这样能把上下文窗口控制得更干净，也更适合对 token 比较敏感的模型。
 
+`regional-llm-wiki` Agent 只通过 Gateway 专属只读工具读取已发布快照。读取器兼容历史清单 schema 1 和当前 schema 2；搜索会返回不可变的 `agent_release_id`，读取页面和证据时必须复用它，避免发布切换时混用两个快照。schema 2 中的 `release_id` 标识 Wiki/证据版本，不是 Agent 导出目录名。
+
 通过 Gateway 安装 `.skill` 压缩包时，DeerFlow 会接受标准的可选 frontmatter 元数据，比如 `version`、`author`、`compatibility`，不会把本来合法的外部 skill 拒之门外。
 
 Tools 也是同样的思路。DeerFlow 自带一组核心工具：网页搜索、网页抓取、网页渲染截图、文件操作、bash 执行；同时也支持通过 MCP Server 和 Python 函数扩展自定义工具。你可以替换任何一项，也可以继续往里加。

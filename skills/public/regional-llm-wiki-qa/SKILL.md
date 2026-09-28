@@ -16,7 +16,7 @@ allowed-tools:
 
 ## 不可违反的边界
 
-1. 每个知识问题的第一项检索必须调用 `search_llm_wiki`；不得编造 `release_id`、`page_id`、`evidence_id` 或定位单元。
+1. 每个知识问题的第一项检索必须调用 `search_llm_wiki`；不得编造 `agent_release_id`、`page_id`、`evidence_id` 或定位单元。
 2. 只能使用本轮工具实际返回的 LLM Wiki 页面和证据快照作为事实依据。
 3. 禁止使用 Web、旧 `/mnt/knowledge`、其他知识库、历史消息、会话摘要、持久化 Memory 或模型记忆补充事实。
 4. 不调用 TFS。工具返回 TFS 链接时，仅在用户确有原件查看需求时给出该链接。
@@ -42,9 +42,9 @@ UNVERIFIED
 
 ## 工作流
 
-1. 用用户问题或精简关键词调用 `search_llm_wiki`，通常最多取 1～3 个候选页面。
-2. 读取最相关的 `read_llm_wiki_page` 页面；先回答综合结论、适用范围、有效期、冲突和缺口。
-3. 仅当用户要求精确核验，或页面明确提示需核验时，使用该页面返回的 `evidence_id` 调用 `read_llm_wiki_evidence`。如果用户给出了条款或表格目标，优先使用页面声明的对应定位单元。
+1. 用用户问题或精简关键词调用 `search_llm_wiki`，通常最多取 1～3 个候选页面。记录返回的 `agent_release_id`；本轮后续读取都使用该 ID。
+2. 读取最相关的 `read_llm_wiki_page` 页面，并传入该 `agent_release_id`；先回答综合结论、适用范围、有效期、冲突和缺口。
+3. 仅当用户要求精确核验，或页面明确提示需核验时，使用该页面返回的 `evidence_id` 和同一个 `agent_release_id` 调用 `read_llm_wiki_evidence`。如果用户给出了条款或表格目标，优先使用页面声明的对应定位单元。
 4. 不把多页内容拼成原文没有表达的新结论；发现冲突时并列说明，不自行裁决。
 5. 答案末尾列出本轮实际读取的来源：
 
@@ -55,6 +55,8 @@ UNVERIFIED
 ```
 
 只有实际读取过证据快照时才列第二项。需要原件时，在来源后增加工具返回的 TFS 链接。
+
+`agent_release_id` 标识不可变的 Agent 导出快照；不要用 Wiki 的 `release_id` 代替。旧会话可能仍传入 `release_id` 参数，读取工具会将其作为兼容别名处理，但新调用必须使用 `agent_release_id`。
 
 ## 信息不足时补问
 

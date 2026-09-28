@@ -1,6 +1,6 @@
 # 区域 LLM Wiki 专属 Agent：真实访问隔离设计
 
-> 状态：**待审核，未实施**  
+> 状态：**已审核并合并 PR #4；schema 2 消费兼容正在补强，影子部署待验收**
 > 目标：在不改变现有 Agent、`/mnt/knowledge`、产品知识库 Skill 或 DeerFlow 问答链路的前提下，新增一个只能读取已发布 LLM Wiki 与其受限证据快照的专属 Agent。
 
 ## 1. 结论
@@ -108,17 +108,17 @@ Gateway 专属只读发布快照挂载
 
 ### 5.1 为什么不能把 `current` 单目录直接暴露给模型
 
-维护任务会原子切换发布快照。如果工具在一次问答中先读取旧索引、再读取新页面，可能出现引用断裂。因此 Gateway 读取的是保留版本的发布根，首个检索结果携带固定 `release_id`；后续页面和证据读取必须使用同一 `release_id`。
+维护任务会原子切换发布快照。如果工具在一次问答中先读取旧索引、再读取新页面，可能出现引用断裂。因此 Gateway 读取的是保留版本的发布根，首个检索结果携带固定 `agent_release_id`；后续页面和证据读取必须使用同一 ID。
 
 ### 5.2 目录契约
 
 维护层在已通过校验并发布时生成如下只读结构；`current` 只指向已完整发布的版本：
 
 ```text
-<runtime>/published/
-├─ current -> releases/<release_id>
+<runtime>/agent-access-runtime/
+├─ current -> releases/<agent_release_id>
 └─ releases/
-   └─ <release_id>/
+   └─ <agent_release_id>/
       ├─ agent-access-manifest.json
       ├─ llm-wiki/
       │  ├─ index.md
@@ -128,10 +128,11 @@ Gateway 专属只读发布快照挂载
          └─ wiki/ ...
 ```
 
-- `release_id` 必须由 `source_commit`、发布时间和发布内容摘要确定，且不使用用户输入。
+- `agent_release_id` 是不可变 Agent 导出版本，由编译器根据规范化清单内容计算；目录名必须与该 ID 一致，且不使用用户输入。
+- `release_id` 标识 Wiki 发布版本；`evidence_release_id` 标识配套证据版本。schema 2 要求二者相等，但它们不再用作 Agent 导出目录名。
 - 发布目录在切换前完成所有写入和校验；`current` 仅在成功后原子切换。
 - 至少保留当前及前一版，保留时间覆盖最长允许问答运行时间；回收由维护层在确认无活跃引用后处理。
-- DeerFlow 只读挂载 `<runtime>/published`，不会挂载 `llm-wiki-work`、诊断、缓存、密钥或源仓库。
+- DeerFlow Gateway 只读挂载 `<runtime>/agent-access-runtime`，不会挂载 `llm-wiki-work`、诊断、缓存、密钥或源仓库。
 
 ### 5.3 `agent-access-manifest.json`
 
@@ -139,10 +140,15 @@ Gateway 专属只读发布快照挂载
 
 ```json
 {
-  "schema_version": 1,
-  "release_id": "...",
+  "schema_version": 2,
+  "agent_release_id": "<wiki-release-id>-<manifest-sha256>",
+  "release_id": "<wiki-release-id>",
+  "evidence_release_id": "<wiki-release-id>",
   "source_commit": "...",
   "published_at": "...",
+  "fallback_source_count": 0,
+  "fallback_table_group_count": 0,
+  "acceptance_quarantine_count": 0,
   "pages": [
     {
       "page_id": "concept:...",
@@ -165,7 +171,9 @@ Gateway 专属只读发布快照挂载
 }
 ```
 
-校验规则：页面、证据路径均为相对 POSIX 路径；不得含空路径、绝对路径、`..`、符号链接逃逸或不在当前 release 根内的路径；每个 `evidence_id` 必须被至少一页引用；哈希必须匹配实际文件。没有通过清单校验的发布版本不能被专用工具读取。
+兼容约定：schema 1 的历史目录仍以 `release_id` 命名；schema 2 的目录以 `agent_release_id` 命名，`agent_release_id` 等于清单规范化内容（排除 `published_at` 与 `agent_release_id`）的 SHA-256 版本标识。工具搜索结果返回 `agent_release_id`，页面与证据读取都用它固定同一不可变导出；`release_id` 仅表示 Wiki/证据版本。旧工具调用中的 `release_id` 参数保留为短期兼容别名。未知 schema 必须拒绝读取。
+
+校验规则：页面、证据路径均为相对 POSIX 路径；不得含空路径、绝对路径、`..`、符号链接逃逸或不在当前 release 根内的路径；schema 2 的目录名、Agent 导出 ID 和 Wiki/证据版本必须匹配；每个 `evidence_id` 必须被页面引用；哈希必须匹配实际文件。没有通过清单校验的发布版本不能被专用工具读取。
 
 ## 6. 专用工具接口
 
@@ -173,9 +181,9 @@ Gateway 专属只读发布快照挂载
 
 | 工具 | 允许输入 | 返回 | 拒绝条件 |
 | --- | --- | --- | --- |
-| `search_llm_wiki` | `query`、可选领域、`limit<=5` | 固定 `release_id`、候选 `page_id`、标题、类型、简短命中片段 | 空/超长 query、未知领域、无有效当前 release。 |
-| `read_llm_wiki_page` | `release_id`、`page_id` | 已验证页面正文、元数据、关联 `evidence_id` 与可用定位单元 | 非当前或保留 release、未知 page ID、哈希不符、页面不在 manifest。 |
-| `read_llm_wiki_evidence` | `release_id`、`evidence_id`、可选已声明定位单元 | 对应证据片段、行号/表格范围、TFS 原件链接 | 未声明的证据、未声明的定位单元、哈希不符、越界请求。 |
+| `search_llm_wiki` | `query`、可选领域、`limit<=5` | 固定 `agent_release_id`、Wiki `release_id`、候选 `page_id`、标题、类型 | 空/超长 query、未知领域、无有效当前 release。 |
+| `read_llm_wiki_page` | `agent_release_id`、`page_id` | 已验证页面正文、元数据、关联 `evidence_id` 与可用定位单元 | ID 不存在、未知 page ID、哈希不符、页面不在 manifest。 |
+| `read_llm_wiki_evidence` | `agent_release_id`、`page_id`、`evidence_id`、可选已声明定位单元 | 对应证据片段、行号/表格范围、TFS 原件链接 | 未声明的证据、未声明的定位单元、哈希不符、越界请求。 |
 | `get_llm_wiki_release_state` | 无 | 发布版本、源 commit、发布时间、降级/隔离统计 | 状态文件或清单校验失败。 |
 
 工具只返回用户问题所需的有限内容，并对 query、页数、行数和输出字符数设上限。错误统一分为：`release_unavailable`、`not_found`、`integrity_failed`、`invalid_request`；不得把宿主机路径、堆栈、密钥或原始模型输出返回给模型。
@@ -287,8 +295,9 @@ Agent 装配白名单是强制边界；Skill 的 `allowed-tools` 是运行时第
 
 - 新 Agent 的模型工具 schema 仅包含五个白名单工具；MCP、Web、Bash、`read_file`、`grep`、写工具、`task`、`update_agent` 不出现。
 - `tool_search` 无法检索或提升任何未授权工具。
-- 工具拒绝绝对路径、`..`、URL、通配符、未知 ID、旧 release ID、未经页面声明的 evidence ID 与超范围定位单元。
+- 工具拒绝绝对路径、`..`、URL、通配符、未知或未保留的 `agent_release_id`、未经页面声明的 evidence ID 与超范围定位单元。
 - 清单哈希或符号链接校验失败时不返回文件内容。
+- schema 1 旧快照仍可读取；schema 2 需校验内容摘要生成的 `agent_release_id`、导出目录名和 Wiki/证据版本一致性；未知版本拒绝读取。
 - 普通 Agent 的 sandbox 无法列出或读取 `/mnt/regional-llm-wiki-runtime`；现有 Agent 回归仍可读取原 `/mnt/knowledge`。
 - 工具与日志不输出主机真实路径、API Key、请求头、模型原始输出或工作目录内容。
 
@@ -298,13 +307,14 @@ Agent 装配白名单是强制边界；Skill 的 `allowed-tools` 是运行时第
 - 需要精确核验时，答案可读取并列出证据行号/表格范围；不需要核验时不无故读取证据。
 - 证据失效、降级页、找不到内容、发布切换中均给出明确且保守的结果。
 - 返回的 TFS 链接只来自 manifest，且工具从不访问该链接。
-- 同一轮中 `release_id` 固定；发布切换后新轮才使用新 release。
+- 同一轮中 `agent_release_id` 固定；发布切换后新轮才使用新导出版本。
 
 ### 10.3 回归与运维
 
 - 现有 `product-kb-qa` 的测试与原 Agent 冒烟通过。
 - 新增 Agent 配置字段为空时，旧自定义 Agent 工具集完全不变。
 - Gateway 重启、LLM Wiki 发布切换、前一版保留和 release 不可用均有集成测试。
+- schema 1/2 合成契约覆盖同一 Wiki release 多个导出版本、发布切换中的版本固定、清单字段篡改、路径越界、内容哈希错误和证据关联错误。
 - 使用 110 题本地验收题库的对应知识问答子集，检查可导航性、证据支持、错误拒答与来源格式。
 
 ## 11. 审核清单
