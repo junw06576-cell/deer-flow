@@ -125,6 +125,14 @@ Rule of thumb: **root `make` = the full application**; **`backend/Makefile` and 
 
 ## Cross-Cutting Conventions
 
+Production Wiki deployment: `docker/docker-compose.yaml` directly mounts the
+validated schema-1 export read-only in Gateway at `/mnt/regional-llm-wiki-runtime`.
+`REGIONAL_LLM_WIKI_COMPAT_ROOT` is required for every base Compose invocation;
+do not add a separate Wiki overlay, replace `/mnt/knowledge`, or propagate the
+mount to sandbox/provisioner. Preserve the missing-path guard and verify UID
+permissions for both current and future releases. See
+`docs/regional-llm-wiki-schema1-compat-deploy.md` for acceptance and rollback.
+
 These apply repo-wide; module guides own the module-specific detail.
 
 - **Documentation update policy** — keep docs in sync with code: update `README.md` for

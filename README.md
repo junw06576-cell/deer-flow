@@ -348,10 +348,13 @@ deploy.sh start              # start pre-built images
 deploy.sh down
 ```
 
-The `regional-llm-wiki` Agent can optionally read a separately validated
-schema-1 LLM Wiki release through a Gateway-only, read-only Compose overlay.
-This overlay is not loaded by `deploy.sh` automatically and does not replace
-the existing `/mnt/knowledge` mount. See
+The base production Compose file includes a Gateway-only, read-only mount of
+a separately validated schema-1 LLM Wiki release for `regional-llm-wiki`.
+Before any Compose deployment, set `REGIONAL_LLM_WIKI_COMPAT_ROOT` in `.env`
+to the absolute host export path and verify Gateway read permissions. An
+unset/empty variable or missing directory blocks deployment; disabling the
+Agent does not remove this Compose requirement. No extra Wiki overlay is
+needed by `deploy.sh`, and the existing `/mnt/knowledge` mount is preserved. See
 [the regional LLM Wiki deployment handoff](docs/regional-llm-wiki-schema1-compat-deploy.md)
 for the release, permission, Compose, acceptance, and rollback gates.
 
