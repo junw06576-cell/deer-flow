@@ -16,6 +16,7 @@
 #   DEER_FLOW_SKILLS_PATH            — skills dir, default $DEER_FLOW_PROJECT_ROOT/skills
 #   DEER_FLOW_DOCKER_SOCKET          — Docker socket path for aio/DooD mode, default /var/run/docker.sock (used only by the opt-in docker-compose.dood.yaml overlay)
 #   DEER_FLOW_REPO_ROOT              — repo root (used for skills host path in DooD)
+#   REGIONAL_LLM_WIKI_COMPAT_ROOT    — required validated schema-1 Wiki export root (Gateway-only, read-only)
 #   BETTER_AUTH_SECRET               — required for frontend auth/session security
 #   DEER_FLOW_INTERNAL_AUTH_TOKEN    — shared internal Gateway auth token for multi-worker IM channels
 #
@@ -110,6 +111,13 @@ services:
       - /opt/deer-flow/agents:/app/backend/.deer-flow/agents
       # Wiki knowledge base mount for product-kb-qa skill
       - /opt/regional_wiki_kb:/mnt/knowledge:ro
+      # Separate schema-1 release for regional-llm-wiki; preserve the old Wiki mount.
+      - type: bind
+        source: ${REGIONAL_LLM_WIKI_COMPAT_ROOT:?Set REGIONAL_LLM_WIKI_COMPAT_ROOT to the validated schema-1 export root}
+        target: /mnt/regional-llm-wiki-runtime
+        read_only: true
+        bind:
+          create_host_path: false
       # DooD: the host Docker socket is NOT mounted by default. It is added only
       # for aio (pure-DooD) sandbox mode via the opt-in docker-compose.dood.yaml
       # overlay (appended by scripts/deploy.sh). See backend/docs/CONFIGURATION.md
