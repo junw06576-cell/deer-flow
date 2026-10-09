@@ -41,7 +41,6 @@ tool_groups:
 - name: file:write
 - name: bash
 - name: ragflow
-- name: regional-llm-wiki
 tools:
 - name: web_search
   use: deerflow.community.ddg_search.tools:web_search_tool
@@ -89,27 +88,7 @@ tools:
 - name: ragflow_search
   use: ragflow_tools:ragflow_search
   group: ragflow
-
-# Regional LLM Wiki 只读工具（仅 regional-llm-wiki Agent 经 tool_groups 白名单获得）
-- name: search_llm_wiki
-  group: regional-llm-wiki
-  use: deerflow.tools.builtins.regional_llm_wiki_tool:search_llm_wiki
-- name: read_llm_wiki_page
-  group: regional-llm-wiki
-  use: deerflow.tools.builtins.regional_llm_wiki_tool:read_llm_wiki_page
-- name: read_llm_wiki_evidence
-  group: regional-llm-wiki
-  use: deerflow.tools.builtins.regional_llm_wiki_tool:read_llm_wiki_evidence
-- name: get_llm_wiki_release_state
-  group: regional-llm-wiki
-  use: deerflow.tools.builtins.regional_llm_wiki_tool:get_llm_wiki_release_state
-
-regional_llm_wiki:
-  enabled: true
-  runtime_root: /mnt/regional-llm-wiki-runtime
-  max_search_results: 5
-  max_page_chars: 24000
-  max_evidence_chars: 16000
+  
 tool_search:
   enabled: true
 tool_output:

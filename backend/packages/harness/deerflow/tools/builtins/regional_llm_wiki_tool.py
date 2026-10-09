@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,14 @@ class _ReleaseError(Exception):
 
 
 @dataclass(frozen=True)
+class _WikiConfig:
+    runtime_root: str
+    max_search_results: int
+    max_page_chars: int
+    max_evidence_chars: int
+
+
+@dataclass(frozen=True)
 class _Release:
     root: Path
     release_id: str
@@ -44,6 +53,41 @@ class _Release:
 
 def _response(status: str, **payload: object) -> str:
     return json.dumps({"status": status, **payload}, ensure_ascii=False, sort_keys=True)
+
+
+def _bounded_int(config: Mapping[str, object], key: str, default: int, *, minimum: int, maximum: int) -> int:
+    value = config.get(key, default)
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise _ReleaseError("release_unavailable")
+    return value
+
+
+def _load_wiki_config() -> _WikiConfig:
+    """Load and validate this tool's extension config from the current AppConfig."""
+    try:
+        raw = getattr(get_app_config(), "regional_llm_wiki", None)
+    except Exception:
+        raise _ReleaseError("release_unavailable") from None
+    if not isinstance(raw, Mapping):
+        raise _ReleaseError("release_unavailable")
+
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool) or not enabled:
+        raise _ReleaseError("release_unavailable")
+
+    runtime_root = raw.get("runtime_root", "/mnt/regional-llm-wiki-runtime")
+    if not isinstance(runtime_root, str):
+        raise _ReleaseError("release_unavailable")
+    runtime_root = runtime_root.strip()
+    if not runtime_root or not Path(runtime_root).is_absolute():
+        raise _ReleaseError("release_unavailable")
+
+    return _WikiConfig(
+        runtime_root=runtime_root,
+        max_search_results=_bounded_int(raw, "max_search_results", 5, minimum=1, maximum=10),
+        max_page_chars=_bounded_int(raw, "max_page_chars", 24_000, minimum=1_000, maximum=100_000),
+        max_evidence_chars=_bounded_int(raw, "max_evidence_chars", 16_000, minimum=1_000, maximum=100_000),
+    )
 
 
 def _safe_relative_path(value: object, *, required_prefix: str) -> Path:
@@ -70,10 +114,8 @@ def _read_limited(path: Path, *, expected_sha256: object, max_chars: int) -> str
 
 
 def _open_release(release_id: str | None = None) -> _Release:
-    config = get_app_config().regional_llm_wiki
-    if not config.enabled:
-        raise _ReleaseError("release_unavailable")
     try:
+        config = _load_wiki_config()
         runtime_root = Path(config.runtime_root).resolve(strict=True)
         releases_root = (runtime_root / _RELEASES_NAME).resolve(strict=True)
         if release_id is None:

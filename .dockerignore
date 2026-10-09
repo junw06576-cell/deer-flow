@@ -65,6 +65,20 @@ frontend/node_modules
 backend/.venv
 backend/htmlcov
 backend/.coverage
+
+# DeerFlow runtime state (threads / sqlite / tool-results / secrets).
+# scripts/deploy.sh and scripts/serve.sh default DEER_FLOW_HOME to
+# $REPO_ROOT/backend/.deer-flow, i.e. INSIDE the build context. Without these
+# exclusions `COPY backend ./backend` bakes live runtime data (thread history,
+# deerflow.db, auth secrets) into the gateway image: slow layer export, and the
+# data stays readable to anyone who can pull/inspect the image. The runtime
+# bind mount hides it at run time, which is why the leak goes unnoticed.
+# NOTE: the repo-root form is not COPY'd (the Dockerfile only copies backend/)
+# but excluding it still keeps the build context small.
+backend/.deer-flow
+backend/.deer-flow/
+.deer-flow
+.deer-flow/
 *.md
 !README.md
 !frontend/README.md

@@ -6,6 +6,8 @@ import hashlib
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from deerflow.tools.builtins import regional_llm_wiki_tool as tool_module
 
 
@@ -54,13 +56,13 @@ def _install_release(tmp_path, monkeypatch):
     (release_root / "agent-access-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     (runtime_root / "current").symlink_to(release_root)
     config = SimpleNamespace(
-        regional_llm_wiki=SimpleNamespace(
-            enabled=True,
-            runtime_root=str(runtime_root),
-            max_search_results=5,
-            max_page_chars=24_000,
-            max_evidence_chars=16_000,
-        )
+        regional_llm_wiki={
+            "enabled": True,
+            "runtime_root": str(runtime_root),
+            "max_search_results": 5,
+            "max_page_chars": 24_000,
+            "max_evidence_chars": 16_000,
+        }
     )
     monkeypatch.setattr(tool_module, "get_app_config", lambda: config)
     return manifest, page_path, evidence_path
@@ -135,9 +137,48 @@ def test_rejects_stale_release_and_disabled_reader(tmp_path, monkeypatch):
     monkeypatch.setattr(
         tool_module,
         "get_app_config",
-        lambda: SimpleNamespace(regional_llm_wiki=SimpleNamespace(enabled=False)),
+        lambda: SimpleNamespace(regional_llm_wiki={"enabled": False}),
     )
     assert json.loads(tool_module._release_state()) == {"status": "release_unavailable"}
+
+
+@pytest.mark.parametrize(
+    "app_config",
+    [
+        SimpleNamespace(),
+        SimpleNamespace(regional_llm_wiki=None),
+        SimpleNamespace(regional_llm_wiki=[]),
+        SimpleNamespace(regional_llm_wiki={"enabled": "true"}),
+        SimpleNamespace(regional_llm_wiki={"enabled": True, "runtime_root": "relative"}),
+        SimpleNamespace(regional_llm_wiki={"enabled": True, "max_search_results": True}),
+        SimpleNamespace(regional_llm_wiki={"enabled": True, "max_page_chars": 999}),
+    ],
+)
+def test_invalid_mapping_config_is_safely_unavailable(app_config, monkeypatch):
+    monkeypatch.setattr(tool_module, "get_app_config", lambda: app_config)
+
+    results = [
+        tool_module._search("query", None, 5),
+        tool_module._read_page("release-1", "page-1"),
+        tool_module._read_evidence("release-1", "page-1", "evidence-1", None),
+        tool_module._release_state(),
+    ]
+
+    assert [json.loads(result) for result in results] == [{"status": "release_unavailable"}] * 4
+
+
+def test_mapping_config_is_reloaded_between_calls(monkeypatch):
+    current = SimpleNamespace(regional_llm_wiki={"enabled": False})
+    monkeypatch.setattr(tool_module, "get_app_config", lambda: current)
+    with pytest.raises(tool_module._ReleaseError, match="release_unavailable"):
+        tool_module._load_wiki_config()
+
+    runtime_root = str(tool_module.Path.cwd())
+    current.regional_llm_wiki = {"enabled": True, "runtime_root": runtime_root, "max_search_results": 7}
+    loaded = tool_module._load_wiki_config()
+
+    assert loaded.runtime_root == runtime_root
+    assert loaded.max_search_results == 7
 
 
 def test_agent_allowlist_filters_configured_builtin_and_mcp_shaped_tools():
