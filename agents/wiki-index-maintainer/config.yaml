@@ -1,3 +1,0 @@
-name: wiki-index-maintainer
-description: Wiki 索引检索别名维护器 — 只返回受控 JSON，不修改正式知识库
-skills: [wiki-index-maintenance]

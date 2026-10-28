@@ -952,3 +952,7 @@ Your unwavering commitment and expertise have been the driving force behind Deer
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=bytedance/deer-flow&type=Date)](https://star-history.com/#bytedance/deer-flow&Date)
+
+# Regional Wiki MCP
+
+A separately deployed, read-only MCP adapter exposes the Regional LLM Wiki's four existing tools without changing Gateway. See [deployment and access instructions](services/regional_wiki_mcp/README.md).

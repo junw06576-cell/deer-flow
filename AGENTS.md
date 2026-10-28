@@ -143,3 +143,7 @@ These apply repo-wide; module guides own the module-specific detail.
   frontend tests live in `frontend/tests/`.
 - **Format before pushing** — run `make format` (backend) / `pnpm check` (frontend). Backend
   CI enforces `ruff format --check`, so formatting must be clean before a push.
+
+# Standalone Regional Wiki MCP
+
+`services/regional_wiki_mcp/` provides a separately deployed Streamable HTTP adapter for the four existing Regional Wiki tools. It reuses the Gateway image, binds the matching Wiki tool source read-only, and requires a separately authorized read-only schema-1 export mount and dedicated bearer token; it does not modify the base Compose stack or mount the export into sandboxes. The deployment binds the 192 server's LAN address and enforces an explicit host allowlist. See its README for deployment and validation. Backend protocol tests are in `backend/tests/test_regional_wiki_mcp_service.py`.

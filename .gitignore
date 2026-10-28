@@ -71,5 +71,6 @@ config.yaml.bak
 .monocle/
 
 .workbuddy/
-
+.workbuddy-ai/
+.agents/
 *.zip

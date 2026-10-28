@@ -1,0 +1,36 @@
+services:
+  regional-wiki-mcp:
+    image: deer-flow-gateway:core2
+    command: ["/app/backend/.venv/bin/uvicorn", "server:app_factory", "--factory", "--host", "0.0.0.0", "--port", "8765"]
+    working_dir: /service
+    user: "${WIKI_MCP_UID:?Set WIKI_MCP_UID to the authorized reader UID}:${WIKI_MCP_GID:?Set WIKI_MCP_GID to the authorized reader GID}"
+    environment:
+      WIKI_RUNTIME_ROOT: /wiki
+      WIKI_MCP_TOKEN: "${WIKI_MCP_TOKEN:?Set a dedicated MCP token}"
+    ports:
+      - "172.16.0.192:18765:8765"
+    volumes:
+      - type: bind
+        source: ./server.py
+        target: /service/server.py
+        read_only: true
+        bind:
+          create_host_path: false
+      # Supply the matching Wiki tool without changing the Gateway image.
+      - type: bind
+        source: ../../backend/packages/harness/deerflow/tools/builtins/regional_llm_wiki_tool.py
+        target: /app/backend/packages/harness/deerflow/tools/builtins/regional_llm_wiki_tool.py
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${REGIONAL_LLM_WIKI_COMPAT_ROOT:?Set the validated schema-1 export root}
+        target: /wiki
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+    restart: unless-stopped

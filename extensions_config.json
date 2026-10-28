@@ -6,28 +6,28 @@
     "tfs-requirements": {
       "enabled": true,
       "type": "http",
-      "url": "http://host.docker.internal:4751/mcp",
+      "url": "http://172.16.0.192:4751/mcp",
       "headers": {},
       "description": "TFS需求历史 — 历史业务背景、工作项关系、验收条件、附件清单与变更原因"
     },
     "gitnexus-team": {
       "enabled": true,
       "type": "http",
-      "url": "http://host.docker.internal:4747/api/mcp",
+      "url": "http://172.16.0.192:4747/api/mcp",
       "headers": {},
       "description": "代码图谱 — 路由、调用链、影响分析、跨项目代码、模块/类/方法定位"
     },
     "db-knowledge": {
       "enabled": true,
       "type": "http",
-      "url": "http://host.docker.internal:4748/mcp",
+      "url": "http://172.16.0.192:4748/mcp",
       "headers": {},
       "description": "数据库图谱 — 表、字段、读写关系、文档说明"
     },
     "cloudhis-source": {
       "enabled": true,
       "type": "http",
-      "url": "http://host.docker.internal:4752/mcp",
+      "url": "http://172.16.0.192:4752/mcp",
       "headers": {},
       "description": "CloudHIS源码 — 源码搜索、类/方法/控制器路由/MyBatis映射符号定位"
     },
@@ -170,6 +170,62 @@
       "url": "http://172.16.0.153:10911/products/mchs/mcp",
       "headers": {},
       "description": "MCHS数据库图谱 — 表、字段、读写关系、文档说明"
+    },
+    "fds-requirements-history": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10912/products/fds/mcp",
+      "headers": {},
+      "description": "家医签约需求历史 — 历史业务背景、工作项关系、验收条件、附件清单与变更原因"
+    },
+    "fds-code-graph": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10910/products/fds/mcp",
+      "headers": {},
+      "description": "家医签约代码图谱 — 路由、调用链、影响分析、跨项目代码、模块/类/方法定位"
+    },
+    "fds-source-code": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10913/products/fds/mcp",
+      "headers": {},
+      "description": "家医签约源码 — 源码搜索、类/方法/控制器路由/MyBatis映射符号定位"
+    },
+    "fds-database": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10911/products/fds/mcp",
+      "headers": {},
+      "description": "家医签约数据库图谱 — 表、字段、读写关系、文档说明"
+    },
+    "pes-requirements-history": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10912/products/pes/mcp",
+      "headers": {},
+      "description": "区域体检需求历史 — 历史业务背景、工作项关系、验收条件、附件清单与变更原因"
+    },
+    "pes-code-graph": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10910/products/pes/mcp",
+      "headers": {},
+      "description": "区域体检代码图谱 — 路由、调用链、影响分析、跨项目代码、模块/类/方法定位"
+    },
+    "pes-source-code": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10913/products/pes/mcp",
+      "headers": {},
+      "description": "区域体检源码 — 源码搜索、类/方法/控制器路由/MyBatis映射符号定位"
+    },
+    "pes-database": {
+      "enabled": true,
+      "type": "http",
+      "url": "http://172.16.0.153:10911/products/pes/mcp",
+      "headers": {},
+      "description": "区域体检数据库图谱 — 表、字段、读写关系、文档说明"
     },
     "resident-health-requirements-history": {
       "enabled": true,
