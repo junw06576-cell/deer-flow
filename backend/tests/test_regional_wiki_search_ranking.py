@@ -3,11 +3,17 @@
 import asyncio
 import hashlib
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from integrations import regional_wiki_search as search
+
+
+@pytest.mark.parametrize("case", json.loads((Path(__file__).parent / "fixtures/document-content-cases.json").read_text()), ids=lambda case: case["name"])
+def test_conservative_classification_contract(case):
+    assert search.document_content_state(case["text"]) == case["state"]
 
 
 def page(page_id, title, kind="source", summary="", **fields):
@@ -104,6 +110,26 @@ def test_legacy_placeholder_is_verified_from_evidence_not_title(monkeypatch, tmp
     assert catalog["pages"][0]["fact_eligible"] is False
     path.write_text(text + "改动")
     assert json.loads(search._search("家医", None, 5)) == {"status": "integrity_failed"}
+
+
+def test_stale_content_policy_is_rechecked_without_mutating_pinned_manifest(monkeypatch, tmp_path):
+    relative = "evidence/wiki/parameters.md"
+    text = "# 参数\n\n## 最大并发：2000\n"
+    path = tmp_path / relative
+    path.parent.mkdir(parents=True)
+    path.write_text(text)
+    manifest = {
+        "content_state_version": "document-content-v1",
+        "pages": [page("params", "家医技术参数", content_state="empty", fact_eligible=False)],
+        "evidence": [{"evidence_id": "params", "content_state": "empty", "path": relative, "sha256": hashlib.sha256(text.encode()).hexdigest()}],
+    }
+    release = SimpleNamespace(root=tmp_path, release_id="old-policy", manifest=manifest, max_search_results=5)
+    monkeypatch.setattr(search.legacy, "_open_release", lambda: release)
+    result = json.loads(search._search("家医参数", None, 5))
+    assert result["pages"][0]["page_id"] == "params"
+    assert result["pages"][0]["fact_eligible"] is True
+    assert manifest["pages"][0]["fact_eligible"] is False
+    assert manifest["evidence"][0]["content_state"] == "empty"
 
 
 def test_document_intent_does_not_override_topic_and_is_not_always_solution():

@@ -17,20 +17,41 @@ from deerflow.tools.builtins import regional_llm_wiki_tool as legacy
 _ALIASES = (("家庭医生", "家医"), ("妇幼保健", "妇幼"), ("公共卫生", "公卫"), ("医疗卫生共同体", "医共体"), ("医疗联合体", "医联体"))
 _INTENTS = {"solution": ("解决方案", "建设方案", "方案"), "manual": ("操作手册", "用户手册", "使用手册"), "parameters": ("技术参数", "控标参数", "参数"), "introduction": ("产品介绍", "产品说明")}
 _FILLERS = re.compile("介绍一下|帮我找一下|请问|帮我|查一下|找一下|有没有|有哪些|是什么|相关的|相关|资料|内容|信息系统|系统|关于|一下|我们|什么|如何|的|吗|呢|请")
+CONTENT_STATE_VERSION = "document-content-v2"
+_PLACEHOLDER_GUIDANCE = (
+    "本文档内容待填充。其他原件见子目录。",
+    "本文档内容待填充。涵盖区域资源预约、双向转诊、多病共管三个小产品，暂无原件，待入库时补充。",
+    "本文档内容待填充。请整理各产品线的标杆案例信息。",
+    "本文档内容待填充。请整理总客户盘点信息。",
+    "本目录内容待填充（需求规格说明/接口方案/部署手册/操作手册等设计类文档，或 Axure/Figma 原型代码）。",
+    "本目录内容待填充（需求规格说明/接口方案/部署手册/操作手册等设计类文档，或 Axure/Figma 原型代码）。区域妇幼原型见子目录 `00-区域妇幼/`。",
+    "通用测试报告分类，暂无资料。功能测试报告见子目录 `00-功能测试报告/`。",
+)
 _TEMPLATE = re.compile(
-    r"(?:(?:内容)?待填充[。.!！…]*|占位(?:文档|页面|页)?[。.!！…]*|(?:本目录|本文档)内容待填充.*|请将原始(?:文件内容|接口文档)提取.*(?:填入|填充).*"
-    r"|包括控标点、演示话术、截图素材等|可使用 Skill \S+ 自动生成|通用测试报告分类，暂无资料。.*)"
+    r"(?:(?:内容)?待填充[。.!！…]*|占位(?:文档|页面|页)?[。.!！…]*|(?:本目录|本文档)内容待填充[。.!！…]*"
+    r"|请将原始(?:文件内容|接口文档)提取为 Markdown 填入此处[。.]?"
+    r"|包括控标点、演示话术、截图素材等|可使用 Skill [A-Za-z0-9_.-]+ 自动生成"
+    r"|通用测试报告分类，暂无资料。|" + "|".join(re.escape(line) for line in _PLACEHOLDER_GUIDANCE) + r")"
 )
 
 
 def document_content_state(text: str) -> str:
-    """Only an explicit, otherwise empty template is a placeholder."""
+    """Ignore only an initial plain H1 title, never factual section headings."""
     body = []
+    seen_content = False
     for raw in text.splitlines():
-        line = raw.strip()
-        if not line or re.match(r"^#{1,6}\s", line) or re.fullmatch(r"[-*_]{3,}", line):
+        line = re.sub(r"^>\s*", "", raw.strip()).strip()
+        if not line or re.fullmatch(r"[-*_]{3,}", line):
             continue
-        body.append(re.sub(r"^>\s*", "", line).strip())
+        heading = re.match(r"^(#{1,6})\s+(.+?)(?:\s+#+)?$", line)
+        if heading:
+            line = heading.group(2)
+            # Ambiguous or information-bearing titles remain substantive.
+            if not seen_content and heading.group(1) == "#" and not re.search(r"[0-9:：=。！？!?]|支持|必须|禁止|不少于|不超过", line):
+                seen_content = True
+                continue
+        seen_content = True
+        body.append(line)
     if not body:
         return "empty"
     if len(text.strip()) <= 1500 and all(_TEMPLATE.fullmatch(line) for line in body):
@@ -126,7 +147,7 @@ def rank_pages(pages, query: str, *, domain: str | None = None, scope: str = "fa
 
 
 def _legacy_evidence_states(release) -> dict[str, str]:
-    """Old exports lack states: verify small whole documents, not summaries.
+    """Old or stale exports: verify small whole documents, not summaries.
 
     A short tail shard is never sufficient to classify its original document.
     Large sources remain unknown here and are still eligible for retrieval.
@@ -136,7 +157,7 @@ def _legacy_evidence_states(release) -> dict[str, str]:
         if not isinstance(item, dict) or not isinstance(item.get("evidence_id"), str):
             raise legacy._ReleaseError("integrity_failed")
         declared = item.get("content_state")
-        if declared in {"substantive", "placeholder", "empty"}:
+        if release.manifest.get("content_state_version") == CONTENT_STATE_VERSION and declared in {"substantive", "placeholder", "empty"}:
             states[item["evidence_id"]] = declared
             continue
         relative = legacy._safe_relative_path(item.get("path"), required_prefix="evidence")
@@ -170,6 +191,10 @@ def _search(query: str, domain: str | None, limit: int, *, scope: str = "facts")
             relative = str(entry.get("path", "")).split("/")
             document_ids[entry["evidence_id"]] = entry.get("source_document_id") or ("sharded:" + relative[2] if len(relative) > 3 and relative[1] in {"compat-shards", "compat-fields"} else entry["evidence_id"])
         pages = [{**page, "source_document_ids": page.get("source_document_ids") or sorted({document_ids[item] for item in page.get("evidence_ids", []) if item in document_ids})} for page in pages]
+        if release.manifest.get("content_state_version") != CONTENT_STATE_VERSION:
+            # Never trust a stale negative classification or modify a pinned
+            # manifest. Unknown large/sharded documents remain retrievable.
+            pages = [{key: value for key, value in page.items() if key not in {"content_state", "fact_eligible"}} for page in pages]
         selected = rank_pages(pages, query, domain=domain, scope=scope, evidence_states=states)[: min(max(1, limit), release.max_search_results)]
         return legacy._response(
             "ok",

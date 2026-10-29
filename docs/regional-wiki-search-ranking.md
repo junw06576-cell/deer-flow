@@ -16,7 +16,7 @@ presence, explicit abbreviation equivalences, document intent, and source
 diversity. It never selects a fixed document ID. Only the search binding
 changes; harness, middleware, frontend and the existing reader are unchanged.
 
-New compiler exports carry `content_state_version=document-content-v1`,
+New compiler exports carry `content_state_version=document-content-v2`,
 document/page `content_state` and page `fact_eligible`. Whole-source identity
 survives compatibility fragmentation. Facts scope excludes pure placeholder
 or empty dependencies; catalog scope includes them with explicit state.
@@ -25,6 +25,15 @@ Legacy manifests are supported: small whole-source files are hash-verified
 before template classification; a short fragment or summary is never treated
 as proof that its original document is a placeholder. Unknown states remain
 searchable and are not a semantic quality verdict.
+
+The v2 classifier preserves information-bearing headings and mixed
+template/body lines. It removes only an initial plain H1 document title and
+decorations and recognizes complete known boilerplate lines. V1 negative
+flags are not reused: small whole-source evidence is hash-verified and
+reclassified; large/sharded sources remain unknown and retrievable. Pinned
+manifests are never edited. Both repositories version an identical synthetic
+classification fixture, including heading facts, inline mixed content and
+legacy-policy migration regressions.
 
 Product names and individual document states are separate. For example, an
 introductory document may be a placeholder while its solution is substantive.
@@ -42,6 +51,9 @@ real topic matches; a generic word such as "方案" must not overwhelm the topic
    export without model calls. A later ordinary compile emits no-fact
    `not_applicable` placeholder sources and drops solely placeholder-derived
    entities/concepts; mixed aggregates retain substantive support.
+   The compiler's first upgraded semantic regression must finish (with durable
+   budget-resume checkpoints) before the maintenance publication gate clears;
+   a model-free cache replay does not meet that semantic gate.
 3. Verify `integrations.regional_wiki_search` imports inside the actual Gateway
    image/mounted checkout. Change only the search tool's `use` to
    `integrations.regional_wiki_search:search_llm_wiki`; retain the existing
@@ -79,5 +91,8 @@ config reached 568 passed / 3 skipped and two unrelated failures (AIO warm-pool
 eviction and Browserless DNS). Both failures reproduce on pristine `main`.
 The broad run was stopped while Readability tried a blocked `npm install`;
 the complete backend suite is not green and is not claimed as passed.
+After the three review fixes, another full-suite attempt with `--maxfail=2`
+stopped at the same two failures (564 passed / 3 skipped); this remains a
+baseline/environment limitation rather than a full-suite success.
 The dedicated retrieval/Reader/MCP tests and compiler tests are reported
 separately. No real key belongs in test config, reports or Git.

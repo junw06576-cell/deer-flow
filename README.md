@@ -961,5 +961,10 @@ source titles and document intent, resists repeated metadata, and excludes
 placeholder-only pages from factual search. Missing-document inventory is
 available through explicit `scope="catalog"`. See the
 [ranking and content-state handoff](docs/regional-wiki-search-ranking.md).
+The paired compiler uses conservative `document-content-v2` classification:
+factual headings and mixed template/body lines stay searchable. For older
+content-policy exports, the integration rechecks hash-verified small whole
+documents and leaves unverified large/sharded sources searchable; it never
+edits a pinned release or infers absence from stale negative flags.
 
 A separately deployed, read-only MCP adapter exposes the Regional LLM Wiki's four existing tools without changing Gateway. See [deployment and access instructions](services/regional_wiki_mcp/README.md).

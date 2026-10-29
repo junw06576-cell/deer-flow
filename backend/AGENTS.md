@@ -929,6 +929,13 @@ For models with `supports_vision: true`:
 
 ## Code Style
 
+Regional Wiki classification stays in `integrations/regional_wiki_search.py`,
+outside the harness. Its `document-content-v2` contract cases must match the
+compiler repository's fixture. Old content-policy flags are not authoritative;
+fallback verification must retain hash/path checks and never classify a whole
+source from a tail shard. No core Agent, middleware or tool-loader changes are
+needed for this search repair.
+
 - Uses `ruff` for linting and formatting
 - Line length: 240 characters
 - Python 3.12+ with type hints
