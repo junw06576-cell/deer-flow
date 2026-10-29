@@ -1,0 +1,17 @@
+[
+  {"name":"document-title", "text":"# 妇幼\n\n---\n", "state":"empty"},
+  {"name":"heading-facts", "text":"# 参数\n\n## 最大并发：2000\n\n## 支持 Linux 和 Windows\n", "state":"substantive"},
+  {"name":"h1-fact", "text":"# 最大并发：2000\n", "state":"substantive"},
+  {"name":"subheading-only", "text":"## 支持 Linux 和 Windows\n", "state":"substantive"},
+  {"name":"mixed-inline", "text":"# 方案\n\n> 本文档内容待填充。已支持签约与履约管理。\n", "state":"substantive"},
+  {"name":"mixed-instruction", "text":"# 方案\n\n> 请将原始文件内容提取为 Markdown 填入此处。支持签约。\n", "state":"substantive"},
+  {"name":"mixed-report", "text":"# 方案\n\n> 通用测试报告分类，暂无资料。并发已达2000。\n", "state":"substantive"},
+  {"name":"plain-fact", "text":"# 家医\n\n签约模块已上线，培训部分待填充。\n", "state":"substantive"},
+  {"name":"template", "text":"# 产品介绍\n\n> 待填充\n> 请将原始文件内容提取为 Markdown 填入此处\n---\n", "state":"placeholder"},
+  {"name":"interface-template", "text":"# 接口\n\n> 待填充\n> 请将原始接口文档提取为 Markdown 填入此处。\n", "state":"placeholder"},
+  {"name":"directory-guide", "text":"# 产品资料\n\n> 占位\n> 本文档内容待填充。其他原件见子目录。\n", "state":"placeholder"},
+  {"name":"skill-guide", "text":"# 资源\n\n> 待填充\n> 可使用 Skill example 自动生成\n", "state":"placeholder"},
+  {"name":"table-fact", "text":"# 参数\n\n| 并发 | 2000 |\n", "state":"substantive"},
+  {"name":"same-heading-after-title", "text":"# 方案\n\n# 功能已上线\n", "state":"substantive"},
+  {"name":"title-predicate", "text":"# 支持签约服务\n", "state":"substantive"}
+]

@@ -146,4 +146,16 @@ These apply repo-wide; module guides own the module-specific detail.
 
 # Standalone Regional Wiki MCP
 
+Regional Wiki search ranking lives in `backend/integrations/regional_wiki_search.py`,
+outside the harness. Bind only `search_llm_wiki` to this integration; the three
+read/status tools keep their existing implementation. Match document content
+states from the compiler export, use verified small whole-document evidence for
+legacy exports, and never infer a product-wide absence from a placeholder file.
+Regression tests: `backend/tests/test_regional_wiki_search_ranking.py`.
+The compiler and integration share the versioned classification cases in their
+respective `tests/fixtures/document-content-cases.json` files; keep the copies
+identical. `document-content-v2` preserves factual headings and mixed text.
+Do not trust older negative content flags: verify small whole evidence files
+and keep unknown large/sharded documents retrievable without mutating manifests.
+
 `services/regional_wiki_mcp/` provides a separately deployed Streamable HTTP adapter for the four existing Regional Wiki tools. It reuses the Gateway image, binds the matching Wiki tool source read-only, and requires a separately authorized read-only schema-1 export mount and dedicated bearer token; it does not modify the base Compose stack or mount the export into sandboxes. The deployment binds the 192 server's LAN address and enforces an explicit host allowlist. See its README for deployment and validation. Backend protocol tests are in `backend/tests/test_regional_wiki_mcp_service.py`.
