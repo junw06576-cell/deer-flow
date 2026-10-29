@@ -17,6 +17,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from deerflow.config.app_config import set_app_config
 from deerflow.tools.builtins import regional_llm_wiki_tool as wiki
+from integrations import regional_wiki_search as search_tools
 
 
 class BearerAuth:
@@ -58,9 +59,9 @@ def create_app(runtime_root: str, token: str) -> ASGIApp:
     )
 
     @server.tool()
-    async def search_llm_wiki(query: str, domain: str | None = None, limit: int = 5) -> str:
+    async def search_llm_wiki(query: str, domain: str | None = None, limit: int = 5, scope: str = "facts") -> str:
         """Search the index; read the returned page before stating facts."""
-        return await wiki.search_llm_wiki.ainvoke({"query": query, "domain": domain, "limit": limit})
+        return await search_tools.search_llm_wiki.ainvoke({"query": query, "domain": domain, "limit": limit, "scope": scope})
 
     @server.tool()
     async def read_llm_wiki_page(release_id: str, page_id: str) -> str:

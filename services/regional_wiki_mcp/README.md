@@ -4,6 +4,12 @@
 
 ## 192 服务器准备
 
+检索排序扩展由 `backend/integrations/regional_wiki_search.py` 提供。部署本版时须一并提供
+`backend/integrations/` 目录；Compose 将其只读挂到独立容器的 `/service/integrations`。
+服务的搜索入口使用该扩展，另外三个工具仍使用现有 Reader。默认事实查询排除纯占位页，
+显式 `scope="catalog"` 才包含目录缺资料项。仅更新编译器或导出不会改变旧 Reader 排序；
+Gateway 配置绑定与独立 MCP 服务须分别核验，详见 `docs/regional-wiki-search-ranking.md`。
+
 1. 按 `docs/regional-llm-wiki-schema1-compat-deploy.md` 完成 schema-1 快照导出、完整校验及发布。单独授权 MCP 服务的 UID/GID 只读遍历快照及未来新发布的文件。现有导出权限会限制 ACL mask，必须每次发布后复核。此项新增对独立服务的授权，保持 Gateway、sandbox 和 provisioner 原有挂载不变。
 2. 保持与本地仓库一致的目录结构：将本目录的 `server.py`、`compose.yaml` 上传到服务器的 `/opt/deer-flow/services/regional_wiki_mcp/`，将 `backend/packages/harness/deerflow/tools/builtins/regional_llm_wiki_tool.py` 上传到 `/opt/deer-flow/backend/packages/harness/deerflow/tools/builtins/`。工具文件会只读挂载到独立容器，不改镜像和 Gateway。确认 `deer-flow-gateway:core2` 镜像包含 MCP 1.x SDK、LangChain 和 `deerflow.config.app_config.set_app_config`；Gateway 容器本身不重建或重启。若服务器目标路径已有文件，先核对内容和本地改动，再决定如何更新，勿直接覆盖。
 3. 准备仅管理员可读的独立环境文件（例如 `/opt/deer-flow-wiki-mcp.env`），不要复用 DeerFlow 的内部认证令牌：

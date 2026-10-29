@@ -40,7 +40,8 @@ def test_authentication_covers_all_requests(client):
 def test_lists_and_calls_four_existing_tools(client, monkeypatch):
     names = ("search_llm_wiki", "read_llm_wiki_page", "read_llm_wiki_evidence", "get_llm_wiki_release_state")
     for name in names:
-        monkeypatch.setattr(service.wiki, name, SimpleNamespace(ainvoke=AsyncMock(return_value=json.dumps({"status": "ok"}))))
+        owner = service.search_tools if name == "search_llm_wiki" else service.wiki
+        monkeypatch.setattr(owner, name, SimpleNamespace(ainvoke=AsyncMock(return_value=json.dumps({"status": "ok"}))))
     result = rpc(client, "tools/list").json()
     assert {item["name"] for item in result["result"]["tools"]} == set(names)
     arguments = [
@@ -53,7 +54,8 @@ def test_lists_and_calls_four_existing_tools(client, monkeypatch):
         response = rpc(client, "tools/call", {"name": name, "arguments": args})
         assert response.status_code == 200
         assert json.loads(response.json()["result"]["content"][0]["text"]) == {"status": "ok"}
-        getattr(service.wiki, name).ainvoke.assert_awaited_once()
+        owner = service.search_tools if name == "search_llm_wiki" else service.wiki
+        getattr(owner, name).ainvoke.assert_awaited_once()
 
 
 def test_rejects_bad_configuration():

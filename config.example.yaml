@@ -921,7 +921,7 @@ tools:
   # arbitrary filesystem paths to the model.
   - name: search_llm_wiki
     group: regional-llm-wiki
-    use: deerflow.tools.builtins.regional_llm_wiki_tool:search_llm_wiki
+    use: integrations.regional_wiki_search:search_llm_wiki
 
   - name: read_llm_wiki_page
     group: regional-llm-wiki

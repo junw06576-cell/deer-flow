@@ -955,4 +955,11 @@ Your unwavering commitment and expertise have been the driving force behind Deer
 
 # Regional Wiki MCP
 
+Regional Wiki topic search can use the business integration at
+`integrations.regional_wiki_search:search_llm_wiki`. It prioritizes matching
+source titles and document intent, resists repeated metadata, and excludes
+placeholder-only pages from factual search. Missing-document inventory is
+available through explicit `scope="catalog"`. See the
+[ranking and content-state handoff](docs/regional-wiki-search-ranking.md).
+
 A separately deployed, read-only MCP adapter exposes the Regional LLM Wiki's four existing tools without changing Gateway. See [deployment and access instructions](services/regional_wiki_mcp/README.md).

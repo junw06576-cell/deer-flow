@@ -18,6 +18,12 @@ services:
           create_host_path: false
       # Supply the matching Wiki tool without changing the Gateway image.
       - type: bind
+        source: ../../backend/integrations
+        target: /service/integrations
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
         source: ../../backend/packages/harness/deerflow/tools/builtins/regional_llm_wiki_tool.py
         target: /app/backend/packages/harness/deerflow/tools/builtins/regional_llm_wiki_tool.py
         read_only: true

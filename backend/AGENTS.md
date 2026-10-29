@@ -410,6 +410,13 @@ Proxied through nginx: `/api/langgraph/*` → Gateway LangGraph-compatible runti
 
 ### Tool System (`packages/harness/deerflow/tools/`)
 
+Regional Wiki search has an opt-in business integration at
+`integrations.regional_wiki_search:search_llm_wiki`. Its async entry point must
+offload filesystem and ranking work with `asyncio.to_thread`. Preserve the
+existing release pin, domain filter and result cap. Placeholder-only entries
+are inventory, not product facts; retain mixed pages and substantively backed
+solutions in the same directory. The harness reader source stays unchanged.
+
 `get_available_tools(groups, include_mcp, model_name, subagent_enabled)` assembles:
 1. **Config-defined tools** - Resolved from `config.yaml` via `resolve_variable()`
 2. **MCP tools** - From enabled MCP servers (lazy initialized, cached with resolved-path + content-signature invalidation)
